@@ -27,7 +27,7 @@ flowchart TD
 - `ingest` discovers Sources, reads complete Records within explicit bounds, and maintains byte locators and fingerprints.
 - `adapters` detects Codex, Pi, and Claude Code and projects ordered Records into adapter-neutral facts. It owns Runtime mappings and private rule diagnostics.
 - `domain` declares the Semantic role/value contract, evidence strength, Loop outcomes, and typed nested values.
-- `storage` defines Storage Format 1, persists physical and domain facts, privately deduplicates bounded Semantic text, publishes five domain Relations plus the `blobs` and `item_search` access Relations, and validates database shape.
+- `storage` defines Storage Format 2, persists the database-wide indexing policy together with physical and domain facts, privately deduplicates bounded Semantic text, publishes five domain Relations plus the `blobs` and `item_search` access Relations, and validates database shape.
 - `indexing` coordinates per-Source synchronization, status, progress, and telemetry.
 - `interface` owns configuration, bundled documentation, public-schema discovery, bounded SQL, and stable machine output.
 - `shell` extracts the shell structure embedded in supported Semantic tool-call values. Its structs are nested Item values rather than additional public domain entities.

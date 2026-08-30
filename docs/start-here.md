@@ -10,11 +10,12 @@ This tutorial builds a local index, introduces the five public domain objects, a
 ## 1. Create a configuration
 
 ```bash
-trace-index config init
+trace-index config init --discover
 trace-index config show
+trace-index config check
 ```
 
-The generated configuration sets a database path and leaves trace roots commented out. Uncomment or add the Codex, Pi, and Claude Code roots you want indexed, or pass files and directories directly to `index sync`.
+`--discover` adds only standard Codex, Pi, and Claude Code roots that currently exist. Use repeatable `--root PATH` instead when the scope must be explicit. Initialization creates and validates only the configuration file; it does not create the database or synchronize traces. You can also leave roots empty and pass files or directories directly to `index sync`.
 
 ## 2. Build the index
 

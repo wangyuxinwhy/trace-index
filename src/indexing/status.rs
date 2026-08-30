@@ -29,6 +29,7 @@ pub fn status(store: &Store, database_path: &Path) -> Result<StatusReport> {
     Ok(StatusReport {
         database: display_database_path(database_path),
         storage_format: STORAGE_FORMAT,
+        indexing_policy: store.indexing_policy()?,
         sources: usize::try_from(source_count)?,
         source_bytes: u64::try_from(source_bytes)?,
         indexed_bytes: u64::try_from(indexed_bytes)?,

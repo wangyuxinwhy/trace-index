@@ -341,11 +341,9 @@ mod tests {
                  INSERT INTO domain_loops(
                      id, session_id, source_id, ordinal, session_position, start_record_id
                  ) VALUES (1, 1, 1, 0, 0, 1);
-                 INSERT INTO content_blobs(
-                     id, hash, published_bytes, text, full_bytes, estimated_tokens
-                 ) VALUES (
-                     1, X'00', 52,
-                     'AgentFriendly 讨论智能体使用和知识索引', 52, 20
+                 INSERT INTO content_blobs(id, hash, text, full_bytes, estimated_tokens)
+                 VALUES (
+                     1, X'00', 'AgentFriendly 讨论智能体使用和知识索引', 52, 20
                  );
                  INSERT INTO domain_items(
                      id, session_id, source_id, loop_id, loop_position,

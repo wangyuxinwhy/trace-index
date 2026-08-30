@@ -15,7 +15,9 @@ trace-index schema list
 trace-index schema get <RELATION> --compact
 ```
 
-Load `trace-index docs get start-here` when the tutorial is useful. Load the full schema for one relation only when its field descriptions or JSON contract are needed.
+Load `trace-index docs get start-here` when the index has not been built or the first-use workflow is needed. Run `config init` only when the selected configuration file does not exist; it creates only that file and refuses to overwrite one. Use `config show` and `config check` to inspect the selected values and readiness, then run `index sync` to write the database. Do not initialize or synchronize when the existing indexed facts are sufficient.
+
+Load the full schema for one relation only when its field descriptions or JSON contract are needed.
 
 The public domain objects are `sources`, `records`, `sessions`, `loops`, and `items`. `blobs` and `item_search` are access relations, not domain objects. `blobs` resolves bounded semantic text by `blob_id`; `item_search` retrieves candidate Item ids. Do not build routine analysis on visible storage tables.
 

@@ -29,7 +29,7 @@ Download the installer before passing options:
 curl --proto '=https' --tlsv1.2 -fsSL \
   'https://github.com/wangyuxinwhy/trace-index/releases/latest/download/install.sh' \
   -o /tmp/trace-index-install.sh
-sh /tmp/trace-index-install.sh --version 0.1.0 --bin-dir "$PWD/bin"
+sh /tmp/trace-index-install.sh --version 0.2.0 --bin-dir "$PWD/bin"
 ```
 
 The script supports:
@@ -50,7 +50,7 @@ Each archive contains only `trace-index` and `LICENSE`. The installer downloads 
 With Rust 1.95 or newer:
 
 ```bash
-cargo install trace-index --version 0.1.0 --locked
+cargo install trace-index --version 0.2.0 --locked
 trace-index --version
 ```
 

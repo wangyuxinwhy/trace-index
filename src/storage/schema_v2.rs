@@ -1,12 +1,21 @@
-//! Storage format 1, shaped around the five public domain objects.
+//! Storage format 2, shaped around the five public domain objects.
 //!
 //! The storage schema follows the five public objects. Private tables only
 //! represent nested or sparse attributes of those objects.
 
-pub(crate) const STORAGE_FORMAT: u32 = 1;
+pub(crate) const STORAGE_FORMAT: u32 = 2;
 
 pub(crate) const CREATE_SCHEMA: &str = r"
 PRAGMA foreign_keys = ON;
+
+-- Database-wide projection policy. Mixing these limits would make otherwise
+-- identical Sources publish different facts depending on which sync touched
+-- them last, so a non-empty index has exactly one immutable policy row.
+CREATE TABLE indexing_policy (
+    singleton                    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    max_indexed_record_bytes     INTEGER NOT NULL CHECK (max_indexed_record_bytes > 0),
+    max_published_text_bytes     INTEGER NOT NULL CHECK (max_published_text_bytes > 0)
+);
 
 -- Physical evidence ---------------------------------------------------------
 -- Domain fields are `id`, `path`, and `runtime`. The remaining columns are
@@ -101,22 +110,17 @@ CREATE TABLE domain_loops (
 CREATE UNIQUE INDEX loops_session_position
     ON domain_loops(session_id, session_position);
 
--- Deduplicated bounded text referenced from Item Semantic JSON. Hashes are
--- computed from the complete Source text; `published_bytes` distinguishes
--- prefixes produced under different observation bounds. This uniqueness is a
--- correctness constraint, so it remains present during cold builds and after
--- an interrupted process.
+-- Deduplicated bounded text referenced from Item Semantic JSON. The hash is
+-- computed from the complete Source text. One immutable database policy makes
+-- that complete value publish one stable bounded text, so the hash is the
+-- single identity and uniqueness constraint.
 CREATE TABLE content_blobs (
     id               INTEGER PRIMARY KEY,
-    hash             BLOB    NOT NULL,
-    published_bytes  INTEGER NOT NULL,
+    hash             BLOB    NOT NULL UNIQUE,
     text             TEXT    NOT NULL,
     full_bytes       INTEGER NOT NULL,
     estimated_tokens INTEGER NOT NULL
 );
-
-CREATE UNIQUE INDEX content_blobs_hash
-    ON content_blobs(hash, published_bytes);
 
 CREATE TABLE domain_items (
     id            INTEGER PRIMARY KEY,
@@ -220,15 +224,6 @@ CREATE INDEX IF NOT EXISTS items_role ON domain_items(json_extract(semantic, '$.
 CREATE INDEX IF NOT EXISTS item_records_record ON item_records(record_id);
 ";
 
-// Unlike the query indexes above, this index enforces a storage invariant used
-// by the Semantic Blob upsert. It is part of CREATE_SCHEMA for new databases
-// and is repeated here so a write-mode open can repair databases left by an
-// interrupted older cold build that deferred the constraint.
-pub(crate) const ENSURE_REQUIRED_INDEXES: &str = r"
-CREATE UNIQUE INDEX IF NOT EXISTS content_blobs_hash
-    ON content_blobs(hash, published_bytes);
-";
-
 pub(crate) const DROP_SECONDARY_INDEXES: &str = r"
 DROP INDEX IF EXISTS session_sources_identity_record;
 DROP INDEX IF EXISTS session_sources_created_at;
@@ -254,8 +249,8 @@ mod tests {
     use super::{CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, STORAGE_FORMAT};
 
     #[test]
-    fn creates_the_minimal_v1_schema() {
-        assert_eq!(STORAGE_FORMAT, 1);
+    fn creates_the_minimal_v2_schema() {
+        assert_eq!(STORAGE_FORMAT, 2);
         let connection = Connection::open_in_memory().expect("open database");
         connection
             .execute_batch(CREATE_SCHEMA)
@@ -273,6 +268,7 @@ mod tests {
             .expect("collect schema");
 
         for expected in [
+            "indexing_policy",
             "trace_sources",
             "trace_records",
             "domain_sessions",
@@ -314,6 +310,18 @@ mod tests {
                 "occurred_at",
                 "semantic",
             ]
+        );
+
+        let blob_columns = connection
+            .prepare("SELECT name FROM pragma_table_info('content_blobs') ORDER BY cid")
+            .expect("prepare Blob column query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query Blob columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect Blob columns");
+        assert_eq!(
+            blob_columns,
+            ["id", "hash", "text", "full_bytes", "estimated_tokens"]
         );
 
         let loop_columns = connection

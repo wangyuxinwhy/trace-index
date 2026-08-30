@@ -482,6 +482,10 @@ fn pi_and_claude_publish_the_same_request_and_answer_semantics() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one policy contract test compares the same bounded text under three database-wide policies"
+)]
 fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
     let traces = tempdir().expect("trace directory");
     let trace = traces.path().join("bounded-text.jsonl");
@@ -509,7 +513,7 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
     )
     .expect("index bounded text fixture");
 
-    let (value, published_bytes, full_bytes, estimated_tokens): (String, i64, i64, i64) = store
+    let (value, visible_bytes, full_bytes, estimated_tokens): (String, i64, i64, i64) = store
         .connection()
         .query_row(
             "SELECT b.text,
@@ -525,11 +529,11 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
         )
         .expect("read bounded TextContent");
     assert_eq!(value, "abcde");
-    assert_eq!(published_bytes, 5);
+    assert_eq!(visible_bytes, 5);
     assert_eq!(full_bytes, 12);
     assert_eq!(estimated_tokens, 4);
 
-    index_paths(
+    let policy_error = index_paths(
         &mut store,
         std::slice::from_ref(&trace),
         &IndexOptions {
@@ -538,8 +542,27 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
             max_text_bytes: 10,
         },
     )
-    .expect("rebuild with a larger text bound");
-    let expanded: String = store
+    .expect_err("a non-empty index must reject a different publication policy");
+    assert!(
+        policy_error
+            .to_string()
+            .contains("indexing policy mismatch")
+    );
+
+    let expanded_directory = tempdir().expect("expanded index directory");
+    let mut expanded_store =
+        Store::open(&expanded_directory.path().join("index.sqlite")).expect("open expanded index");
+    index_paths(
+        &mut expanded_store,
+        std::slice::from_ref(&trace),
+        &IndexOptions {
+            rebuild: false,
+            max_record_bytes: 1024 * 1024,
+            max_text_bytes: 10,
+        },
+    )
+    .expect("index with a larger text bound in a new database");
+    let expanded: String = expanded_store
         .connection()
         .query_row(
             "SELECT b.text
@@ -553,8 +576,11 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
         .expect("read expanded TextContent");
     assert_eq!(expanded, "abcdef你");
 
+    let reduced_directory = tempdir().expect("reduced index directory");
+    let mut reduced_store =
+        Store::open(&reduced_directory.path().join("index.sqlite")).expect("open reduced index");
     index_paths(
-        &mut store,
+        &mut reduced_store,
         &[trace],
         &IndexOptions {
             rebuild: true,
@@ -563,7 +589,7 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
         },
     )
     .expect("rebuild with a smaller text bound");
-    let reduced: String = store
+    let reduced: String = reduced_store
         .connection()
         .query_row(
             "SELECT b.text
@@ -576,7 +602,9 @@ fn semantic_text_states_when_only_a_bounded_prefix_is_published() {
         )
         .expect("read reduced TextContent");
     assert_eq!(reduced, "abcd");
-    assert_eq!(count(store.connection(), "content_blobs"), 3);
+    assert_eq!(count(store.connection(), "content_blobs"), 1);
+    assert_eq!(count(expanded_store.connection(), "content_blobs"), 1);
+    assert_eq!(count(reduced_store.connection(), "content_blobs"), 1);
 }
 
 #[test]

@@ -6,11 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde::Serialize;
 
 use super::public_schema::{recreate_public_views, validate_public_relations};
 use super::schema::{
-    CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, DROP_SECONDARY_INDEXES, ENSURE_REQUIRED_INDEXES,
-    STORAGE_FORMAT,
+    CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, DROP_SECONDARY_INDEXES, STORAGE_FORMAT,
 };
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
@@ -51,6 +51,25 @@ pub(crate) struct SourceState {
     pub indexed_bytes: u64,
     pub indexed_lines: u64,
     pub indexed_fingerprint: String,
+}
+
+/// Database-wide policy that determines which Source bytes become indexed
+/// facts. It is persisted because changing either limit without rebuilding
+/// every Source would make one index internally inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct IndexingPolicy {
+    pub max_indexed_record_bytes: usize,
+    pub max_published_text_bytes: usize,
+}
+
+impl std::fmt::Display for IndexingPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{{max_indexed_record_bytes={}, max_published_text_bytes={}}}",
+            self.max_indexed_record_bytes, self.max_published_text_bytes
+        )
+    }
 }
 
 impl Store {
@@ -176,6 +195,76 @@ impl Store {
             .context("failed to inspect whether the index is empty")
     }
 
+    /// Establishes the policy for an empty index or verifies the immutable
+    /// policy of an index that already contains Sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored limits are invalid or a non-empty index was
+    /// built with a different policy.
+    pub(crate) fn ensure_indexing_policy(&mut self, requested: IndexingPolicy) -> Result<()> {
+        let stored = self.indexing_policy()?;
+        if stored == Some(requested) {
+            return Ok(());
+        }
+        if !self.is_empty()? {
+            let stored = stored.map_or_else(
+                || "unknown (policy metadata is missing)".to_owned(),
+                |policy| policy.to_string(),
+            );
+            bail!(
+                "indexing policy mismatch for {}: stored {stored}, requested {requested}; \
+                 create a new index database and reindex every Source",
+                self.path.display()
+            );
+        }
+        self.connection
+            .execute(
+                "INSERT INTO indexing_policy(
+                     singleton, max_indexed_record_bytes, max_published_text_bytes
+                 ) VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                     max_indexed_record_bytes = excluded.max_indexed_record_bytes,
+                     max_published_text_bytes = excluded.max_published_text_bytes",
+                rusqlite::params![
+                    to_sql_i64(
+                        u64::try_from(requested.max_indexed_record_bytes)?,
+                        "maximum indexed Record bytes"
+                    )?,
+                    to_sql_i64(
+                        u64::try_from(requested.max_published_text_bytes)?,
+                        "maximum published text bytes"
+                    )?,
+                ],
+            )
+            .context("failed to persist indexing policy")?;
+        Ok(())
+    }
+
+    pub(crate) fn indexing_policy(&self) -> Result<Option<IndexingPolicy>> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT max_indexed_record_bytes, max_published_text_bytes
+                   FROM indexing_policy
+                  WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .context("failed to read indexing policy")?;
+        stored
+            .map(|(max_record, max_text)| {
+                Ok(IndexingPolicy {
+                    max_indexed_record_bytes: usize::try_from(max_record)
+                        .context("stored maximum indexed Record bytes is invalid")?,
+                    max_published_text_bytes: usize::try_from(max_text)
+                        .context("stored maximum published text bytes is invalid")?,
+                })
+            })
+            .transpose()
+    }
+
     pub(crate) fn drop_secondary_indexes(&mut self) -> Result<()> {
         self.connection
             .execute_batch(DROP_SECONDARY_INDEXES)
@@ -186,12 +275,6 @@ impl Store {
         self.connection
             .execute_batch(CREATE_SECONDARY_INDEXES)
             .context("failed to create secondary indexes")
-    }
-
-    fn ensure_required_indexes(&mut self) -> Result<()> {
-        self.connection
-            .execute_batch(ENSURE_REQUIRED_INDEXES)
-            .context("failed to ensure required indexes")
     }
 
     fn initialize_schema(&mut self) -> Result<()> {
@@ -209,7 +292,6 @@ impl Store {
 
         if version == STORAGE_FORMAT {
             self.validate_schema()?;
-            self.ensure_required_indexes()?;
             // A cold build defers query-only indexes. If the process is killed,
             // the next write-mode open restores them before synchronization.
             // Every statement is idempotent and no correctness constraint is
@@ -462,32 +544,27 @@ mod tests {
     }
 
     #[test]
-    fn write_open_repairs_indexes_missing_after_an_interrupted_cold_build() {
+    fn write_open_repairs_query_indexes_missing_after_an_interrupted_cold_build() {
         let directory = tempdir().expect("temp directory");
         let database = directory.path().join("index.sqlite");
         drop(Store::open(&database).expect("create index"));
 
         let connection = Connection::open(&database).expect("open database directly");
         connection
-            .execute_batch(
-                "DROP INDEX content_blobs_hash;
-                 DROP INDEX items_role;",
-            )
+            .execute_batch("DROP INDEX items_role;")
             .expect("simulate interrupted index build");
         drop(connection);
 
         let repaired = Store::open(&database).expect("repair indexes on write open");
-        for name in ["content_blobs_hash", "items_role"] {
-            let count: i64 = repaired
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?1",
-                    [name],
-                    |row| row.get(0),
-                )
-                .expect("inspect repaired index");
-            assert_eq!(count, 1, "index {name} was not repaired");
-        }
+        let count: i64 = repaired
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'items_role'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect repaired index");
+        assert_eq!(count, 1, "query index was not repaired");
     }
 
     #[test]

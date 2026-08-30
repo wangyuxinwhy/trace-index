@@ -22,8 +22,8 @@ use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
 /// the cache never returns an id whose row no longer exists.
 #[derive(Debug, Default)]
 pub(crate) struct BlobCache {
-    ids: HashMap<(ContentHash, u64), i64>,
-    pending: Vec<(ContentHash, u64)>,
+    ids: HashMap<ContentHash, i64>,
+    pending: Vec<ContentHash>,
 }
 
 impl BlobCache {
@@ -51,33 +51,24 @@ impl BlobCache {
             .text
             .as_deref()
             .context("Semantic Blob has no published text")?;
-        let published_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        let key = (content.hash, published_bytes);
+        let key = content.hash;
         if let Some(id) = self.ids.get(&key) {
             return Ok(*id);
         }
         let full_bytes = to_sql_i64(content.full_bytes, "Semantic Blob byte length")?;
-        let published_bytes = to_sql_i64(published_bytes, "Semantic Blob published byte length")?;
         let estimated_tokens =
             to_sql_i64(content.estimated_tokens, "Semantic Blob token estimate")?;
         let started = Instant::now();
         let id = transaction
             .prepare_cached(
-                "INSERT INTO content_blobs(
-                     hash, published_bytes, text, full_bytes, estimated_tokens)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(hash, published_bytes) DO UPDATE SET hash = hash
+                "INSERT INTO content_blobs(hash, text, full_bytes, estimated_tokens)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(hash) DO UPDATE SET hash = hash
                  RETURNING id",
             )
             .context("failed to prepare Semantic Blob upsert")?
             .query_row(
-                params![
-                    content.hash.as_slice(),
-                    published_bytes,
-                    text,
-                    full_bytes,
-                    estimated_tokens,
-                ],
+                params![content.hash.as_slice(), text, full_bytes, estimated_tokens,],
                 |row| row.get::<_, i64>(0),
             )
             .context("failed to store Semantic Blob")?;
