@@ -106,12 +106,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${{ needs.validate.outputs.version }}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
           gh release create "${{ needs.validate.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
             --title "Trace Index ${{ needs.validate.outputs.tag }}" \
-            --notes-from-tag \
+            --notes-file release-notes.md \
             dist/install.sh \
             dist/latest \
             dist/manifest.json \
