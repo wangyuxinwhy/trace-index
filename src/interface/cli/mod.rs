@@ -9,7 +9,6 @@ mod run;
 
 pub(crate) use run::run;
 
-const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TEXT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_RECORD_READ_BYTES: u64 = 16 * 1024 * 1024;
@@ -111,11 +110,28 @@ arguments, defaults, limits, side effects, and command-specific examples.";
 const INDEX_SYNC_AFTER_HELP: &str = r"Mutation and input behavior:
   This is the command that writes the index. With PATHS, it synchronizes those
   files or directories. Without PATHS, it uses the configured [[roots]].
+  The first sync stores the effective Record and text byte limits as one
+  database-wide policy. An indexed database owns and reuses that policy; an
+  explicit conflicting limit is rejected. Changing policy requires a new
+  database and a complete reindex.
   The final JSON envelope is written to stdout; progress is written to stderr.
 
 Examples:
   trace-index index sync
   trace-index index sync ~/.codex/sessions ~/.claude/projects --progress ndjson";
+
+const INDEX_STATUS_AFTER_HELP: &str = r"Behavior:
+  Opens the selected existing database read-only. It does not discover or
+  synchronize traces. The result includes Source coverage and freshness plus
+  the stored indexing policy when one has been established.
+
+Example:
+  trace-index index status";
+
+const DOCS_AFTER_HELP: &str = r"Behavior:
+  Reads documentation bundled with this binary without loading configuration or
+  opening the database. The global --config and --db selectors are accepted for
+  command-tree consistency but have no effect on docs commands.";
 
 const QUERY_RUN_AFTER_HELP: &str = r#"Behavior:
   Runs one read-only statement against the existing index. It never refreshes
@@ -167,6 +183,37 @@ const ASSET_EXTRACT_AFTER_HELP: &str = r"Behavior:
 Example:
   trace-index asset extract '12345#/payload/content/1/image_url' --output image.png";
 
+const CONFIG_INIT_AFTER_HELP: &str = r"Behavior:
+  Creates and validates one configuration file without replacing an existing
+  file. It does not create the database or synchronize traces. --root is an
+  explicit opt-in; --discover adds only standard Runtime roots that exist.
+  --db records the initial database path, and [indexing] initializes only a new
+  or empty database.
+
+Examples:
+  trace-index config init --discover
+  trace-index config init --root ~/.codex/sessions --root /work/traces
+  trace-index --db /work/trace-index.sqlite config init --root /work/traces";
+
+const CONFIG_SHOW_AFTER_HELP: &str = r"Behavior:
+  Returns absolute configured paths and the origin of each selected or defaulted
+  value. Indexing values initialize a new or empty database; use index status
+  for an established policy. This command does not inspect roots or open the database.
+
+Example:
+  trace-index config show";
+
+const CONFIG_CHECK_AFTER_HELP: &str = r"Behavior:
+  Resolves the same configuration file, database path, and roots as operational
+  commands, then checks root existence, type, canonical duplication, and database
+  path ancestry. It is read-only and does not require the database to exist.
+  Any issue with level=error produces valid=false and exit 1 after the JSON
+  report. A warning-only report exits 0 even when configured_sync_ready=false,
+  because index sync can still receive explicit PATHS.
+
+Example:
+  trace-index config check";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "trace-index",
@@ -195,6 +242,7 @@ pub(crate) struct Cli {
 )]
 enum Command {
     /// Read documentation bundled with the current CLI.
+    #[command(after_help = DOCS_AFTER_HELP)]
     Docs {
         #[command(subcommand)]
         command: DocsCommand,
@@ -240,12 +288,15 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum DocsCommand {
     /// List bundled documentation topics.
+    #[command(after_help = DOCS_AFTER_HELP)]
     List,
 
     /// Get one documentation topic.
+    #[command(after_help = DOCS_AFTER_HELP)]
     Get(DocsGetArgs),
 
     /// Search bundled documentation topics.
+    #[command(after_help = DOCS_AFTER_HELP)]
     Search {
         /// Case-insensitive text to find.
         query: String,
@@ -287,13 +338,27 @@ impl From<CliProgress> for ProgressMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Subcommand)]
 enum ConfigCommand {
     /// Create a new configuration file without overwriting an existing one.
-    Init,
+    #[command(after_help = CONFIG_INIT_AFTER_HELP)]
+    Init {
+        /// Add one trace file or directory to the new configuration; repeatable.
+        #[arg(long, value_name = "PATH")]
+        root: Vec<PathBuf>,
 
-    /// Show the effective configuration after path and precedence resolution.
+        /// Add standard Codex, Pi, and Claude Code roots that currently exist.
+        #[arg(long)]
+        discover: bool,
+    },
+
+    /// Show resolved configuration values and their origins.
+    #[command(after_help = CONFIG_SHOW_AFTER_HELP)]
     Show,
+
+    /// Validate configuration and configured root readiness without mutation.
+    #[command(after_help = CONFIG_CHECK_AFTER_HELP)]
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -302,6 +367,7 @@ enum IndexCommand {
     Sync(IndexSyncArgs),
 
     /// Show index coverage, parse status, and source freshness.
+    #[command(after_help = INDEX_STATUS_AFTER_HELP)]
     Status,
 }
 
@@ -315,13 +381,17 @@ struct IndexSyncArgs {
     #[arg(long)]
     rebuild: bool,
 
-    /// Maximum bytes retained in memory for one JSONL record.
-    #[arg(long, default_value_t = DEFAULT_MAX_RECORD_BYTES)]
-    max_record_bytes: usize,
+    /// Request maximum bytes indexed for one JSONL Record in this sync.
+    ///
+    /// The built-in value is 16777216.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
+    max_record_bytes: Option<usize>,
 
-    /// Maximum bytes retained for one projected Semantic text value.
-    #[arg(long, default_value_t = DEFAULT_MAX_TEXT_BYTES)]
-    max_text_bytes: usize,
+    /// Request maximum bytes published for one Semantic text value in this sync.
+    ///
+    /// The built-in value is 65536.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
+    max_text_bytes: Option<usize>,
 
     /// Include one result object per discovered source in the final envelope.
     #[arg(long)]
@@ -476,6 +546,19 @@ struct AssetExtractArgs {
 
 fn parse_limit(value: &str) -> Result<usize, String> {
     parse_bounded_usize(value, 1, 10_000, "limit")
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid byte limit {value:?}: {error}"))
+        .and_then(|parsed| {
+            if parsed == 0 {
+                Err("byte limit must be greater than zero".to_owned())
+            } else {
+                Ok(parsed)
+            }
+        })
 }
 
 fn parse_cell_bytes(value: &str) -> Result<usize, String> {

@@ -14,7 +14,8 @@ Process and stream behavior:
 - Success exits 0 and writes the result to stdout.
 - A command-shape or Clap argument error exits 2 and writes usage to stderr.
 - A runtime error normally exits 1, writes a diagnostic to stderr, and leaves stdout empty.
-- `index sync` is the intentional partial-result exception: when some recognized Sources fail, it writes the complete synchronization report to stdout and exits 1 so callers can inspect both the successful and failed Source results.
+- `config check` returns its complete read-only findings on stdout. Error issues make `valid=false` and exit 1; Warning-only reports exit 0 even when `configured_sync_ready=false` because positional `index sync PATHS...` remains valid.
+- `index sync` returns the complete synchronization report on stdout and exits 1 when some recognized Sources fail, so callers can inspect both the successful and failed Source results.
 
 Only `index sync` emits progress. Progress is written to stderr and never mixed into the final stdout JSON. `--progress auto|human|ndjson|off` selects the rendering.
 
@@ -34,7 +35,7 @@ Large Record values and inline media appear as structured references. An Asset r
 
 ## Synchronization reports
 
-`index sync` reports physical and domain writes under `metrics.writes`: `records`, `sessions`, `loops`, and `items`. A changed Source can cause its domain projection to be replaced in full even when only a small physical suffix was appended, so domain write counts need not match `indexed_records`.
+`index sync` reports the database-wide `indexing_policy` used to publish facts and physical and domain writes under `metrics.writes`: `records`, `sessions`, `loops`, and `items`. `index status` returns the stored policy when one has been established. A changed Source can cause its domain projection to be replaced in full even when only a small physical suffix was appended, so domain write counts need not match `indexed_records`.
 
 `metrics.phases_ms` partitions elapsed time across discovery, preparation, clearing, reading, projection, persistence, fingerprinting, commit, secondary-index work, and an unattributed residual. `metrics.persist_ms` is operational telemetry for current write sites. The names below describe implementation work; they do not add domain objects.
 

@@ -8,10 +8,13 @@ use tempfile::tempdir;
 
 fn trace_index() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trace-index"));
-    command.env(
-        "XDG_CONFIG_HOME",
-        std::env::temp_dir().join(format!("trace-index-cli-contract-{}", std::process::id())),
-    );
+    let isolated =
+        std::env::temp_dir().join(format!("trace-index-cli-contract-{}", std::process::id()));
+    command
+        .env_remove("TRACE_INDEX_CONFIG")
+        .env_remove("TRACE_INDEX_DB")
+        .env("XDG_CONFIG_HOME", isolated.join("config"))
+        .env("XDG_DATA_HOME", isolated.join("data"));
     command
 }
 
@@ -95,6 +98,231 @@ fn index_fixture(directory: &Path, request: &str) -> (PathBuf, PathBuf, Value) {
 }
 
 #[test]
+fn config_init_creates_a_valid_explicit_configuration_without_other_mutation() {
+    let directory = tempdir().expect("temporary directory");
+    let config = directory.path().join("config.toml");
+    let database = directory.path().join("data/index.sqlite");
+    let root = directory.path().join("traces");
+    fs::create_dir(&root).expect("create trace root");
+
+    let initialized = compact_json(&run(&[
+        "--config",
+        path_text(&config),
+        "--db",
+        path_text(&database),
+        "config",
+        "init",
+        "--root",
+        path_text(&root),
+    ]));
+    assert_eq!(initialized["data"]["created"], true);
+    assert_eq!(
+        initialized["data"]["config"]["config_file"]["path"],
+        path_text(&config)
+    );
+    assert_eq!(
+        initialized["data"]["config"]["config_file"]["origin"]["kind"],
+        "cli"
+    );
+    assert_eq!(
+        initialized["data"]["config"]["database"]["origin"]["kind"],
+        "cli"
+    );
+    assert_eq!(
+        initialized["data"]["config"]["roots"][0]["path"],
+        path_text(&root)
+    );
+    assert!(config.is_file());
+    assert!(
+        !database.exists(),
+        "config init must not create the database"
+    );
+
+    let contents = fs::read_to_string(&config).expect("read initialized configuration");
+    assert!(contents.contains("schema_version = 1"));
+    assert!(contents.contains("max_indexed_record_bytes = 16777216"));
+    assert!(contents.contains("max_published_text_bytes = 65536"));
+
+    let checked = compact_json(&run(&["--config", path_text(&config), "config", "check"]));
+    assert_eq!(checked["data"]["valid"], true);
+    assert_eq!(checked["data"]["configured_sync_ready"], true);
+
+    let repeated = run(&["--config", path_text(&config), "config", "init"]);
+    assert!(!repeated.status.success());
+    assert!(repeated.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&repeated.stderr).contains("refusing to overwrite"));
+}
+
+#[test]
+fn config_init_keeps_cli_database_precedence_in_its_report() {
+    let directory = tempdir().expect("temporary directory");
+    let config = directory.path().join("config.toml");
+    let cli_database = directory.path().join("cli.sqlite");
+    let environment_database = directory.path().join("environment.sqlite");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trace-index"));
+    command
+        .env_remove("TRACE_INDEX_CONFIG")
+        .env("TRACE_INDEX_DB", &environment_database)
+        .env("XDG_CONFIG_HOME", directory.path().join("config-home"))
+        .env("XDG_DATA_HOME", directory.path().join("data-home"))
+        .args([
+            "--config",
+            path_text(&config),
+            "--db",
+            path_text(&cli_database),
+            "config",
+            "init",
+        ]);
+
+    let initialized = compact_json(&command.output().expect("run config init"));
+    assert_eq!(
+        initialized["data"]["config"]["database"]["path"],
+        path_text(&cli_database)
+    );
+    assert_eq!(
+        initialized["data"]["config"]["database"]["origin"]["kind"],
+        "cli"
+    );
+    let contents = fs::read_to_string(config).expect("read initialized configuration");
+    assert!(contents.contains(path_text(&cli_database)));
+    assert!(!contents.contains(path_text(&environment_database)));
+}
+
+#[test]
+fn config_init_discover_adds_only_standard_roots_that_exist() {
+    let directory = tempdir().expect("temporary directory");
+    let home = directory.path().join("home");
+    let codex = home.join(".codex/sessions");
+    fs::create_dir_all(&codex).expect("create existing Codex root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trace-index"));
+    command
+        .env_remove("TRACE_INDEX_CONFIG")
+        .env_remove("TRACE_INDEX_DB")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .env("XDG_DATA_HOME", directory.path().join("data"))
+        .args(["config", "init", "--discover"]);
+
+    let initialized = compact_json(&command.output().expect("run config init --discover"));
+    let roots = initialized["data"]["config"]["roots"]
+        .as_array()
+        .expect("effective roots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["label"], "codex");
+    assert_eq!(roots[0]["path"], path_text(&codex));
+}
+
+#[test]
+fn config_check_warning_only_report_exits_successfully() {
+    let directory = tempdir().expect("temporary directory");
+    let config = directory.path().join("config.toml");
+    compact_json(&run(&["--config", path_text(&config), "config", "init"]));
+
+    let checked = compact_json(&run(&["--config", path_text(&config), "config", "check"]));
+    assert_eq!(checked["data"]["valid"], true);
+    assert_eq!(checked["data"]["configured_sync_ready"], false);
+    assert_eq!(checked["data"]["issues"][0]["level"], "warning");
+    assert_eq!(checked["data"]["issues"][0]["code"], "no_configured_roots");
+}
+
+#[test]
+fn docs_ignore_global_storage_selectors_without_opening_them() {
+    let directory = tempdir().expect("temporary directory");
+    let missing_config = directory.path().join("missing.toml");
+    let missing_database = directory.path().join("missing.sqlite");
+    let listed = compact_json(&run(&[
+        "--config",
+        path_text(&missing_config),
+        "--db",
+        path_text(&missing_database),
+        "docs",
+        "list",
+    ]));
+    assert!(
+        listed["data"]["topics"]
+            .as_array()
+            .is_some_and(|topics| !topics.is_empty())
+    );
+    assert!(!missing_database.exists());
+}
+
+#[test]
+fn ordinary_sync_reuses_the_policy_owned_by_a_non_empty_database() {
+    let directory = tempdir().expect("temporary directory");
+    let database = directory.path().join("index.sqlite");
+    let trace = directory.path().join("trace.jsonl");
+    let config = directory.path().join("config.toml");
+    write_codex_trace(&trace, "stored policy request", "finished");
+
+    let first = compact_json(&run(&[
+        "--db",
+        path_text(&database),
+        "index",
+        "sync",
+        path_text(&trace),
+        "--max-text-bytes",
+        "5",
+        "--progress",
+        "off",
+    ]));
+    assert_eq!(
+        first["data"]["indexing_policy"]["max_published_text_bytes"],
+        5
+    );
+
+    fs::write(
+        &config,
+        format!(
+            "schema_version = 1\ndatabase = {database:?}\n\n[indexing]\nmax_published_text_bytes = 6\n\n[[roots]]\npath = {trace:?}\n"
+        ),
+    )
+    .expect("write configuration with a different initial policy");
+    let second = compact_json(&run(&[
+        "--config",
+        path_text(&config),
+        "index",
+        "sync",
+        "--progress",
+        "off",
+    ]));
+    assert_eq!(
+        second["data"]["indexing_policy"]["max_published_text_bytes"],
+        5
+    );
+}
+
+#[test]
+fn index_rejects_a_policy_change_after_sources_exist() {
+    let directory = tempdir().expect("temporary directory");
+    let (database, trace, report) = index_fixture(directory.path(), "policy request");
+    assert_eq!(
+        report["data"]["indexing_policy"]["max_published_text_bytes"],
+        65536
+    );
+
+    let changed = run(&[
+        "--db",
+        path_text(&database),
+        "index",
+        "sync",
+        path_text(&trace),
+        "--max-text-bytes",
+        "5",
+        "--progress",
+        "off",
+    ]);
+    assert!(!changed.status.success());
+    assert!(changed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("indexing policy mismatch"));
+
+    let status = compact_json(&run(&["--db", path_text(&database), "index", "status"]));
+    assert_eq!(
+        status["data"]["indexing_policy"]["max_published_text_bytes"],
+        65536
+    );
+}
+
+#[test]
 fn root_help_teaches_the_current_control_plane_and_model() {
     let output = run(&["--help"]);
     assert!(output.status.success());
@@ -142,6 +370,31 @@ fn root_help_teaches_the_current_control_plane_and_model() {
 
 #[test]
 fn conditional_guidance_lives_with_the_command_that_needs_it() {
+    let init = run(&["config", "init", "--help"]);
+    assert!(init.status.success());
+    let init = String::from_utf8(init.stdout).expect("UTF-8 init help");
+    assert!(init.contains("--root <PATH>"));
+    assert!(init.contains("--discover"));
+    assert!(init.contains("does not create the database or synchronize traces"));
+    assert!(init.contains("--db records the initial database path"));
+    assert!(init.contains("initializes only a new"));
+
+    let show = run(&["config", "show", "--help"]);
+    assert!(show.status.success());
+    let show = String::from_utf8(show.stdout).expect("UTF-8 show help");
+    assert!(show.contains("absolute configured paths"));
+    assert!(show.contains("origin"));
+    assert!(show.contains("use index status"));
+
+    let check = run(&["config", "check", "--help"]);
+    assert!(check.status.success());
+    let check = String::from_utf8(check.stdout).expect("UTF-8 check help");
+    assert!(check.contains("read-only"));
+    assert!(check.contains("canonical duplication"));
+    assert!(check.contains("database path"));
+    assert!(check.contains("level=error produces valid=false"));
+    assert!(check.contains("warning-only report exits 0"));
+
     let query = run(&["query", "run", "--help"]);
     assert!(query.status.success());
     let query = String::from_utf8(query.stdout).expect("UTF-8 query help");
@@ -154,7 +407,22 @@ fn conditional_guidance_lives_with_the_command_that_needs_it() {
     let sync = String::from_utf8(sync.stdout).expect("UTF-8 sync help");
     assert!(sync.contains("This is the command that writes the index"));
     assert!(sync.contains("Without PATHS, it uses the configured [[roots]]"));
+    assert!(sync.contains("database-wide policy"));
+    assert!(sync.contains("Changing policy requires a new"));
     assert!(sync.contains("progress is written to stderr"));
+
+    let status = run(&["index", "status", "--help"]);
+    assert!(status.status.success());
+    let status = String::from_utf8(status.stdout).expect("UTF-8 status help");
+    assert!(status.contains("existing database read-only"));
+    assert!(status.contains("does not discover or"));
+    assert!(status.contains("stored indexing policy"));
+
+    let docs = run(&["docs", "list", "--help"]);
+    assert!(docs.status.success());
+    let docs = String::from_utf8(docs.stdout).expect("UTF-8 docs help");
+    assert!(docs.contains("without loading configuration"));
+    assert!(docs.contains("have no effect on docs commands"));
 
     let export = run(&["record", "export", "--help"]);
     assert!(export.status.success());

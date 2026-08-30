@@ -247,7 +247,7 @@ mod tests {
                 .find(|region| region.name == name)
                 .expect("region")
         };
-        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 21);
+        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 22);
         assert_eq!(by_name("relation-list").body.lines().count(), 7);
         assert_eq!(by_name("persist-sites").body.matches('`').count(), 6 * 2);
     }

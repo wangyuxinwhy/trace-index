@@ -19,7 +19,8 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 | `docs search` | Search bundled documentation topics |
 | `config` | Initialize and inspect trace-index configuration |
 | `config init` | Create a new configuration file without overwriting an existing one |
-| `config show` | Show the effective configuration after path and precedence resolution |
+| `config show` | Show resolved configuration values and their origins |
+| `config check` | Validate configuration and configured root readiness without mutation |
 | `index` | Maintain and inspect the current trace index |
 | `index sync` | Incrementally index supported Agent trace files or directories |
 | `index status` | Show index coverage, parse status, and source freshness |

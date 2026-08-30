@@ -5,4 +5,4 @@ pub(crate) mod db;
 pub(crate) mod persist;
 pub(crate) mod public_schema;
 pub(crate) mod schema;
-mod schema_v1;
+mod schema_v2;

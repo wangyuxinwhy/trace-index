@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::storage::db::IndexingPolicy;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordParse {
     pub status: String,
@@ -79,6 +81,7 @@ pub struct AssetExtractReport {
 pub struct IndexReport {
     pub adapters: Vec<String>,
     pub database: String,
+    pub indexing_policy: IndexingPolicy,
     pub discovered_files: usize,
     pub indexed_files: usize,
     pub unchanged_files: usize,
@@ -221,6 +224,8 @@ pub struct SourceIndexResult {
 pub struct StatusReport {
     pub database: String,
     pub storage_format: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexing_policy: Option<IndexingPolicy>,
     pub sources: usize,
     pub source_bytes: u64,
     pub indexed_bytes: u64,

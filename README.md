@@ -9,7 +9,7 @@ Trace Index is a local, bounded-memory query plane for Agent trace files. It ind
 Install from crates.io when a Rust toolchain is available:
 
 ```bash
-cargo install trace-index --version 0.1.0 --locked
+cargo install trace-index --version 0.2.0 --locked
 ```
 
 Or install a verified prebuilt binary on Apple Silicon macOS, Intel macOS, or x86-64 Linux:
@@ -24,8 +24,9 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 Create a configuration and enable the trace roots you want to index:
 
 ```bash
-trace-index config init
+trace-index config init --discover
 trace-index config show
+trace-index config check
 trace-index index sync
 trace-index index status
 ```

@@ -13,11 +13,11 @@ use crate::indexing::indexer::IndexOptions;
 use crate::indexing::status::status;
 use crate::indexing::sync::{self, SyncRoot};
 use crate::ingest::record::{export_record, extract_asset, inspect_record, verify_record};
-use crate::interface::config::{self, LoadedConfig};
+use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
 use crate::interface::output::ResponseEnvelope;
 use crate::interface::query::{public_schema, query_sql};
-use crate::storage::db::Store;
+use crate::storage::db::{IndexingPolicy, Store};
 
 pub(crate) fn run() -> Result<()> {
     let Cli {
@@ -38,7 +38,7 @@ pub(crate) fn run() -> Result<()> {
 }
 
 fn run_operational(command: Command, loaded: &LoadedConfig) -> Result<()> {
-    let database = &loaded.effective.database;
+    let database = &loaded.effective.database.path;
     let needs_write = matches!(
         &command,
         Command::Index {
@@ -76,7 +76,7 @@ fn configured_roots(loaded: &LoadedConfig) -> Vec<SyncRoot> {
         .roots
         .iter()
         .map(|root| SyncRoot {
-            name: root.name.clone(),
+            label: root.label.clone(),
             path: root.path.clone(),
         })
         .collect()
@@ -94,7 +94,7 @@ fn explicit_roots(paths: Vec<PathBuf>, loaded: &LoadedConfig) -> Result<Vec<Sync
         .into_iter()
         .enumerate()
         .map(|(index, path)| SyncRoot {
-            name: format!("argument-{}", index + 1),
+            label: Some(format!("argument-{}", index + 1)),
             path,
         })
         .collect())
@@ -120,10 +120,21 @@ fn run_config(
     database: Option<&std::path::Path>,
 ) -> Result<()> {
     match command {
-        ConfigCommand::Init => print_envelope(&config::initialize(config_file)?),
+        ConfigCommand::Init { root, discover } => {
+            print_envelope(&config::initialize(config_file, database, &root, discover)?)
+        }
         ConfigCommand::Show => {
             let loaded = config::load(config_file, database)?;
             print_envelope(&loaded.effective)
+        }
+        ConfigCommand::Check => {
+            let report = config::check(config_file, database)?;
+            let valid = report.valid;
+            print_envelope(&report)?;
+            if !valid {
+                bail!("configuration check found errors");
+            }
+            Ok(())
         }
     }
 }
@@ -131,12 +142,15 @@ fn run_config(
 fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) -> Result<()> {
     match command {
         IndexCommand::Sync(args) => {
-            if args.max_record_bytes == 0 {
-                bail!("--max-record-bytes must be greater than zero");
-            }
-            if args.max_text_bytes == 0 {
-                bail!("--max-text-bytes must be greater than zero");
-            }
+            let stored_policy = store.indexing_policy()?;
+            let index_is_empty = store.is_empty()?;
+            let policy = resolve_indexing_policy(
+                &loaded.effective.indexing,
+                stored_policy,
+                index_is_empty,
+                args.max_record_bytes,
+                args.max_text_bytes,
+            );
             let roots = explicit_roots(args.paths, loaded)?;
             let mut observer = StderrProgress::new(args.progress.into());
             let mut report = sync::execute_observed(
@@ -144,8 +158,8 @@ fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) ->
                 &roots,
                 &IndexOptions {
                     rebuild: args.rebuild,
-                    max_record_bytes: args.max_record_bytes,
-                    max_text_bytes: args.max_text_bytes,
+                    max_record_bytes: policy.max_indexed_record_bytes,
+                    max_text_bytes: policy.max_published_text_bytes,
                 },
                 &mut observer,
             )?;
@@ -172,10 +186,36 @@ fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) ->
             }
         }
         IndexCommand::Status => {
-            print_envelope(&status(store, &loaded.effective.database)?)?;
+            print_envelope(&status(store, &loaded.effective.database.path)?)?;
         }
     }
     Ok(())
+}
+
+/// Resolves the policy requested by one synchronization at the point where
+/// CLI, configuration, and storage state meet.
+fn resolve_indexing_policy(
+    configured: &EffectiveIndexingConfig,
+    stored: Option<IndexingPolicy>,
+    index_is_empty: bool,
+    cli_max_record_bytes: Option<usize>,
+    cli_max_text_bytes: Option<usize>,
+) -> IndexingPolicy {
+    let baseline = if index_is_empty {
+        IndexingPolicy {
+            max_indexed_record_bytes: configured.max_indexed_record_bytes.value,
+            max_published_text_bytes: configured.max_published_text_bytes.value,
+        }
+    } else {
+        stored.unwrap_or(IndexingPolicy {
+            max_indexed_record_bytes: configured.max_indexed_record_bytes.value,
+            max_published_text_bytes: configured.max_published_text_bytes.value,
+        })
+    };
+    IndexingPolicy {
+        max_indexed_record_bytes: cli_max_record_bytes.unwrap_or(baseline.max_indexed_record_bytes),
+        max_published_text_bytes: cli_max_text_bytes.unwrap_or(baseline.max_published_text_bytes),
+    }
 }
 
 fn run_schema(store: &Store, command: SchemaCommand) -> Result<()> {

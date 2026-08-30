@@ -5,37 +5,48 @@ description: Configure Codex, Pi, and Claude Code roots, synchronize them, and i
 
 # Configure and Synchronize Traces
 
-Create a configuration file once:
+Create a configuration file once. To opt in to every standard Runtime root that currently exists:
 
 ```bash
-trace-index config init
+trace-index config init --discover
 ```
 
-The generated file sets the database path and leaves example roots commented out. Enable only the Runtime roots that should be indexed:
+For precise scope, provide one or more roots explicitly instead. `config init` does not create the database or synchronize any traces:
+
+```bash
+trace-index config init \
+  --root ~/.codex/sessions \
+  --root /work/selected-traces
+```
+
+The generated file records the schema version, initial indexing policy, and only the roots explicitly selected or discovered. Paths supplied to `config init` are written as absolute paths. `database` is omitted unless initialization receives `--db`; the platform default remains visible through `config show`.
 
 ```toml
-database = "~/.local/share/trace-index/index.sqlite"
+schema_version = 1
+
+[indexing]
+max_indexed_record_bytes = 16777216
+max_published_text_bytes = 65536
 
 [[roots]]
-name = "codex"
-path = "~/.codex/sessions"
+path = "/absolute/path/to/.codex/sessions"
 
 [[roots]]
-name = "pi"
-path = "~/.pi/agent/sessions"
-
-[[roots]]
-name = "claude"
-path = "~/.claude/projects"
+path = "/work/selected-traces"
 ```
 
-`config init` refuses to overwrite an existing file. Before indexing, inspect the fully resolved database and root paths:
+Roots added by `--discover` carry the diagnostic labels `codex`, `pi`, or `claude`.
+
+`config init` refuses to overwrite an existing file. Before indexing, inspect the resolved database, origins, initial policy, and root paths, then run the read-only root and database-path preflight:
 
 ```bash
 trace-index config show
+trace-index config check
 ```
 
 Relative paths are resolved against the configuration file's directory. `~` expands to the current user's home directory.
+
+The root label is diagnostic only. Trace Index detects the Codex, Pi, or Claude Code Adapter from each Source's contents.
 
 ## Synchronize configured or one-off paths
 
@@ -52,6 +63,8 @@ trace-index index sync /path/to/one.jsonl /path/to/session-directory
 ```
 
 Synchronization is the only operation that updates the index. `schema`, `query`, `record`, and `asset` commands never refresh it implicitly.
+
+The first synchronization persists `max_indexed_record_bytes` and `max_published_text_bytes` as one database-wide policy. Once the index contains Sources, that stored policy is authoritative and ordinary synchronization reuses it even if the configuration file later changes. A conflicting `--max-record-bytes` or `--max-text-bytes` request is rejected. Use a new database and reindex every Source to change this policy; `--rebuild` does not replace it.
 
 Normal synchronization skips unchanged Sources, reads append-only growth incrementally, and rebuilds a Source when its already indexed prefix changed. Use `--rebuild` only when matching Sources must be re-read even though their indexed prefixes still match:
 

@@ -16,9 +16,9 @@ pub(crate) type ContentHash = [u8; 32];
 /// Text retained by an Adapter, bounded for predictable indexing cost.
 ///
 /// The digest is over the complete input. Adapters use it while pairing
-/// Runtime Records; private storage combines it with the published prefix
-/// length when deduplicating Semantic text. The optional text is the bounded
-/// value that can enter the Item's Semantic value.
+/// Runtime Records and private storage uses it to deduplicate Semantic text.
+/// The optional text is the bounded value that can enter the Item's Semantic
+/// value.
 #[derive(Debug, Clone)]
 pub(crate) struct BoundedText {
     pub hash: ContentHash,

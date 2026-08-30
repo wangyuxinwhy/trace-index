@@ -14,7 +14,7 @@ use crate::storage::db::Store;
 
 #[derive(Debug, Clone)]
 pub struct SyncRoot {
-    pub name: String,
+    pub label: Option<String>,
     pub path: PathBuf,
 }
 
@@ -107,8 +107,8 @@ fn canonical_paths(roots: &[SyncRoot]) -> Result<Vec<PathBuf>> {
         .map(|root| {
             root.path.canonicalize().with_context(|| {
                 format!(
-                    "failed to canonicalize trace root {:?}: {}",
-                    root.name,
+                    "failed to canonicalize trace root {}: {}",
+                    root.label.as_deref().unwrap_or("<unlabelled>"),
                     root.path.display()
                 )
             })
@@ -143,7 +143,7 @@ mod tests {
         let report = execute(
             &mut store,
             &[SyncRoot {
-                name: "test".to_owned(),
+                label: Some("test".to_owned()),
                 path: trace,
             }],
             &IndexOptions {
@@ -167,7 +167,7 @@ mod tests {
         let report = execute(
             &mut store,
             &[SyncRoot {
-                name: "test".to_owned(),
+                label: Some("test".to_owned()),
                 path: trace,
             }],
             &IndexOptions {

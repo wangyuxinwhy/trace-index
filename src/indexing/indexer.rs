@@ -29,7 +29,7 @@ use crate::ingest::source::{
 use crate::interface::output::{IndexMetrics, IndexReport, SourceIndexResult};
 use crate::shell::syntax;
 use crate::storage::blob::BlobCache;
-use crate::storage::db::{SourceState, Store, display_database_path, to_sql_i64};
+use crate::storage::db::{IndexingPolicy, SourceState, Store, display_database_path, to_sql_i64};
 use crate::storage::persist::{clear_projection, write_session};
 
 const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
@@ -85,6 +85,10 @@ fn index_paths_internal(
     telemetry: &mut IndexTelemetry,
     progress: &mut dyn ProgressObserver,
 ) -> Result<IndexReport> {
+    store.ensure_indexing_policy(IndexingPolicy {
+        max_indexed_record_bytes: options.max_record_bytes,
+        max_published_text_bytes: options.max_text_bytes,
+    })?;
     let discover_started = Instant::now();
     let files = discover_jsonl_files(paths)?;
     let source_bytes = files.iter().try_fold(0_u64, |total, path| {
@@ -100,10 +104,12 @@ fn index_paths_internal(
     if files.is_empty() {
         bail!("no .jsonl files found in the supplied paths");
     }
-
     let mut report = IndexReport {
         adapters: Vec::new(),
         database: display_database_path(store.path()),
+        indexing_policy: store
+            .indexing_policy()?
+            .context("indexing policy must be established before synchronization")?,
         discovered_files: files.len(),
         indexed_files: 0,
         unchanged_files: 0,
