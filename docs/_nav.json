@@ -1,0 +1,25 @@
+[
+  {
+    "text": "Start Here",
+    "link": "/start-here"
+  },
+  {
+    "text": "Guides",
+    "link": "/how-to/install",
+    "activeMatch": "^/how-to/"
+  },
+  {
+    "text": "Design",
+    "link": "/design/",
+    "activeMatch": "^/design/"
+  },
+  {
+    "text": "Reference",
+    "link": "/reference/cli",
+    "activeMatch": "^/reference/"
+  },
+  {
+    "text": "GitHub",
+    "link": "https://github.com/wangyuxinwhy/trace-index"
+  }
+]

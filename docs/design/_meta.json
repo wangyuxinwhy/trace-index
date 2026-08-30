@@ -1,0 +1,18 @@
+[
+  "index",
+  "what-is-trace-index",
+  "design-principles",
+  "domain-model",
+  {
+    "type": "dir",
+    "name": "model",
+    "label": "Domain Objects",
+    "collapsible": true,
+    "collapsed": false
+  },
+  "evidence-and-provenance",
+  "semantic-text",
+  "index-consistency",
+  "architecture",
+  "glossary"
+]

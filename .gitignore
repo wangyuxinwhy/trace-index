@@ -1,0 +1,10 @@
+/target/
+/doc_build/
+/node_modules/
+/.private/
+.DS_Store
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*.*.*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate release version
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${REQUESTED_TAG:-${GITHUB_REF_NAME}}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          }
+          version="${tag#v}"
+          manifest_version="$(git show "$tag:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)"
+          test "$version" = "$manifest_version" || {
+            echo "tag $tag does not match Cargo.toml $manifest_version" >&2
+            exit 1
+          }
+          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Verify native binary and package
+        run: |
+          binary="target/${{ matrix.target }}/release/trace-index"
+          test "$("$binary" --version)" = "trace-index ${{ needs.validate.outputs.version }}"
+          scripts/package-release.sh \
+            --binary "$binary" \
+            --target "${{ matrix.target }}" \
+            --output-root dist \
+            --version "${{ needs.validate.outputs.version }}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/v${{ needs.validate.outputs.version }}/*
+          if-no-files-found: error
+
+  release:
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist/v${{ needs.validate.outputs.version }}
+          merge-multiple: true
+      - name: Assemble and verify release
+        run: |
+          scripts/assemble-release.sh \
+            --dist-root dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --require-target x86_64-unknown-linux-gnu \
+            --require-target x86_64-apple-darwin \
+            --require-target aarch64-apple-darwin
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.validate.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Trace Index ${{ needs.validate.outputs.tag }}" \
+            --notes-from-tag \
+            dist/install.sh \
+            dist/latest \
+            dist/manifest.json \
+            dist/v${{ needs.validate.outputs.version }}/*

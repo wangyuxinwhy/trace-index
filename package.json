@@ -1,0 +1,14 @@
+{
+  "name": "trace-index-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "docs:dev": "rspress dev",
+    "docs:build": "rspress build",
+    "docs:preview": "rspress preview",
+    "docs:check": "npm run docs:build && node scripts/check-docs-output.mjs"
+  },
+  "devDependencies": {
+    "@rspress/core": "2.0.21"
+  }
+}

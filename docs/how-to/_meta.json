@@ -1,0 +1,7 @@
+[
+  "install",
+  "configure-and-sync",
+  "query-evidence",
+  "search-literals",
+  "inspect-and-export"
+]
