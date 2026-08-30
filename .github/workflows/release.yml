@@ -114,13 +114,30 @@ jobs:
             END { if (!found) exit 1 }
           ' CHANGELOG.md > release-notes.md
           test -s release-notes.md
-          gh release create "${{ needs.validate.outputs.tag }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --draft \
-            --title "Trace Index ${{ needs.validate.outputs.tag }}" \
-            --notes-file release-notes.md \
-            dist/install.sh \
-            dist/latest \
-            dist/manifest.json \
-            dist/v${{ needs.validate.outputs.version }}/*
+          tag="${{ needs.validate.outputs.tag }}"
+          assets=(
+            dist/install.sh
+            dist/latest
+            dist/manifest.json
+            dist/v"$version"/*.tar.gz
+            dist/v"$version"/*.tar.gz.sha256
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "Trace Index $tag" \
+              --notes-file release-notes.md
+            gh release upload "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "Trace Index $tag" \
+              --notes-file release-notes.md \
+              "${assets[@]}"
+          fi
