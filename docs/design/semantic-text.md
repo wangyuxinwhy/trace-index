@@ -1,14 +1,14 @@
 ---
 title: "Trace Index 语义文本 Blob"
-description: "解释有界语义文本怎样通过私有 Blob 共享存储并透明重建，以及它与 Item、全文检索和 Record 证据的责任边界。"
+description: "解释有界语义文本怎样通过内部 Blob 共享存储并透明重建，以及它与 Item、全文检索和 Record 证据的责任边界。"
 ---
 
 # Trace Index 语义文本 Blob
 
 > [!IMPORTANT]
-> Trace Index 的 Blob 是 Item 语义文本的私有共享存储，不是领域对象、公共查询入口或原始证据。它在不改变 `Item.semantic` 契约的前提下，让有界文本只保存一次；查询时仍返回完整的类型化 `TextContent`，需要完整 Runtime 表示时仍沿 Item 的 Record 证据回到 Source。
+> Trace Index 的 Blob 是 Item 语义文本的内部共享存储，不是领域对象、公共查询入口或原始证据。它在不改变 `Item.semantic` 契约的前提下，让有界文本只保存一次；查询时仍返回完整的类型化 `TextContent`，需要完整 Runtime 表示时仍沿 Item 的 Record 证据回到 Source。
 
-[Trace Index Item 语义契约](/design/model/semantic-contract) 定义哪些字段是 `TextContent` 以及它们对完整性和规模的承诺。本页只解释 Blob 怎样在架构中兑现这些承诺，并把公开语义、私有存储、全文检索和原始证据分开。精确表、列、散列算法、默认上限和迁移版本由代码仓库拥有。
+[Trace Index Item 语义契约](/design/model/semantic-contract) 定义哪些字段是 `TextContent` 以及它们对完整性和规模的承诺。本页只解释 Blob 怎样在架构中兑现这些承诺，并把公开语义、内部存储、全文检索和原始证据分开。精确表、列、散列算法、默认上限和迁移版本由代码仓库拥有。
 
 ## Blob 解决什么问题
 
@@ -30,7 +30,7 @@ flowchart LR
     semantic --> split{是否是 Blob 支持的\n语义文本成员}
     split -->|是| blob[共享 Blob]
     split -->|否| inline[普通类型化字段]
-    blob --> item[Item 私有骨架 + Blob 引用]
+    blob --> item[Item 内部骨架 + Blob 引用]
     inline --> item
     item --> public[公开 Item 重建 TextContent]
     item --> evidence[Record 证据]
@@ -39,7 +39,7 @@ flowchart LR
 
 Adapter 先从 Source 中的完整文本建立一个有界表示。它保留完整文本的内容身份和规模，只让 UTF-8 字符边界上的前缀进入语义投影。投影先构造并验证完整的类型化 `SemanticValue`，再把其中选定的 `TextContent` 交给 Blob 存储。
 
-Item 私有表示保存不含该文本对象的类型化骨架，并引用共享 Blob。公共查询按 `semantic.role` 规定的路径把 Blob 重新放回 `text` 或 `summary`，所以调用方看到的仍是领域契约定义的 `SemanticValue`，不需要知道 Blob 身份或布局。
+Item 内部表示保存不含该文本对象的类型化骨架，并引用共享 Blob。公共查询按 `semantic.role` 规定的路径把 Blob 重新放回 `text` 或 `summary`，所以调用方看到的仍是领域契约定义的 `SemanticValue`，不需要知道 Blob 身份或布局。
 
 ## 共享身份由完整内容和发布范围共同决定
 
@@ -57,7 +57,7 @@ Blob 不是通用 JSON 外置层。它只承载 `SemanticValue` 中由 Item 契�
 
 工具参数和 Shell 结构仍是各自的类型化值。完整的结构化参数可以直接进入 ToolCall；参数一旦只剩有界前缀，就不能伪装成完整 JSON，而应省略公开参数并通过 Record 恢复。Shell Fragment 的嵌套文字与解析结构也不因为体积而自动变成通用 Blob 引用。
 
-这个边界保证私有存储不会反过来扩张或模糊 `SemanticValue`。新增 Blob 用途必须先有领域契约中的真实文本成员，不能只因为某段 JSON 较大就外置。
+这个边界保证内部存储不会反过来扩张或模糊 `SemanticValue`。新增 Blob 用途必须先有领域契约中的真实文本成员，不能只因为某段 JSON 较大就外置。
 
 ## 与全文检索和原始证据的边界
 
@@ -65,7 +65,7 @@ Blob、全文检索和 Record 回答三个不同问题：
 
 | 能力 | 回答的问题 | 是否拥有事实 |
 | --- | --- | --- |
-| Blob | 怎样低成本保存和重建已发布的有界语义文本 | 否，只是 Item 的私有存储 |
+| Blob | 怎样低成本保存和重建已发布的有界语义文本 | 否，只是 Item 的内部存储 |
 | 全文检索 | 哪些 Item 可能包含待查文字 | 否，只是由选定 Item 文本重建的候选入口 |
 | Record | Runtime 实际持久化了什么、完整内容位于哪里 | 是，拥有物理证据 |
 
@@ -81,7 +81,7 @@ Source 改写、Adapter 规则变化或文本上限变化需要重建受影响�
 
 ## 必须保持的不变量
 
-1. 私有存储前后的公开 `Item.semantic` 在类型和含义上相同。
+1. 内部存储前后的公开 `Item.semantic` 在类型和含义上相同。
 2. 有界前缀必须在 UTF-8 边界结束，并通过 `value` 与 `full_bytes` 的关系如实表达完整性。
 3. 内容共享不能合并不同的完整文本或不同的发布范围，也不能合并 Item 身份和证据。
 4. Blob 身份、摘要和物理布局不得进入公共领域契约；普通分析只依赖 Item。
