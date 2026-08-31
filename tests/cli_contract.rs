@@ -345,6 +345,17 @@ fn root_help_teaches_the_current_control_plane_and_model() {
         "Domain Relations: sources, records, sessions, loops, items",
         "Access Relations: blobs, item_search",
         "Start from items and select facts with semantic.role",
+        "Investigation defaults:",
+        "Orient with the conversation spine.",
+        "human.request, human.steering, agent.commentary, and agent.final_answer",
+        "This is an orientation view, not the complete evidence set.",
+        "A text-search hit is only a candidate.",
+        "Match evidence depth to the claim.",
+        "Order Loops by session_position and Items by loop_position.",
+        "Report contributing and missing counts",
+        "separately; an inner join can silently redefine the population",
+        "These are independent boundaries.",
+        "Stop when the requested claim is supported.",
         "Reads never synchronize or mutate the index",
     ] {
         assert!(help.contains(required), "help omitted {required:?}");

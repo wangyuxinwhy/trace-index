@@ -99,6 +99,58 @@ Query correctly:
   4. Follow record_ids only for exact Runtime evidence or index-integrity debugging.
   5. Use schema get before extracting an unfamiliar JSON shape.
 
+Investigation defaults:
+  Orient with the conversation spine.
+    When the first question is what a Session was doing, begin with
+    human.request, human.steering, agent.commentary, and agent.final_answer.
+    Together they give a compact view of the Human's goals and corrections,
+    the Agent's stated progress, and the answer delivered at each Loop.
+
+    This is an orientation view, not the complete evidence set. Commentary can
+    be provisional or later corrected, and a Final Answer can report an action
+    without proving that the corresponding Tool Call succeeded.
+
+  Narrow candidates before expanding text.
+    First count or group the candidate population, then constrain it by the
+    Runtime, Session, context, time, and Semantic roles relevant to the claim.
+    Read the conversation spine for plausible Sessions before retrieving broad
+    Tool Outputs, reasoning, or whole-conversation text.
+
+    A text-search hit is only a candidate. Confirm its Session, time, role, and
+    exact Blob text before treating it as relevant evidence. A candidate that
+    helps exclude a Session can still be useful even when it is absent from the
+    final answer.
+
+  Match evidence depth to the claim.
+    Use Human roles for what the Human requested, corrected, accepted, or
+    rejected. Use Agent commentary and Final Answers for what the Agent said it
+    was doing or concluded. Use Tool Calls and Tool Outputs for what was
+    attempted and what the tool returned. Inspect physical Records only when an
+    exact Runtime field or source representation is required.
+
+  Reconstruct chronology with stable positions.
+    Order Loops by session_position and Items by loop_position. Timestamps and
+    numeric ids can help identify scope, but they are not substitutes for these
+    published ordering fields when reconstructing a Session timeline.
+
+  Preserve the intended population and missing values.
+    For a claim about a population, state the denominator before joining an
+    optional value or relationship. Report contributing and missing counts
+    separately; an inner join can silently redefine the population, and a
+    missing value is not zero.
+
+  Verify completeness at each boundary.
+    Check whether the query result is complete, whether returned cells or Blob
+    text are truncated, and whether the Runtime had already truncated a Tool
+    Output. These are independent boundaries. Partial rows or text can support
+    a bounded example, but not an exhaustive conclusion unless the missing
+    coverage is made explicit.
+
+  Stop when the requested claim is supported.
+    Expand from orientation to execution evidence only as far as the question
+    requires. Preserve unresolved ambiguity instead of selecting a convenient
+    Session, interpretation, or denominator.
+
 Operational boundary:
   Reads never synchronize or mutate the index. Run index sync explicitly only
   when newly written traces are required. Commands return compact JSON on stdout;

@@ -4,6 +4,12 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-31
+
+### Changed
+
+- Root Help now teaches general investigation defaults for orienting with the conversation spine, narrowing candidates, matching evidence depth to claims, reconstructing chronology, preserving missing coverage, checking completeness boundaries, and stopping when the requested claim is supported.
+
 ## [0.2.0] - 2026-08-30
 
 ### Changed
@@ -29,6 +35,7 @@ Initial public release.
 - Compact machine-readable output, explicit incomplete-result hints, bundled Agent documentation, and an Agent skill.
 - Storage Format 1. Databases created by non-public development builds must be rebuilt.
 
-[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wangyuxinwhy/trace-index/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wangyuxinwhy/trace-index/releases/tag/v0.1.0
