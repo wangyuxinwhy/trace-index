@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Prints one line describing the environment this Agent is running in right now, discovered live,
+# never copied from a note. It is the contactNote for `presence available` and the answer to "can a
+# path I send you be opened where you are?".
+#
+#   whereami          one line, at most 500 characters (the contactNote limit)
+#   whereami --json   the same facts as JSON, for scripts
+#
+# Facts and where each comes from:
+#   harness   Claude Code if CLAUDECODE=1, Codex if CODEX_* is set, else "unknown harness"
+#   host      `hostname -s`; the credential label in AgentID is not the host name
+#   user      $USER
+#   repo      Git remote `origin` of the repository this script lives in, plus the current commit
+#   root      the repository's working-tree path on this host
+#
+# The line says explicitly that paths resolve only on this host, so a reader compares `host` with
+# their own before using one.
+#
+# Historical live check: 2026-09-03, macOS Claude Code. Local fixture checks of both runtime labels,
+# Git facts and the output limit: 2026-09-05, tests/scripts.test.mjs. Labels do not prove event delivery.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${CLAUDECODE:-}" == "1" ]]; then harness="Claude Code${CLAUDE_CODE_EXECPATH:+ $(basename "$CLAUDE_CODE_EXECPATH")}"
+elif env | grep -q '^CODEX_'; then harness="Codex"
+else harness="unknown harness"; fi
+host="$(hostname -s 2>/dev/null || hostname)"
+user="${USER:-$(id -un)}"
+root="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "not a git repository")"
+remote="$(git -C "$here" remote get-url origin 2>/dev/null || echo "no origin")"
+commit="$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo "?")"
+
+if [[ "${1:-}" == "--json" ]]; then
+  H="$harness" HO="$host" U="$user" RT="$root" RM="$remote" C="$commit" python3 -c '
+import json, os; print(json.dumps({"harness": os.environ["H"], "host": os.environ["HO"], "user": os.environ["U"], "repo": os.environ["RM"], "commit": os.environ["C"], "root": os.environ["RT"]}))'
+else
+  line="$harness on host $host as $user; repo $remote@$commit checked out at $root; local paths resolve only on host $host"
+  echo "${line:0:500}"
+fi

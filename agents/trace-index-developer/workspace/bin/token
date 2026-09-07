@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# API-2 cutover helper: exact canonical-name binding; stdout is secret token output.
+# token [--fresh] [audience]. Capture stdout; never run it bare in a transcript.
+# Keep the old operational helper until AgentID's coordinated cutover.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 - "$here/../../agent.json" "$@" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
+
+os.umask(0o077)
+
+def fail(message, code=2):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+args = sys.argv[2:]
+fresh = bool(args and args[0] == '--fresh')
+if fresh:
+    args.pop(0)
+if len(args) > 1:
+    fail('usage: token [--fresh] [audience]')
+audience = args[0] if args else 'agentid'
+if not re.fullmatch(r'[a-z][a-z0-9_-]{0,62}', audience):
+    fail('invalid audience')
+
+try:
+    binding = Path(sys.argv[1])
+    if not binding.is_file():
+        fail('no binding; see PREPARE.md')
+    b = json.loads(binding.read_text())
+    name, issuer, pointer = b.get('name'), b.get('issuer'), b.get('credential')
+    if ('id' in b or not isinstance(name, str) or not 3 <= len(name) <= 63
+            or name == 'me' or not re.fullmatch(r'[a-z][a-z0-9]*(?:-[a-z0-9]+)*', name)):
+        fail('canonical name binding required; no legacy id fallback; see PREPARE.md')
+    if not isinstance(issuer, str) or not isinstance(pointer, str):
+        fail('invalid binding; see PREPARE.md')
+    origin = urlsplit(issuer)
+    if (not origin.hostname or origin.username or origin.password or origin.query
+            or origin.fragment or origin.path not in ('', '/')
+            or (origin.scheme != 'https' and not (origin.scheme == 'http'
+                and origin.hostname in ('localhost', '127.0.0.1', '::1')))):
+        fail('issuer must be an HTTPS origin (HTTP loopback is only for local tests)')
+    if pointer.startswith('file:'):
+        credential = Path(pointer[5:]).expanduser().read_text().rstrip('\n')
+    elif pointer.startswith('env:'):
+        credential = os.environ.get(pointer[4:], '')
+        if not credential:
+            fail('credential variable is empty or unset; see PREPARE.md')
+    else:
+        fail('unsupported credential pointer; see PREPARE.md')
+    if not credential:
+        fail('empty credential; see PREPARE.md')
+    cache_dir = Path.home() / '.cache/agentid/tokens' / origin.netloc / name
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache_dir.chmod(0o700)
+    cache = cache_dir / f'{audience}.json'
+    if not fresh:
+        try:
+            saved = json.loads(cache.read_text())
+            if (saved['expires_at'] - time.time() > 120
+                    and isinstance(saved['access_token'], str) and saved['access_token']):
+                print(saved['access_token'])
+                raise SystemExit(0)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    # Secret request data goes through stdin, never argv, environment or diagnostics.
+    result = subprocess.run(
+        ['curl', '--silent', '--fail', '--max-time', '30', '--max-filesize', '65536',
+         '--header', 'Content-Type: application/x-www-form-urlencoded',
+         '--data-binary', '@-', f'{issuer.rstrip("/")}/oauth/token'],
+        input=urlencode({'grant_type': 'client_credentials', 'client_id': name,
+                         'client_secret': credential, 'audience': audience}),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=35)
+    if result.returncode:
+        fail('token exchange failed; upstream diagnostics suppressed', 1)
+    response = json.loads(result.stdout)
+    token, expires = response.get('access_token'), response.get('expires_in')
+    if (not isinstance(token, str) or not token or len(token) > 32768
+            or '\n' in token or '\r' in token
+            or type(expires) is not int or not 0 < expires <= 86400):
+        fail('invalid token response; upstream diagnostics suppressed', 1)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=cache_dir, delete=False) as out:
+            temporary = Path(out.name)
+            json.dump({'access_token': token, 'expires_at': time.time() + expires}, out)
+        os.replace(temporary, cache)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print(token)
+except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+    fail('token helper failed; private diagnostics suppressed; see PREPARE.md', 1)
+PY

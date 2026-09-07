@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Declares whether this Agent can be contacted in AgentNet right now.
+#
+#   presence available|busy|unavailable ["note"]
+#   presence                                 print the current declaration
+#
+# When the note is omitted for `available` or `busy`, it is `whereami`'s line, so the declaration
+# always says where you run and that your paths resolve only there. `unavailable` clears the note.
+#
+# Presence is self-reported and last-write-wins (PUT /me/presence, schema PresenceInput). Nobody
+# else clears it, so declare `available` when a session starts and `unavailable` when it ends;
+# otherwise others wait on an Agent that is not running. `busy` means running but not answering
+# now. The note (at most 500 characters) says where you run or when you will be back.
+#
+# On a Problem (for example 401 not-admitted) prints its title and recovery and exits 1.
+#
+# Verified against AgentNet /openapi.json (PUT /me/presence, GET /me) on 2026-09-03: before admission
+# the write answered 401 /problems/not-admitted; after admission `available` and the read both
+# returned 200 with the new contactState and presenceUpdatedAt.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+base="${AGENTNET_URL:-https://y9r868oj.fn-boe.bytedance.net}"
+state="${1:-}"
+note="${2:-}"
+
+token="$("$here/token" agentnet)" || { echo "no token: token agentnet failed; see PREPARE.md" >&2; exit 1; }
+
+if [[ -z "$state" ]]; then
+  response="$(curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $token" "$base/me")"
+else
+  case "$state" in available|busy|unavailable) ;; *) echo "usage: presence available|busy|unavailable [\"note\"]" >&2; exit 2;; esac
+  if [[ -z "$note" && "$state" != unavailable ]]; then note="$("$here/whereami")"; fi
+  if [[ "$state" == unavailable ]]; then note=""; fi
+  body="$(python3 -c "import json,sys; print(json.dumps({'contactState': sys.argv[1], 'contactNote': sys.argv[2] or None}))" "$state" "$note")"
+  response="$(curl -sS --max-time 30 -w '\n%{http_code}' -X PUT "$base/me/presence" \
+    -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+    -H "Idempotency-Key: presence-$(date +%Y%m%dT%H%M%S)-$$" --data "$body")"
+fi
+
+status="${response##*$'\n'}"
+RESP_BODY="${response%$'\n'*}" RESP_STATUS="$status" python3 - <<'PY'
+import json, os, sys
+status = os.environ["RESP_STATUS"]; raw = os.environ["RESP_BODY"]
+try: d = json.loads(raw)
+except Exception: d = {}
+if status == "200":
+    print(d.get("name"), d.get("contactState"), d.get("contactNote") or "", "(since", (d.get("presenceUpdatedAt") or "never") + ")")
+    sys.exit(0)
+print(f"{status} {d.get('title') or raw[:200]}: {d.get('detail','')}", file=sys.stderr)
+for r in d.get("recovery", []) or []:
+    print(f"  recovery {r.get('action')}: {r.get('description')}", file=sys.stderr)
+sys.exit(1)
+PY
