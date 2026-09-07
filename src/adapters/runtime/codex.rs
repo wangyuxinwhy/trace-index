@@ -2114,10 +2114,74 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CodexProjector, classify_message, linked_session_from_tagged_text, runtime_arguments,
-        shell_command, structured_tool_end_facts, tool_output_facts,
+        CodexProjector, classify_message, linked_session_from_tagged_text, parse_timestamp_ms,
+        runtime_arguments, shell_command, structured_tool_end_facts, tool_output_facts,
     };
     use crate::adapters::{projection::ItemDetail, semantic};
+
+    /// 2026-09-07T13:40:00Z as epoch milliseconds, computed independently of
+    /// the parser under test: days since 1970-01-01 times 86 400 seconds.
+    const SEPT_7_2026_13_40_UTC_MS: i64 = (20_703 * 86_400 + 13 * 3_600 + 40 * 60) * 1_000;
+
+    #[test]
+    fn timestamp_offsets_resolve_to_the_same_utc_instant() {
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T13:40:00Z"),
+            Some(SEPT_7_2026_13_40_UTC_MS)
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T21:40:00+08:00"),
+            Some(SEPT_7_2026_13_40_UTC_MS)
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T08:10:00-05:30"),
+            Some(SEPT_7_2026_13_40_UTC_MS)
+        );
+    }
+
+    #[test]
+    fn timestamp_offset_crossing_midnight_keeps_the_utc_day() {
+        let sixteen_utc = parse_timestamp_ms("2026-09-07T16:00:00Z");
+        assert_eq!(
+            parse_timestamp_ms("2026-09-08T00:00:00+08:00"),
+            sixteen_utc,
+            "next-day midnight in UTC+8 is the same instant as 16:00Z"
+        );
+        assert_eq!(
+            sixteen_utc,
+            Some(SEPT_7_2026_13_40_UTC_MS + (2 * 3_600 + 20 * 60) * 1_000)
+        );
+    }
+
+    #[test]
+    fn timestamp_without_zone_is_read_as_utc() {
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T13:40:00"),
+            parse_timestamp_ms("2026-09-07T13:40:00Z"),
+            "a bare timestamp is not shifted by any host time zone"
+        );
+    }
+
+    #[test]
+    fn timestamp_fraction_is_truncated_to_milliseconds() {
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T13:40:00.5Z"),
+            Some(SEPT_7_2026_13_40_UTC_MS + 500)
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-07T13:40:00.123456+08:00"),
+            Some(SEPT_7_2026_13_40_UTC_MS - 8 * 3_600 * 1_000 + 123)
+        );
+    }
+
+    #[test]
+    fn malformed_timestamp_is_absent_not_zero() {
+        assert_eq!(parse_timestamp_ms(""), None);
+        assert_eq!(parse_timestamp_ms("2026-09-07"), None);
+        assert_eq!(parse_timestamp_ms("2026/09/07T13:40:00Z"), None);
+        assert_eq!(parse_timestamp_ms("2026-09-07T13:40:00 UTC"), None);
+        assert_eq!(parse_timestamp_ms("2026-09-07T13:40:00+xx:00"), None);
+    }
 
     #[test]
     fn nested_tool_metadata_does_not_invent_zero_duration() {

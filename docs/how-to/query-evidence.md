@@ -212,6 +212,15 @@ LIMIT 50;
 
 Times are epoch milliseconds. Use half-open intervals for complete dates. `sessions.created_at` and `items.occurred_at` describe domain time; Source synchronization metadata does not prove when an interaction happened.
 
+Every stored time is a UTC instant: the Adapters convert each Runtime timestamp's offset before storing it, and query results return the same milliseconds regardless of the machine that runs the query. A calendar date in a person's time zone is a different boundary from the same date in UTC, so write the boundary with its offset instead of assuming `Z`:
+
+```sql
+SELECT unixepoch('2026-09-07T00:00:00+08:00') * 1000 AS start_ms,
+       unixepoch('2026-09-08T00:00:00+08:00') * 1000 AS end_ms;
+```
+
+Keep the instant in machine-facing output and convert only when a person reads the result. Format with the reader's fixed offset and state that offset in the text, for example `strftime('%Y-%m-%d %H:%M', occurred_at / 1000, 'unixepoch', '+08:00')` reported as `2026-09-07 21:40 +08:00`; substitute the offset of the person reading the result. Do not use the SQLite `'localtime'` modifier: it reads the time zone of the host running the query, so the same Item renders differently on different machines and the result carries no offset a reader could verify.
+
 ## Analyze tool calls and outputs as Items
 
 There is no derived tool-call View. Calls and outputs remain separate Items so the timeline stays truthful. A Tool Output points back to its call through `semantic.value.call_item_id` when the Runtime supplied enough evidence to resolve it.

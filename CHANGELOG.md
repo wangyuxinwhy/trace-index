@@ -4,6 +4,10 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- The query how-to now states that every stored time is a UTC instant, shows how to write a calendar-date boundary with an explicit offset, and explains how to format results with the reader's fixed offset instead of the host-dependent SQLite `'localtime'` modifier. Storage, relations, ordering, and JSON output are unchanged.
+
 ## [0.2.1] - 2026-08-31
 
 ### Changed
