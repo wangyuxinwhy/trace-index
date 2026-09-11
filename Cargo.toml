@@ -28,6 +28,11 @@ publish = ["crates-io"]
 name = "trace-index"
 path = "src/main.rs"
 
+[workspace]
+members = ["python"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"

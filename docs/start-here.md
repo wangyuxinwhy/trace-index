@@ -5,9 +5,11 @@ description: Build an index and answer from its bounded public query plane.
 
 # Start Here
 
-This tutorial builds a local index, introduces the five public domain objects, and queries trace facts without guessing the current schema.
+This tutorial builds a local index, introduces the five public domain objects, and queries trace facts without guessing the current schema. CLI and Python share the same domain model and SQL; only invocation and result handling differ.
 
-## 1. Create a configuration
+## 1. Select an index
+
+**CLI:** create a configuration if the selected file does not exist; otherwise use `config show` and `config check` without running initialization again.
 
 ```bash
 trace-index config init --discover
@@ -17,6 +19,16 @@ trace-index config check
 
 `--discover` adds only standard Codex, Pi, and Claude Code roots that currently exist. Use repeatable `--root PATH` instead when the scope must be explicit. Initialization creates and validates only the configuration file; it does not create the database or synchronize traces. You can also leave roots empty and pass files or directories directly to `index sync`.
 
+**Python:** configuration creation remains a CLI operation, not an import side effect. You can reuse an existing configuration, or select a database and explicit trace paths without creating a configuration file. In the examples below, `database` is your chosen index path and `trace_paths` is your chosen sequence of trace files or directories:
+
+```python
+import trace_index as ti
+
+index = ti.Index(db=database)
+```
+
+This selects the index without opening or creating it. Use `ti.Index()` to reuse default configuration selection, or `ti.Index.open(db=database)` when an existing readable index is required immediately.
+
 ## 2. Build the index
 
 ```bash
@@ -24,7 +36,17 @@ trace-index index sync
 trace-index index status
 ```
 
-Synchronization is explicit. Read commands never refresh or modify the index.
+**Python:** synchronize the selected paths explicitly, then inspect coverage:
+
+```python
+report = index.sync(trace_paths)
+print(report.indexed_files, report.skipped_files, report.incomplete_files)
+print(index.status())
+```
+
+Use `index.sync()` without paths to reuse configured roots. Recognized-source failures raise `ti.SyncFailedError` with `.report`; successful Source writes remain committed. See `help(ti.Index.sync)` for partial failures and policy overrides.
+
+Synchronization is explicit. Reads never refresh or modify the index.
 
 ## 3. Discover the current contract
 
@@ -37,7 +59,19 @@ trace-index schema get items --compact
 trace-index schema get blobs --compact
 ```
 
-Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions. The bundled help, documentation, and schema describe the running binary; do not substitute names remembered from another version.
+Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions.
+
+**Python:** use the standard module and method help, then discover the selected index's Schema:
+
+```python
+help(ti)
+help(ti.Index.query)
+print(index.schema())
+print(index.schema("items"))
+print(index.schema("blobs"))
+```
+
+`index.schema()` lists Relation names and descriptions; supplying a Relation also returns its columns. The bundled help, documentation, and schema describe the running binary or installed wheel; do not substitute names remembered from another version. Python Help and bundled docs require neither an index nor a CLI executable.
 
 ## 4. Understand the five objects
 
@@ -59,17 +93,26 @@ Item ──cites──> one or more physical Records
 
 ## 5. Read Items in a Loop
 
-Items in a Loop have a zero-based `loop_position`:
+Items in a Loop have a zero-based `loop_position`. Substitute a Loop id selected from your index:
 
-```bash
-trace-index query run --stdin <<'SQL'
+```sql
 SELECT loop_position,
        semantic
 FROM items
 WHERE loop_id = 1
 ORDER BY loop_position;
-SQL
 ```
+
+SQL blocks are shared between interfaces. On the CLI, pass SQL through `query run --stdin` with a quoted heredoc, or save it to a file and use `query run --file`. In Python, pass the SQL string directly:
+
+```python
+result = index.query(sql)
+print(result.complete, result.cells_truncated, result.hint)
+for row in result.rows:
+    print(row)
+```
+
+Here `sql` is the SQL block you selected, not a filename. `result.require_complete()` can reject query-budget omissions before an exhaustive claim; it does not prove index freshness, full Source text, or absence of earlier Runtime truncation. Python SQL TEXT cells, including JSON-encoded `semantic`, remain strings; use SQL projections or decode explicitly. See `help(ti.Index.query)` for bound parameters and `help(ti.QueryBudget)` for budgets.
 
 Some Items belong to a Session without belonging to a Loop. For those rows, `loop_id` and `loop_position` are both null.
 
@@ -144,7 +187,7 @@ The trigram match is case-folded and intentionally broader than exact literal ma
 
 `item_search` covers only semantic text explicitly selected by the Item contract. For one- or two-character literals, first narrow with `sessions`, `loops`, or `semantic.role`, then join the referenced Blobs and scan that smaller text set with `instr()`.
 
-When the input contains only partial natural-language clues, use several literal anchors, compare compact candidate Sessions against the supplied scope, and expand only supported candidates. Do not dump every hit; preserve ambiguity when the available evidence does not identify one Session. The complete funnel and bounded SQL patterns are in `trace-index docs get how-to/search-literals`.
+When the input contains only partial natural-language clues, use several literal anchors, compare compact candidate Sessions against the supplied scope, and expand only supported candidates. Do not dump every hit; preserve ambiguity when the available evidence does not identify one Session. The complete funnel and bounded SQL patterns are in the bundled `how-to/search-literals` topic, available through `trace-index docs get how-to/search-literals` or `ti.doc("how-to/search-literals")`.
 
 ## 8. Follow an Item to physical evidence
 
@@ -162,6 +205,19 @@ Inspect a selected Record when the user asks for its raw representation, exact s
 trace-index record inspect 12345
 ```
 
-For normal analysis, answer from bounded queries over the five public objects and stop once the requested claim is supported.
+**Python:** use the Record id selected for physical evidence:
 
-Continue with `trace-index docs get how-to/query-evidence`, or discover every topic with `trace-index docs list`.
+```python
+inspection = index.record(record_id).inspect()
+print(inspection.raw_verified, inspection.externalized_values)
+```
+
+Both interfaces return a bounded, display-safe representation, not byte-exact raw JSON. Failed source verification yields a reference rather than unverified content. Export and media extraction remain explicit CLI operations.
+
+For normal analysis, answer from bounded queries over the five public objects and stop once the requested claim is supported. Close Python connections when finished, or use an `Index` context manager for a bounded investigation:
+
+```python
+index.close()
+```
+
+Continue with the bundled `how-to/query-evidence` topic, or discover every topic: CLI `trace-index docs list`; Python `ti.docs()` and `ti.doc("how-to/query-evidence")`.

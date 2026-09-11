@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "trace-index"
+dynamic = ["version"]
+description = "Native, bounded, source-traceable queries over agent traces"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/wangyuxinwhy/trace-index"
+Documentation = "https://wangyuxinwhy.github.io/trace-index/"
+
+[tool.maturin]
+manifest-path = "python/Cargo.toml"
+python-source = "python"
+module-name = "trace_index._native"
+features = ["pyo3/extension-module"]
+include = [
+  "python/trace_index/*.pyi",
+  "python/trace_index/py.typed",
+  { path = "scripts/generate_python_stubs.py", format = "sdist" },
+]

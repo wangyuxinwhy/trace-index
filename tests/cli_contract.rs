@@ -328,6 +328,12 @@ fn root_help_teaches_the_current_control_plane_and_model() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    let shared = trace_index::api::agent_context();
+    assert_eq!(
+        help.matches(&shared).count(),
+        1,
+        "CLI must embed the common bootstrap exactly once"
+    );
     for required in [
         "docs get start-here",
         "schema list",

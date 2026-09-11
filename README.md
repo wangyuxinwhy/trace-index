@@ -19,6 +19,10 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   'https://github.com/wangyuxinwhy/trace-index/releases/latest/download/install.sh' | sh
 ```
 
+For native Python access through PyO3, including `Index.query()` and explicit
+`Index.sync()`, see the [Python package guide](python/README.md). It uses the same
+Rust engine without invoking the CLI.
+
 ## Start in 60 seconds
 
 Create a configuration and enable the trace roots you want to index:
@@ -46,7 +50,7 @@ Read commands never synchronize or mutate the index. Run `index sync` explicitly
 
 ## For Agents
 
-Root Help establishes the complete conceptual model needed to query correctly. Conditional workflows, exact Semantic value shapes, and search mechanics are available through bundled, version-matched documentation:
+Root Help establishes the complete conceptual model needed to query correctly. Python's standard `help(trace_index)` shares that same bootstrap knowledge after `import trace_index`; use `help(trace_index.Index.query)` for Python-specific invocation. Conditional workflows, exact Semantic value shapes, and search mechanics are available through bundled, version-matched documentation:
 
 ```bash
 trace-index docs list

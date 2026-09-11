@@ -4,8 +4,13 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Native PyO3 Python bindings with reusable read-only connections, parameterized bounded SQL, Schema and bundled documentation discovery, Record verification and inspection, and explicit incremental `Index.sync()` with partial-failure reports. Wheels bundle the Rust engine; no CLI subprocess is required.
+
 ### Changed
 
+- CLI root Help and the standard Python module docstring now share one bootstrap context, with Semantic meanings generated from domain types and Relation names from public Schema declarations. Python method docstrings and the shared first-use tutorial document native invocation without duplicating the domain model; installed-wheel Help, doctests, and CLI parity are verified.
 - The query how-to now states that every stored time is a UTC instant, shows how to write a calendar-date boundary with an explicit offset, and explains how to format results with the reader's fixed offset instead of the host-dependent SQLite `'localtime'` modifier. Storage, relations, ordering, and JSON output are unchanged.
 
 ## [0.2.1] - 2026-08-31
