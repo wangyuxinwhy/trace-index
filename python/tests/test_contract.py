@@ -262,7 +262,7 @@ class Contract(unittest.TestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         try:
-            with self.assertRaises(ti.QueryTimeoutError):
+            with self.assertRaises(ti.QueryTimeoutError) as caught:
                 self.index.query(
                     "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x",
                     budget=ti.QueryBudget(timeout_seconds=0.1),
@@ -271,7 +271,55 @@ class Contract(unittest.TestCase):
             done.set()
             thread.join()
         self.assertGreater(len(ticks), 2)
+        message = str(caught.exception)
+        self.assertIn("0.1-second timeout", message)
+        self.assertNotIn("0-second timeout", message)
+        self.assertNotIn("query timeout: interrupted", message)
         self.assertEqual(self.index.query("SELECT 1 AS n").returned, 1)
+
+    def test_fractional_timeout_diagnostics_and_connection_recovery(self):
+        self.build()
+        for seconds in (0.000001, 0.01, 1.25):
+            with self.subTest(seconds=seconds):
+                with self.assertRaises(ti.QueryTimeoutError) as caught:
+                    self.index.query(
+                        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x",
+                        budget=ti.QueryBudget(timeout_seconds=seconds),
+                    )
+                # Decimal formatting need not match Python's exponent notation.
+                message = str(caught.exception)
+                duration = re.search(
+                    r"query exceeded the ([0-9.e+-]+)-second timeout;", message
+                )
+                self.assertIsNotNone(duration, message)
+                self.assertEqual(float(duration.group(1)), seconds)
+                self.assertIn("COUNT or GROUP BY", message)
+                self.assertNotIn("--", message)
+                self.assertEqual(self.index.query("SELECT 1 AS n").rows[0]["n"], 1)
+
+    def test_schema_lookup_errors_are_distinct_from_index_access_errors(self):
+        self.build()
+        with self.assertRaises(ti.UnknownRelationError) as caught:
+            self.index.schema("not_a_public_relation")
+        self.assertIsInstance(caught.exception, ti.TraceIndexError)
+        self.assertNotIsInstance(caught.exception, ti.IndexUnavailableError)
+        self.assertIn("not_a_public_relation", str(caught.exception))
+        self.assertEqual(self.index.schema("items").relations[0].name, "items")
+        self.assertEqual(self.index.status().sources, 1)
+        missing = self.root / "missing.sqlite"
+        with ti.Index(db=missing) as index:
+            with self.assertRaises(ti.IndexUnavailableError):
+                index.schema("items")
+        self.assertFalse(missing.exists())
+        incompatible = self.root / "incompatible.sqlite"
+        with sqlite3.connect(incompatible) as db:
+            db.execute("PRAGMA user_version=2147483647")
+        with ti.Index(db=incompatible) as index:
+            with self.assertRaises(ti.IndexUnavailableError):
+                index.schema("items")
+        self.index.close()
+        with self.assertRaises(ti.ClosedIndexError):
+            self.index.schema("not_a_public_relation")
 
     def test_parallel_same_and_separate_handles(self):
         self.build()
@@ -424,6 +472,37 @@ class Contract(unittest.TestCase):
         self.assertTrue(report.complete)
         self.assertEqual(report.skipped_files, 1)
         self.assertEqual(report.incomplete_files, 1)
+
+    @unittest.skipUnless(
+        os.environ.get("TRACE_INDEX_CLI"), "compiled CLI path required for parity"
+    )
+    def test_cli_and_python_report_the_configured_timeout(self):
+        self.build()
+        sql = "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x"
+        run = subprocess.run(
+            [
+                os.environ["TRACE_INDEX_CLI"],
+                "--db",
+                str(self.db),
+                "query",
+                "run",
+                sql,
+                "--timeout-seconds",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(run.returncode, 1)
+        self.assertEqual(run.stdout, "")
+        with self.assertRaises(ti.QueryTimeoutError) as caught:
+            self.index.query(sql, budget=ti.QueryBudget(timeout_seconds=1))
+        for message in (run.stderr, str(caught.exception)):
+            self.assertIn("query exceeded the 1-second timeout;", message)
+            self.assertIn("COUNT or GROUP BY", message)
+            self.assertNotIn("query timeout: interrupted", message)
+        self.assertEqual(self.index.query("SELECT 1 AS n").rows[0]["n"], 1)
 
     @unittest.skipUnless(
         os.environ.get("TRACE_INDEX_CLI"), "compiled CLI path required for parity"

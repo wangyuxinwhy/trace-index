@@ -91,10 +91,9 @@ pub fn query_sql_native(
         .connection()
         .progress_handler(0, None::<fn() -> bool>)?;
     match result {
-        Err(error) if is_query_interrupted(&error) => Err(error.context(QueryFailure::Timeout).context(format!(
-            "query exceeded the {}-second timeout; narrow by source, project, actor, or time, or estimate candidate density with COUNT or GROUP BY before fetching rows",
-            timeout.as_secs()
-        ))),
+        Err(error) if is_query_interrupted(&error) => {
+            Err(error.context(QueryFailure::Timeout(timeout)))
+        }
         Err(error) if has_literal_newline_escape(sql) && is_unrecognized_token(&error) => {
             Err(error.context(
                 "SQL contains a literal `\\n`; pass real newline characters in the SQL string, not escaped backslash-n text",
@@ -333,14 +332,18 @@ fn native_cell(value: ValueRef<'_>, max_bytes: usize) -> (NativeCell, bool) {
 pub enum QueryFailure {
     Parameter(String),
     Rejected(String),
-    Timeout,
+    Timeout(Duration),
 }
 
 impl std::fmt::Display for QueryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parameter(message) | Self::Rejected(message) => f.write_str(message),
-            Self::Timeout => f.write_str("query timeout"),
+            Self::Timeout(limit) => write!(
+                f,
+                "query exceeded the {}-second timeout; narrow by source, project, actor, or time, or estimate candidate density with COUNT or GROUP BY before fetching rows",
+                limit.as_secs_f64()
+            ),
         }
     }
 }
@@ -486,7 +489,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{UnknownRelation, public_schema, query_sql};
+    use super::{QueryFailure, UnknownRelation, public_schema, query_sql};
     use crate::storage::db::Store;
 
     fn insert_search_fixture(store: &Store) {
@@ -710,6 +713,29 @@ mod tests {
     }
 
     #[test]
+    fn timeout_diagnostics_preserve_the_configured_duration() {
+        for (limit, seconds) in [
+            (Duration::ZERO, "0"),
+            (Duration::from_nanos(1), "0.000000001"),
+            (Duration::from_micros(1), "0.000001"),
+            (Duration::from_millis(1), "0.001"),
+            (Duration::from_millis(10), "0.01"),
+            (Duration::from_millis(100), "0.1"),
+            (Duration::from_secs(1), "1"),
+            (Duration::from_millis(1250), "1.25"),
+            (Duration::from_secs(30), "30"),
+        ] {
+            let message = QueryFailure::Timeout(limit).to_string();
+            assert!(
+                message.starts_with(&format!("query exceeded the {seconds}-second timeout;")),
+                "{message}"
+            );
+            assert!(message.contains("COUNT or GROUP BY"), "{message}");
+            assert!(!message.contains("--"), "{message}");
+        }
+    }
+
+    #[test]
     fn explains_query_timeouts_with_recovery_guidance() {
         let directory = tempdir().expect("temp directory");
         let database = directory.path().join("index.sqlite");
@@ -729,8 +755,13 @@ mod tests {
             Duration::ZERO,
         )
         .expect_err("interrupt long query");
+        assert!(
+            matches!(timeout.downcast_ref::<QueryFailure>(), Some(QueryFailure::Timeout(limit)) if limit.is_zero())
+        );
         let message = format!("{timeout:#}");
         assert!(message.contains("0-second timeout"), "{message}");
+        assert_eq!(message.matches("query exceeded").count(), 1);
+        assert!(!message.contains("query timeout: interrupted"), "{message}");
         assert!(message.contains("COUNT or GROUP BY"), "{message}");
     }
 

@@ -225,9 +225,12 @@ with patch('subprocess.Popen', side_effect=AssertionError('no subprocess in Help
     def test_unknown_relation_recovery_uses_python_discovery(self):
         with ti.Index(db=self.db) as index:
             index.sync([self.source])
-            with self.assertRaises(ti.IndexUnavailableError) as caught:
+            with self.assertRaises(ti.UnknownRelationError) as caught:
                 index.schema("nonexistent-relation")
+            self.assertNotIsInstance(caught.exception, ti.IndexUnavailableError)
             self.assertIn("index.schema()", str(caught.exception))
+            self.assertIn("UnknownRelationError", inspect.getdoc(ti.Index.schema))
+            self.assertIn("index.schema()", inspect.getdoc(ti.UnknownRelationError))
             self.assertNotIn("trace-index schema list", str(caught.exception))
             if os.environ.get("TRACE_INDEX_CLI"):
                 run = subprocess.run(

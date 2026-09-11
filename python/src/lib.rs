@@ -14,6 +14,12 @@ use trace_index::api::{self, NativeCell, Parameter, QueryFailure};
 create_exception!(_native, TraceIndexError, PyException);
 create_exception!(_native, ConfigurationError, TraceIndexError);
 create_exception!(_native, IndexUnavailableError, TraceIndexError);
+create_exception!(
+    _native,
+    UnknownRelationError,
+    TraceIndexError,
+    "The requested public Schema relation does not exist; use index.schema() to discover names."
+);
 create_exception!(_native, ClosedIndexError, TraceIndexError);
 create_exception!(_native, QueryError, TraceIndexError);
 create_exception!(_native, ParameterError, QueryError);
@@ -31,7 +37,7 @@ fn error(error: anyhow::Error, fallback: fn(String) -> PyErr) -> PyErr {
         return match kind {
             QueryFailure::Parameter(_) => ParameterError::new_err(message),
             QueryFailure::Rejected(_) => QueryRejectedError::new_err(message),
-            QueryFailure::Timeout => QueryTimeoutError::new_err(message),
+            QueryFailure::Timeout(_) => QueryTimeoutError::new_err(message),
         };
     }
     fallback(message)
@@ -173,7 +179,7 @@ impl NativeIndex {
             self.access(|index| {
                 index.schema(relation.as_deref()).map_err(|e| {
                     if e.is::<api::UnknownRelation>() {
-                        IndexUnavailableError::new_err(format!(
+                        UnknownRelationError::new_err(format!(
                             "{e}\nHint: use index.schema() to discover valid public relation names"
                         ))
                     } else {
@@ -315,6 +321,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         TraceIndexError,
         ConfigurationError,
         IndexUnavailableError,
+        UnknownRelationError,
         ClosedIndexError,
         QueryError,
         ParameterError,

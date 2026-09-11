@@ -35,6 +35,7 @@ from ._native import (
     RecordError,
     SyncError,
     TraceIndexError,
+    UnknownRelationError,
     __version__,
 )
 
@@ -508,9 +509,11 @@ class Index:
 
         budget defaults to QueryBudget(); use help(QueryBudget) for defaults and
         ranges. QueryError describes SQL/authorization failures; timeout raises
-        QueryTimeoutError. Opening failures raise IndexUnavailableError; a closed
-        handle raises ClosedIndexError. A bounded partial result is returned
-        normally. Use require_complete() when all SQL rows/cells are required;
+        QueryTimeoutError, reporting the configured execution limit including
+        fractional seconds, not measured elapsed time. Opening failures raise
+        IndexUnavailableError; a closed handle raises ClosedIndexError. A bounded
+        partial result is returned normally. Use require_complete() when all SQL
+        rows/cells are required;
         this does not prove index freshness, Source coverage, or Runtime completeness.
         No implicit synchronization, pagination, text expansion, or retry occurs.
 
@@ -547,8 +550,10 @@ class Index:
 
         relation=None lists names and descriptions, without columns. Supplying
         one relation includes column names, SQL types, nullability and meanings.
-        Does not synchronize. Unknown relations and unavailable/incompatible
-        indexes raise IndexUnavailableError; closed handles raise ClosedIndexError.
+        Does not synchronize. An unknown relation raises UnknownRelationError;
+        use schema() without a name to discover valid names.
+        Unavailable/incompatible indexes raise IndexUnavailableError, while
+        closed handles raise ClosedIndexError.
 
         Example (index is open):
             >>> relation = index.schema("items").relations[0]
@@ -690,6 +695,7 @@ __all__ = [
     "TraceIndexError",
     "ConfigurationError",
     "IndexUnavailableError",
+    "UnknownRelationError",
     "ClosedIndexError",
     "QueryError",
     "ParameterError",

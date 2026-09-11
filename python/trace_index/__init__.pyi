@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, TypeAlias
 from . import _native
-from ._native import ClosedIndexError as ClosedIndexError, ConfigurationError as ConfigurationError, IndexUnavailableError as IndexUnavailableError, ParameterError as ParameterError, QueryError as QueryError, QueryRejectedError as QueryRejectedError, QueryTimeoutError as QueryTimeoutError, RecordError as RecordError, SyncError as SyncError, TraceIndexError as TraceIndexError, __version__ as __version__
+from ._native import ClosedIndexError as ClosedIndexError, ConfigurationError as ConfigurationError, IndexUnavailableError as IndexUnavailableError, ParameterError as ParameterError, QueryError as QueryError, QueryRejectedError as QueryRejectedError, QueryTimeoutError as QueryTimeoutError, RecordError as RecordError, SyncError as SyncError, TraceIndexError as TraceIndexError, UnknownRelationError as UnknownRelationError, __version__ as __version__
 PathInput: TypeAlias = str | os.PathLike[str]
 Parameter: TypeAlias = None | bool | int | float | str | bytes
 Cell: TypeAlias = None | int | float | str | bytes
@@ -384,9 +384,11 @@ class Index:
 
         budget defaults to QueryBudget(); use help(QueryBudget) for defaults and
         ranges. QueryError describes SQL/authorization failures; timeout raises
-        QueryTimeoutError. Opening failures raise IndexUnavailableError; a closed
-        handle raises ClosedIndexError. A bounded partial result is returned
-        normally. Use require_complete() when all SQL rows/cells are required;
+        QueryTimeoutError, reporting the configured execution limit including
+        fractional seconds, not measured elapsed time. Opening failures raise
+        IndexUnavailableError; a closed handle raises ClosedIndexError. A bounded
+        partial result is returned normally. Use require_complete() when all SQL
+        rows/cells are required;
         this does not prove index freshness, Source coverage, or Runtime completeness.
         No implicit synchronization, pagination, text expansion, or retry occurs.
 
@@ -408,8 +410,10 @@ class Index:
 
         relation=None lists names and descriptions, without columns. Supplying
         one relation includes column names, SQL types, nullability and meanings.
-        Does not synchronize. Unknown relations and unavailable/incompatible
-        indexes raise IndexUnavailableError; closed handles raise ClosedIndexError.
+        Does not synchronize. An unknown relation raises UnknownRelationError;
+        use schema() without a name to discover valid names.
+        Unavailable/incompatible indexes raise IndexUnavailableError, while
+        closed handles raise ClosedIndexError.
 
         Example (index is open):
             >>> relation = index.schema("items").relations[0]
@@ -471,4 +475,4 @@ class Index:
             True
         """
         ...
-__all__ = ['Index', 'QueryBudget', 'QueryResult', 'Schema', 'Relation', 'Column', 'docs', 'doc', 'DocTopic', 'SyncReport', 'SourceResult', 'IndexingPolicy', 'StatusReport', 'ObservedRole', 'Record', 'InspectionBudget', 'RecordSource', 'RecordParse', 'RecordMetadata', 'RecordVerification', 'RecordInspection', 'TraceIndexError', 'ConfigurationError', 'IndexUnavailableError', 'ClosedIndexError', 'QueryError', 'ParameterError', 'QueryTimeoutError', 'QueryRejectedError', 'IncompleteResultError', 'SyncError', 'SyncFailedError', 'RecordError', 'PathInput', 'Parameter', 'Cell', 'Row', 'JSONValue', '__version__']
+__all__ = ['Index', 'QueryBudget', 'QueryResult', 'Schema', 'Relation', 'Column', 'docs', 'doc', 'DocTopic', 'SyncReport', 'SourceResult', 'IndexingPolicy', 'StatusReport', 'ObservedRole', 'Record', 'InspectionBudget', 'RecordSource', 'RecordParse', 'RecordMetadata', 'RecordVerification', 'RecordInspection', 'TraceIndexError', 'ConfigurationError', 'IndexUnavailableError', 'UnknownRelationError', 'ClosedIndexError', 'QueryError', 'ParameterError', 'QueryTimeoutError', 'QueryRejectedError', 'IncompleteResultError', 'SyncError', 'SyncFailedError', 'RecordError', 'PathInput', 'Parameter', 'Cell', 'Row', 'JSONValue', '__version__']

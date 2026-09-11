@@ -8,6 +8,11 @@ All notable public changes to Trace Index are documented here.
 
 - Native PyO3 Python bindings with reusable read-only connections, parameterized bounded SQL, Schema and bundled documentation discovery, Record verification and inspection, and explicit incremental `Index.sync()` with partial-failure reports. Wheels bundle the Rust engine; no CLI subprocess is required.
 
+### Fixed
+
+- Query timeout diagnostics retain the configured fractional-second limit and avoid a redundant timeout context; execution budgets are unchanged.
+- Python `Index.schema(name)` now raises `UnknownRelationError` (a `TraceIndexError`), not `IndexUnavailableError`, for an unknown public Relation. Missing or incompatible indexes still raise `IndexUnavailableError`.
+
 ### Changed
 
 - CLI root Help and the standard Python module docstring now share one bootstrap context, with Semantic meanings generated from domain types and Relation names from public Schema declarations. Python method docstrings and the shared first-use tutorial document native invocation without duplicating the domain model; installed-wheel Help, doctests, and CLI parity are verified.
