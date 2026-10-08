@@ -43,13 +43,14 @@ pub(crate) fn detect(bytes: &[u8]) -> Result<AdapterKind> {
         return Ok(AdapterKind::Pi);
     }
     // Claude Code stamps the session on nearly every record, including the
-    // control-plane ones a file can open with. The exception is a subagent
-    // launch record, which names the agent instead.
+    // control-plane ones a file can open with. Subagent launch and fork
+    // context records name the agent instead.
     if value.get("sessionId").and_then(Value::as_str).is_some() {
         return Ok(AdapterKind::Claude);
     }
-    if matches!(record_type, "started" | "result")
-        && value.get("agentId").and_then(Value::as_str).is_some()
+    if (matches!(record_type, "started" | "result")
+        && value.get("agentId").and_then(Value::as_str).is_some())
+        || super::runtime::claude::fork_context_identity(&value).is_some()
     {
         return Ok(AdapterKind::Claude);
     }
@@ -163,6 +164,23 @@ mod tests {
             detect(br#"{"type":"started","key":"v2:a","agentId":"a1"}"#).unwrap(),
             AdapterKind::Claude
         );
+    }
+
+    #[test]
+    fn detects_claude_fork_headers_only_with_structured_identities() {
+        assert_eq!(
+            detect(br#"{"type":"fork-context-ref","agentId":"child","parentSessionId":"parent"}"#)
+                .unwrap(),
+            AdapterKind::Claude
+        );
+        for invalid in [
+            br#"{"type":"fork-context-ref","agentId":"child"}"#.as_slice(),
+            br#"{"type":"fork-context-ref","agentId":"","parentSessionId":"parent"}"#.as_slice(),
+            br#"{"type":"fork-context-ref","agentId":"child","parentSessionId":42}"#.as_slice(),
+            br#"{"type":"unknown","agentId":"child","parentSessionId":"parent"}"#.as_slice(),
+        ] {
+            assert!(detect(invalid).is_err());
+        }
     }
 
     #[test]

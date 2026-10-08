@@ -12,6 +12,7 @@ All notable public changes to Trace Index are documented here.
 - Pi system prompt and tool-loadout declarations no longer open a Loop or misclassify the first Human request as steering. Prompt patches, compaction checkpoints, and context edits are published without rewriting historical messages; retry recovery stays in its outer Loop. Tool duration and per-response model metadata are preserved.
 - Codex turn-scoped `token_usage_record` counters update unfinished and completed Loops without adding legacy usage twice. Native `CommandExecution` completion events expose commands executed through JavaScript orchestration, with correlated outputs and source witnesses; event order and repeated completions preserve arguments, working directories, and output boundaries.
 - Claude Code model-context and progress-reminder attachments use their known Runtime roles instead of `runtime.unknown`.
+- Claude Code fork-context reference headers identify child traces and preserve parent links and context-reference evidence without copying inherited parent messages or opening a Loop.
 
 ### Changed
 

@@ -56,6 +56,17 @@ pub(crate) fn record_facts(value: &Value) -> RecordFacts {
     }
 }
 
+/// A fork header identifies the child Source and its parent without a
+/// `sessionId` stamp. The referenced parent context is not present here.
+pub(crate) fn fork_context_identity(value: &Value) -> Option<(&str, &str)> {
+    if string(value, "type") != Some("fork-context-ref") {
+        return None;
+    }
+    let agent = string(value, "agentId").filter(|id| !id.is_empty())?;
+    let parent = string(value, "parentSessionId").filter(|id| !id.is_empty())?;
+    Some((agent, parent))
+}
+
 /// The type of the first content block, which says what a message record
 /// actually carries: a prompt, a tool result, reasoning, or a tool call.
 fn leading_block_type(value: &Value) -> Option<&str> {
@@ -186,6 +197,8 @@ struct SessionBuilder {
     session_uuid: Option<String>,
     /// Present only for a subagent source, where it is this session's identity.
     agent_id: Option<String>,
+    /// Native parent identity and the Record declaring inherited context.
+    fork_context_reference: Option<(String, u64)>,
     ordinal: u32,
     start_seq: u64,
     end_seq: u64,
@@ -227,6 +240,7 @@ impl SessionBuilder {
         Self {
             session_uuid: None,
             agent_id: None,
+            fork_context_reference: None,
             ordinal,
             start_seq,
             end_seq: start_seq,
@@ -288,6 +302,9 @@ impl SessionBuilder {
             .or_else(|| self.session_uuid.clone())
             .unwrap_or_else(|| format!("unlabeled-{ordinal}"));
         let identity_confirmed = self.agent_id.is_some() || self.session_uuid.is_some();
+        let (forked_from_native_id, forked_from_record_seq) = self
+            .fork_context_reference
+            .map_or((None, None), |(parent, seq)| (Some(parent), Some(seq)));
         SessionProjection {
             session_uuid,
             identity_confirmed,
@@ -296,9 +313,9 @@ impl SessionBuilder {
             cwd: self.cwd,
             // Only a subagent source knows its parent: its records carry the
             // launching session's id while naming themselves by agent id.
-            forked_from_native_id: None,
+            forked_from_native_id,
             forked_from_locator: None,
-            forked_from_record_seq: None,
+            forked_from_record_seq,
             delegated_from_record_seq: is_subagent.then_some(self.start_seq),
             delegated_from_native_id: if is_subagent { self.session_uuid } else { None },
             title: None,
@@ -363,19 +380,26 @@ impl ClaudeProjector {
     /// Session-level facts repeat on nearly every record; the first sighting
     /// wins so a later relocation cannot rewrite where the work happened.
     fn absorb_session_facts(&mut self, seq: u64, value: &Value, ts_ms: Option<i64>) {
-        let session_id = string(value, "sessionId").map(str::to_owned);
+        let fork_identity = fork_context_identity(value);
+        let session_id = string(value, "sessionId")
+            .or_else(|| fork_identity.map(|(_, parent)| parent))
+            .map(str::to_owned);
         let cwd = string(value, "cwd").map(str::to_owned);
         let version = string(value, "version").map(str::to_owned);
         let branch = string(value, "gitBranch")
             .filter(|branch| !branch.is_empty())
             .map(str::to_owned);
         // A sidechain record's `agentId` is the identity of the whole source.
-        let agent_id = value
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            .then(|| string(value, "agentId").map(str::to_owned))
-            .flatten();
+        let agent_id = fork_identity
+            .map(|(agent, _)| agent.to_owned())
+            .or_else(|| {
+                value
+                    .get("isSidechain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    .then(|| string(value, "agentId").map(str::to_owned))
+                    .flatten()
+            });
 
         let session = self.session_mut(seq);
         if session.session_uuid.is_none() {
@@ -383,6 +407,13 @@ impl ClaudeProjector {
         }
         if session.agent_id.is_none() {
             session.agent_id = agent_id;
+        }
+        if let Some((agent, parent)) = fork_identity
+            && session.agent_id.as_deref() == Some(agent)
+            && session.session_uuid.as_deref() == Some(parent)
+            && session.fork_context_reference.is_none()
+        {
+            session.fork_context_reference = Some((parent.to_owned(), seq));
         }
         if session.cwd.is_none() {
             session.cwd = cwd;
@@ -914,6 +945,25 @@ impl ClaudeProjector {
     /// mode bookkeeping, cached titles, or snapshots as Items would duplicate
     /// state already represented by Session or Loop.
     fn control(&mut self, seq: u64, value: &Value, ts_ms: Option<i64>, record_kind: &str) {
+        if fork_context_identity(value).is_some() {
+            // Publish the reference, not reconstructed parent messages. A
+            // context header alone is not an execution trigger.
+            let preview = self.blob(&value.to_string());
+            self.emit(
+                seq,
+                ts_ms,
+                value,
+                ItemSeed {
+                    semantic_role: semantic::RUNTIME_SESSION_REFERENCE.to_owned(),
+                    basis: basis::RECORD_KIND,
+                    preview: Some(preview),
+                    detail: ItemDetail::Message { has_images: false },
+                    linked_session_native_id: None,
+                    searchable: false,
+                },
+            );
+            return;
+        }
         let role = match record_kind {
             // A launch and its result name the subagent Source that ran.
             "started" => semantic::SUBAGENT_ACTIVITY,

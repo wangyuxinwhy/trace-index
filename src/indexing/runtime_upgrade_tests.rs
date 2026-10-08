@@ -1,6 +1,6 @@
 //! End-to-end publication checks for newer Runtime evidence shapes.
 
-use super::{count, index_fixture, write_jsonl};
+use super::{count, index_fixture, index_paths, options, write_jsonl};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -541,4 +541,137 @@ fn claude_model_and_progress_attachments_have_known_runtime_roles() {
     assert_eq!(text(db, &items[1]), "Report progress");
     assert_eq!(text(db, &items[2]), "Elapsed time");
     assert_eq!(count(db, "loops"), 0);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one Source evolves from a fork header to a child execution"
+)]
+fn claude_fork_context_header_preserves_identity_evidence_and_append_behavior() {
+    let traces = tempdir().expect("traces");
+    let child = traces.path().join("child.jsonl");
+    let parent = traces.path().join("parent.jsonl");
+    let header = json!({"type":"fork-context-ref","agentId":"child","parentSessionId":"parent","parentLastUuid":"parent-message","contextLength":20});
+    write_jsonl(&child, std::slice::from_ref(&header));
+    let (_directory, mut store) = index_fixture(&child);
+    assert_eq!(count(store.connection(), "sessions"), 1);
+    assert_eq!(count(store.connection(), "loops"), 0);
+    let initial = semantics(store.connection());
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["role"], "runtime.context");
+    assert_eq!(initial[0]["value"]["category"], "session_reference");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text(store.connection(), &initial[0])).unwrap(),
+        header
+    );
+    let (identity, fork): (String, Option<String>) = store
+        .connection()
+        .query_row("SELECT native_id, forked_from FROM sessions", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(identity, "child");
+    assert!(fork.is_none(), "a missing parent remains unresolved");
+
+    write_jsonl(
+        &parent,
+        &[json!({"type":"mode","sessionId":"parent","mode":"default"})],
+    );
+    index_paths(&mut store, &[parent], &options(false)).expect("index parent later");
+    let (fork_parent, delegated_parent, witness_position): (String, String, i64) = store
+        .connection()
+        .query_row(
+            "SELECT p.native_id, d.native_id, r.source_position
+           FROM sessions c
+           JOIN sessions p ON p.session_id=json_extract(c.forked_from, '$.session_id')
+           JOIN sessions d ON d.session_id=json_extract(c.delegated_from, '$.session_id')
+           JOIN records r ON r.record_id=json_extract(c.forked_from, '$.record_id')
+          WHERE c.native_id='child'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            fork_parent.as_str(),
+            delegated_parent.as_str(),
+            witness_position
+        ),
+        ("parent", "parent", 0)
+    );
+
+    write_jsonl(
+        &child,
+        &[
+            header,
+            json!({"type":"assistant","sessionId":"parent","agentId":"child","isSidechain":true,"message":{"id":"response","role":"assistant","model":"test-model","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":"echo ok"}}],"usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":1,"output_tokens":7}}}),
+            json!({"type":"user","sessionId":"parent","agentId":"child","isSidechain":true,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":"ok"}]}}),
+            json!({"type":"assistant","sessionId":"parent","agentId":"child","isSidechain":true,"message":{"id":"final","role":"assistant","model":"test-model","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+        ],
+    );
+    let report =
+        index_paths(&mut store, &[child], &options(false)).expect("append child execution");
+    assert_eq!(report.indexed_records, 3);
+    assert_eq!(report.failed_files, 0);
+    assert_eq!(
+        count(store.connection(), "records"),
+        5,
+        "referenced parent context is not copied"
+    );
+    assert_eq!(count(store.connection(), "sessions"), 2);
+    assert_eq!(count(store.connection(), "loops"), 1);
+    let items = semantics(store.connection());
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "runtime.context",
+            "agent.tool_call.shell",
+            "tool.output",
+            "agent.final_answer"
+        ]
+    );
+    let (input, output): (i64, i64) = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(usage,'$.input'), json_extract(usage,'$.output') FROM loops",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((input, output), (7, 8));
+    let (native_id, parent_id, fork_witness, delegation_witness, item_witness, locator):
+        (String, String, i64, i64, i64, String) = store.connection().query_row(
+        "SELECT c.native_id, p.native_id,
+                json_extract(c.forked_from,'$.record_id'),
+                json_extract(c.delegated_from,'$.record_id'),
+                json_extract(i.record_ids,'$[0]'), src.locator
+           FROM sessions c
+           JOIN sessions p ON p.session_id=json_extract(c.forked_from,'$.session_id')
+           JOIN items i ON i.session_id=c.session_id AND json_extract(i.semantic,'$.role')='runtime.context'
+           JOIN records r ON r.record_id=json_extract(i.record_ids,'$[0]')
+           JOIN sources src USING(source_id)
+          WHERE c.native_id='child'", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        (native_id.as_str(), parent_id.as_str()),
+        ("child", "parent")
+    );
+    assert_eq!(
+        (fork_witness, delegation_witness),
+        (item_witness, item_witness)
+    );
+    assert_eq!(
+        locator,
+        traces
+            .path()
+            .join("child.jsonl")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+    );
 }
