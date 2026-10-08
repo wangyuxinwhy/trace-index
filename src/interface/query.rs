@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::ValueRef;
 
@@ -29,74 +29,26 @@ pub fn query_sql(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<SqlQueryReport> {
-    let report = query_sql_native(
-        store,
-        sql,
-        &BTreeMap::new(),
-        limit,
-        max_cell_bytes,
-        max_output_bytes,
-        timeout,
-    )?;
-    Ok(SqlQueryReport {
-        complete: report.complete,
-        incomplete_reason: report.incomplete_reason,
-        hint: report.hint,
-        returned: report.returned,
-        cells_truncated: report.cells_truncated,
-        columns: report.columns,
-        rows: report
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|(key, value)| (key, value.to_json()))
-                    .collect()
-            })
-            .collect(),
-    })
-}
-
-/// Executes the shared query engine without a JSON transport conversion.
-///
-/// # Errors
-/// Returns parameter, SQL, authorization, budget, or storage errors.
-#[allow(clippy::too_many_arguments)]
-pub fn query_sql_native(
-    store: &Store,
-    sql: &str,
-    parameters: &BTreeMap<String, rusqlite::types::Value>,
-    limit: usize,
-    max_cell_bytes: usize,
-    max_output_bytes: usize,
-    timeout: Duration,
-) -> Result<SqlQueryReport<NativeCell>> {
     if sql.trim().is_empty() {
-        return Err(QueryFailure::Rejected("SQL must not be empty".into()).into());
+        bail!("SQL must not be empty");
     }
 
     let started = Instant::now();
     store
         .connection()
         .progress_handler(10_000, Some(move || started.elapsed() >= timeout))?;
-    let result = run_query(
-        store,
-        sql,
-        parameters,
-        limit,
-        max_cell_bytes,
-        max_output_bytes,
-    );
+    let result = run_query(store, sql, limit, max_cell_bytes, max_output_bytes);
     store
         .connection()
         .progress_handler(0, None::<fn() -> bool>)?;
     match result {
-        Err(error) if is_query_interrupted(&error) => {
-            Err(error.context(QueryFailure::Timeout(timeout)))
-        }
+        Err(error) if is_query_interrupted(&error) => Err(error.context(format!(
+            "query exceeded the {}-second timeout; narrow by source, project, actor, or time, or estimate candidate density with COUNT or GROUP BY before fetching rows",
+            timeout.as_secs_f64()
+        ))),
         Err(error) if has_literal_newline_escape(sql) && is_unrecognized_token(&error) => {
             Err(error.context(
-                "SQL contains a literal `\\n`; pass real newline characters in the SQL string, not escaped backslash-n text",
+                "SQL contains a literal `\\n`; pass real newlines with `--stdin` and a quoted heredoc, or use `--file`",
             ))
         }
         result => result,
@@ -130,11 +82,10 @@ fn is_unrecognized_token(error: &anyhow::Error) -> bool {
 fn run_query(
     store: &Store,
     sql: &str,
-    parameters: &BTreeMap<String, rusqlite::types::Value>,
     limit: usize,
     max_cell_bytes: usize,
     max_output_bytes: usize,
-) -> Result<SqlQueryReport<NativeCell>> {
+) -> Result<SqlQueryReport> {
     let executing = Arc::new(AtomicBool::new(false));
     let authorizer_executing = Arc::clone(&executing);
     store
@@ -145,7 +96,6 @@ fn run_query(
     let result = run_authorized_query(
         store,
         sql,
-        parameters,
         limit,
         max_cell_bytes,
         max_output_bytes,
@@ -157,19 +107,17 @@ fn run_query(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_authorized_query(
     store: &Store,
     sql: &str,
-    parameters: &BTreeMap<String, rusqlite::types::Value>,
     limit: usize,
     max_cell_bytes: usize,
     max_output_bytes: usize,
     executing: &AtomicBool,
-) -> Result<SqlQueryReport<NativeCell>> {
+) -> Result<SqlQueryReport> {
     let mut statement = store.connection().prepare(sql)?;
     if !statement.readonly() {
-        return Err(QueryFailure::Rejected("only read-only SQL is allowed".into()).into());
+        bail!("only read-only SQL is allowed");
     }
 
     let columns = statement
@@ -179,16 +127,12 @@ fn run_authorized_query(
         .collect::<Vec<_>>();
     let unique = columns.iter().collect::<BTreeSet<_>>();
     if unique.len() != columns.len() {
-        return Err(QueryFailure::Rejected(
-            "query output has duplicate column names; use SQL aliases".into(),
-        )
-        .into());
+        bail!("query output has duplicate column names; use SQL aliases");
     }
 
-    bind_parameters(&mut statement, parameters)?;
     executing.store(true, Ordering::Relaxed);
     let result = (|| {
-        let mut query = statement.raw_query();
+        let mut query = statement.query([])?;
         let mut output = Vec::with_capacity(limit);
         let mut cells_truncated = 0;
         let mut output_bytes = 0_usize;
@@ -200,7 +144,7 @@ fn run_authorized_query(
             let mut object = BTreeMap::new();
             let mut row_cells_truncated = 0;
             for (index, name) in columns.iter().enumerate() {
-                let (value, truncated) = native_cell(row.get_ref(index)?, max_cell_bytes);
+                let (value, truncated) = value_to_json(row.get_ref(index)?, max_cell_bytes);
                 row_cells_truncated += usize::from(truncated);
                 object.insert(name.clone(), value);
             }
@@ -237,13 +181,13 @@ fn query_hint(incomplete_reason: Option<&str>, cells_truncated: usize) -> Option
     let mut parts = Vec::new();
     if let Some(reason) = incomplete_reason {
         parts.push(match reason {
-        "row_limit" => "Only part of the result set was returned because the row limit was reached. Narrow the WHERE scope, aggregate before fetching rows, or continue with a stable, unique ORDER BY key; raise the row limit only when the additional rows are necessary.".to_owned(),
-        "output_budget" => "Only part of the result set was returned because the serialized rows reached the output budget. Return identifiers, counts, or shorter snippets first; remove large columns, narrow the WHERE scope, or continue with a stable, unique ORDER BY key before raising the output byte budget.".to_owned(),
+        "row_limit" => "Only part of the result set was returned because the row limit was reached. Narrow the WHERE scope, aggregate before fetching rows, or continue with a stable, unique ORDER BY key; raise --limit only when the additional rows are necessary.".to_owned(),
+        "output_budget" => "Only part of the result set was returned because the serialized rows reached the output budget. Return identifiers, counts, or shorter snippets first; remove large columns, narrow the WHERE scope, or continue with a stable, unique ORDER BY key before raising --max-output-bytes.".to_owned(),
         _ => "Only part of the result set was returned. Narrow the query or continue from a stable boundary before treating the result as exhaustive.".to_owned(),
         });
     }
     if cells_truncated > 0 {
-        parts.push("One or more returned text or blob cells reached the cell byte budget and contain prefixes only. Do not treat those cell values as complete; project shorter snippets or fetch only selected identifiers with a larger cell budget.".to_owned());
+        parts.push("One or more returned text or blob cells reached --max-cell-bytes and contain prefixes only. Do not treat those cell values as complete; project shorter snippets or fetch only selected identifiers with a larger cell budget.".to_owned());
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
@@ -270,110 +214,6 @@ fn authorize_read_only_query(context: AuthContext<'_>, executing: bool) -> Autho
         } if executing => Authorization::Allow,
         _ => Authorization::Deny,
     }
-}
-
-/// SQL values retained without text serialization across the native boundary.
-#[derive(Debug)]
-pub enum NativeCell {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    Blob { bytes: Vec<u8>, full_bytes: usize },
-}
-
-impl NativeCell {
-    pub(crate) fn to_json(&self) -> serde_json::Value {
-        match self {
-            Self::Null => serde_json::Value::Null,
-            Self::Integer(v) => serde_json::json!(v),
-            Self::Real(v) => serde_json::json!(v),
-            Self::Text(v) => serde_json::json!(v),
-            Self::Blob { bytes, full_bytes } => {
-                let (mut value, _) = value_to_json(ValueRef::Blob(bytes), usize::MAX);
-                value["byte_length"] = serde_json::json!(full_bytes);
-                value
-            }
-        }
-    }
-}
-
-impl serde::Serialize for NativeCell {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        self.to_json().serialize(serializer)
-    }
-}
-
-fn native_cell(value: ValueRef<'_>, max_bytes: usize) -> (NativeCell, bool) {
-    match value {
-        ValueRef::Null => (NativeCell::Null, false),
-        ValueRef::Integer(v) => (NativeCell::Integer(v), false),
-        ValueRef::Real(v) => (NativeCell::Real(v), false),
-        ValueRef::Text(bytes) => {
-            let text = String::from_utf8_lossy(bytes);
-            let (text, truncated) = truncate_utf8(&text, max_bytes);
-            (NativeCell::Text(text.to_owned()), truncated)
-        }
-        ValueRef::Blob(bytes) => (
-            NativeCell::Blob {
-                bytes: bytes[..bytes.len().min(max_bytes)].to_vec(),
-                full_bytes: bytes.len(),
-            },
-            bytes.len() > max_bytes,
-        ),
-    }
-}
-
-/// Stable error categories for language bindings; messages are not parsed.
-#[derive(Debug)]
-pub enum QueryFailure {
-    Parameter(String),
-    Rejected(String),
-    Timeout(Duration),
-}
-
-impl std::fmt::Display for QueryFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parameter(message) | Self::Rejected(message) => f.write_str(message),
-            Self::Timeout(limit) => write!(
-                f,
-                "query exceeded the {}-second timeout; narrow by source, project, actor, or time, or estimate candidate density with COUNT or GROUP BY before fetching rows",
-                limit.as_secs_f64()
-            ),
-        }
-    }
-}
-impl std::error::Error for QueryFailure {}
-
-fn bind_parameters(
-    statement: &mut rusqlite::Statement<'_>,
-    parameters: &BTreeMap<String, rusqlite::types::Value>,
-) -> Result<()> {
-    let mut used = BTreeSet::new();
-    for index in 1..=statement.parameter_count() {
-        let name = statement
-            .parameter_name(index)
-            .and_then(|name| name.strip_prefix(':'))
-            .ok_or_else(|| QueryFailure::Parameter("only :name parameters are supported".into()))?;
-        let value = parameters
-            .get(name)
-            .ok_or_else(|| QueryFailure::Parameter(format!("missing parameter: {name}")))?;
-        if matches!(value, rusqlite::types::Value::Real(v) if !v.is_finite()) {
-            return Err(QueryFailure::Parameter(format!("parameter {name} must be finite")).into());
-        }
-        used.insert(name.to_owned());
-        statement.raw_bind_parameter(index, value)?;
-    }
-    for name in parameters.keys() {
-        if !used.contains(name) {
-            return Err(QueryFailure::Parameter(format!("unused parameter: {name}")).into());
-        }
-    }
-    Ok(())
 }
 
 fn value_to_json(value: ValueRef<'_>, max_bytes: usize) -> (serde_json::Value, bool) {
@@ -416,17 +256,6 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (&str, bool) {
     (&value[..boundary], true)
 }
 
-/// Unknown public Schema name. Discovery syntax belongs to each frontend.
-#[derive(Debug)]
-pub struct UnknownRelation(pub String);
-
-impl std::fmt::Display for UnknownRelation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "unknown public relation {:?}", self.0)
-    }
-}
-impl std::error::Error for UnknownRelation {}
-
 /// Describes the stable public SQL relations.
 ///
 /// # Errors
@@ -441,7 +270,10 @@ pub fn public_schema(
     if let Some(name) = requested
         && find_public_relation(name).is_none()
     {
-        return Err(UnknownRelation(name.to_owned()).into());
+        bail!(
+            "unknown public relation {name:?}\n\
+             Hint: run `trace-index schema list` to discover valid public relation names"
+        );
     }
 
     validate_public_relations(store.connection())?;
@@ -489,7 +321,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{QueryFailure, UnknownRelation, public_schema, query_sql};
+    use super::{public_schema, query_sql};
     use crate::storage::db::Store;
 
     fn insert_search_fixture(store: &Store) {
@@ -670,9 +502,8 @@ mod tests {
         .expect_err("reject literal newline escape");
         let message = format!("{escaped_newline:#}");
         assert!(message.contains("literal `\\n`"), "{message}");
-        assert!(message.contains("real newline characters"), "{message}");
-        assert!(!message.contains("--stdin"), "{message}");
-        assert!(!message.contains("--file"), "{message}");
+        assert!(message.contains("--stdin"), "{message}");
+        assert!(message.contains("--file"), "{message}");
     }
 
     #[test]
@@ -713,29 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_diagnostics_preserve_the_configured_duration() {
-        for (limit, seconds) in [
-            (Duration::ZERO, "0"),
-            (Duration::from_nanos(1), "0.000000001"),
-            (Duration::from_micros(1), "0.000001"),
-            (Duration::from_millis(1), "0.001"),
-            (Duration::from_millis(10), "0.01"),
-            (Duration::from_millis(100), "0.1"),
-            (Duration::from_secs(1), "1"),
-            (Duration::from_millis(1250), "1.25"),
-            (Duration::from_secs(30), "30"),
-        ] {
-            let message = QueryFailure::Timeout(limit).to_string();
-            assert!(
-                message.starts_with(&format!("query exceeded the {seconds}-second timeout;")),
-                "{message}"
-            );
-            assert!(message.contains("COUNT or GROUP BY"), "{message}");
-            assert!(!message.contains("--"), "{message}");
-        }
-    }
-
-    #[test]
     fn explains_query_timeouts_with_recovery_guidance() {
         let directory = tempdir().expect("temp directory");
         let database = directory.path().join("index.sqlite");
@@ -755,14 +563,41 @@ mod tests {
             Duration::ZERO,
         )
         .expect_err("interrupt long query");
-        assert!(
-            matches!(timeout.downcast_ref::<QueryFailure>(), Some(QueryFailure::Timeout(limit)) if limit.is_zero())
-        );
         let message = format!("{timeout:#}");
         assert!(message.contains("0-second timeout"), "{message}");
-        assert_eq!(message.matches("query exceeded").count(), 1);
-        assert!(!message.contains("query timeout: interrupted"), "{message}");
         assert!(message.contains("COUNT or GROUP BY"), "{message}");
+    }
+
+    #[test]
+    fn fractional_timeout_diagnostics_preserve_the_limit_and_query_recovery() {
+        let directory = tempdir().expect("temp directory");
+        let store = Store::open(&directory.path().join("index.sqlite")).expect("open store");
+        for (limit, seconds) in [
+            (Duration::from_millis(1), "0.001"),
+            (Duration::from_millis(10), "0.01"),
+        ] {
+            let error = query_sql(
+                &store,
+                "WITH RECURSIVE counter(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM counter) SELECT SUM(n) FROM counter",
+                10, 1024, 4096, limit,
+            ).expect_err("interrupt unbounded recursion");
+            let message = format!("{error:#}");
+            assert!(
+                message.starts_with(&format!("query exceeded the {seconds}-second timeout;")),
+                "{message}"
+            );
+            assert_eq!(message.matches("query exceeded").count(), 1);
+            let recovered = query_sql(
+                &store,
+                "SELECT 1 AS n",
+                10,
+                1024,
+                4096,
+                Duration::from_secs(1),
+            )
+            .expect("connection recovered after interruption");
+            assert_eq!(recovered.rows[0]["n"], 1);
+        }
     }
 
     #[test]
@@ -806,7 +641,7 @@ mod tests {
         assert!(!item_id.nullable);
         let unknown =
             public_schema(&store, Some("missing"), true).expect_err("reject unknown relation");
-        assert!(unknown.downcast_ref::<UnknownRelation>().is_some());
+        assert!(unknown.to_string().contains("trace-index schema list"));
     }
 
     #[test]

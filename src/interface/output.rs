@@ -168,7 +168,7 @@ pub struct ResponseEnvelope<T: Serialize> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SqlQueryReport<T = serde_json::Value> {
+pub struct SqlQueryReport {
     pub complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
@@ -177,7 +177,7 @@ pub struct SqlQueryReport<T = serde_json::Value> {
     pub returned: usize,
     pub cells_truncated: usize,
     pub columns: Vec<String>,
-    pub rows: Vec<BTreeMap<String, T>>,
+    pub rows: Vec<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]

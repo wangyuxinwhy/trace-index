@@ -21,7 +21,7 @@ trace-index schema get items --compact
 trace-index schema get blobs --compact
 ```
 
-The compact form shows names, SQLite types, and nullability. Load the full schema for one relation when a field's meaning is not yet clear. In Python, `index.schema()` lists Relations and `index.schema("items")` includes a Relation's columns and descriptions; see the shared `start-here` tutorial for index selection.
+The compact form shows names, SQLite types, and nullability. Load the full schema for one relation when a field's meaning is not yet clear.
 
 Run one bounded, read-only SQL statement:
 
@@ -49,17 +49,6 @@ SQL
 
 trace-index query run --file analysis.sql
 ```
-
-In Python, pass the same SQL as a string rather than a shell command or filename. The remaining SQL blocks in this guide apply to both interfaces:
-
-```python
-result = index.query(sql)
-print(result.complete, result.cells_truncated, result.hint)
-for row in result.rows:
-    print(row)
-```
-
-Use `help(type(index).query)` for parameters, budgets, result types, and exceptions. Python's optional `parameters` mapping uses native `:name` binding; CLI `query run` does not expose a parameter-binding option. `result.require_complete()` checks query-budget omissions only, not index freshness or earlier text boundaries. Both interfaces require explicit synchronization when newly written traces are needed.
 
 ## Read Semantic values and text references
 

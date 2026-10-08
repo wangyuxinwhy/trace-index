@@ -298,8 +298,10 @@ pub trait ProgressObserver {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct NoopProgress;
 
+#[cfg(test)]
 impl ProgressObserver for NoopProgress {
     fn update(&mut self, _update: ProgressUpdate, _force: bool) {}
     fn finish(&mut self) {}

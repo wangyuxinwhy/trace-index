@@ -22,6 +22,7 @@ pub(crate) const SUBAGENT_ACTIVITY: &str = "subagent.activity";
 pub(crate) const SUBAGENT_REPORT: &str = "subagent.report";
 
 pub(crate) const RUNTIME_UNKNOWN: &str = "runtime.unknown";
+pub(crate) const RUNTIME_INSTRUCTIONS: &str = "runtime.instructions";
 pub(crate) const RUNTIME_COMPACTION: &str = "runtime.compaction_summary";
 pub(crate) const RUNTIME_STATE: &str = "runtime.state";
 pub(crate) const RUNTIME_LIFECYCLE: &str = "runtime.lifecycle";

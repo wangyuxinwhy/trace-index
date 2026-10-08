@@ -1,6 +1,6 @@
 [package]
 name = "trace-index"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.95"
 description = "A bounded-memory event index for agent trace JSONL files"
@@ -27,11 +27,6 @@ publish = ["crates-io"]
 [[bin]]
 name = "trace-index"
 path = "src/main.rs"
-
-[workspace]
-members = ["python"]
-default-members = ["."]
-resolver = "3"
 
 [dependencies]
 anyhow = "1.0.104"

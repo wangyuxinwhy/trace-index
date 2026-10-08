@@ -104,6 +104,8 @@ struct LoopBuilder {
     effort: Option<String>,
     context_window: Option<u64>,
     usage: Option<crate::domain::Usage>,
+    /// A turn-scoped cumulative counter supersedes legacy per-response events.
+    structured_usage: bool,
     personality: Option<String>,
     collab_mode: Option<String>,
     approval_policy: Option<String>,
@@ -145,6 +147,7 @@ impl LoopBuilder {
             effort: None,
             context_window: None,
             usage: None,
+            structured_usage: false,
             personality: None,
             collab_mode: None,
             approval_policy: None,
@@ -314,6 +317,13 @@ impl LoopBuilder {
 }
 
 #[derive(Debug)]
+struct ClosedLoopIndex {
+    position: usize,
+    calls: HashMap<String, usize>,
+    outputs: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
 struct SessionBuilder {
     session_uuid: String,
     identity_confirmed: bool,
@@ -334,6 +344,7 @@ struct SessionBuilder {
     base_instructions: Option<BoundedText>,
     items: Vec<ItemProjection>,
     loops: Vec<LoopProjection>,
+    closed_loops: HashMap<String, ClosedLoopIndex>,
     active_loop: Option<LoopBuilder>,
 }
 
@@ -359,6 +370,7 @@ impl SessionBuilder {
             base_instructions: None,
             items: Vec::new(),
             loops: Vec::new(),
+            closed_loops: HashMap::new(),
             active_loop: None,
         }
     }
@@ -384,6 +396,27 @@ impl SessionBuilder {
         };
         self.end_seq = self.end_seq.max(turn.end_seq);
         let finished = turn.finish();
+        if let Some(id) = finished.native_id.as_ref() {
+            // finish sorts timeline Items, so build indices over that final
+            // order once, not by rescanning on every late completion.
+            let mut index = ClosedLoopIndex {
+                position: self.loops.len(),
+                calls: HashMap::new(),
+                outputs: HashMap::new(),
+            };
+            for (position, item) in finished.items.iter().enumerate() {
+                match &item.detail {
+                    ItemDetail::ToolCall { call_id, .. } => {
+                        index.calls.insert(call_id.clone(), position);
+                    }
+                    ItemDetail::ToolOutput { call_id, .. } => {
+                        index.outputs.insert(call_id.clone(), position);
+                    }
+                    _ => {}
+                }
+            }
+            self.closed_loops.insert(id.clone(), index);
+        }
         self.loops.push(finished);
     }
 
@@ -548,10 +581,12 @@ impl CodexProjector {
             ("event_msg", Some("user_message")) => self.ui_user_message(seq, payload, ts_ms),
             ("event_msg", Some("item_completed")) => {
                 self.completed_user_message(seq, payload, ts_ms);
+                self.completed_command_execution(seq, payload, ts_ms);
             }
             ("event_msg", Some("agent_message")) => self.ui_agent_message(seq, payload, ts_ms),
             // Usage belongs to the containing Loop, not the Item timeline.
             ("event_msg", Some("token_count")) => self.token_count(seq, payload),
+            ("token_usage_record", _) => self.token_usage_record(seq, payload),
             ("event_msg", Some("task_started")) => self.task_started(seq, payload, ts_ms),
             ("event_msg", Some("task_complete")) => self.task_complete(seq, payload, ts_ms),
             ("event_msg", Some("turn_aborted")) => self.turn_aborted(seq, payload, ts_ms),
@@ -774,10 +809,41 @@ impl CodexProjector {
 
         let turn = self.session_mut(seq).loop_mut(seq);
         turn.context_window = context_window.or(turn.context_window);
-        if let Some(sample) = sample {
+        if !turn.structured_usage
+            && let Some(sample) = sample
+        {
             turn.usage = Some(projection::add_usage(turn.usage.take(), sample));
         }
         turn.end_seq = turn.end_seq.max(seq);
+    }
+
+    /// `TokenUsageRecord` publishes both response and cumulative counters.
+    /// Only `turn_token_usage` belongs to a Loop; adding `usage` or
+    /// `thread_token_usage` would double count or import other Loops' work.
+    fn token_usage_record(&mut self, seq: u64, payload: &Value) {
+        let Some(turn_id) = string_at(payload, "turn_id") else {
+            return;
+        };
+        let Some(usage) = payload.get("turn_token_usage").and_then(codex_usage) else {
+            return;
+        };
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if string_at(payload, "thread_id").is_some_and(|id| id != session.session_uuid) {
+            return;
+        }
+        if let Some(turn) = session.active_loop.as_mut()
+            && turn.turn_uuid.as_deref() == Some(turn_id)
+        {
+            turn.usage = Some(usage);
+            turn.structured_usage = true;
+            turn.end_seq = turn.end_seq.max(seq);
+        } else if let Some(index) = session.closed_loops.get(turn_id) {
+            // Usage can land after the next Loop has started. It still owns
+            // the explicitly named turn, never whichever turn is current.
+            session.loops[index.position].usage = Some(usage);
+        }
     }
 
     fn task_started(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>) {
@@ -1169,6 +1235,71 @@ impl CodexProjector {
 
     // ── tool calls ─────────────────────────────────────────────────────────
 
+    /// Native execution Items witness commands actually submitted to a tool,
+    /// including commands hidden behind a JavaScript orchestration call. Do
+    /// not infer child invocations from the script itself.
+    fn completed_command_execution(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>) {
+        let Some(item) = payload.get("item") else {
+            return;
+        };
+        if string_at(item, "type") != Some("CommandExecution")
+            || !matches!(
+                string_at(item, "source"),
+                Some("agent" | "unified_exec_startup")
+            )
+            || string_at(item, "id").is_none()
+        {
+            return;
+        }
+        let max_text_bytes = self.max_text_bytes;
+        let turn_id = string_at(payload, "turn_id");
+        let session = self.session_mut(seq);
+        if string_at(payload, "thread_id").is_some_and(|id| id != session.session_uuid) {
+            return;
+        }
+        let call_id = string_at(item, "id")
+            .expect("checked command identity")
+            .to_owned();
+        if turn_id.is_some_and(|id| {
+            session
+                .active_loop
+                .as_ref()
+                .and_then(|turn| turn.turn_uuid.as_deref())
+                != Some(id)
+        }) {
+            if let Some(index) = turn_id.and_then(|id| session.closed_loops.get_mut(id)) {
+                let positions = (
+                    index.calls.get(&call_id).copied(),
+                    index.outputs.get(&call_id).copied(),
+                );
+                let (call, output) = upsert_command_execution(
+                    &mut session.loops[index.position].items,
+                    positions,
+                    seq,
+                    ts_ms,
+                    item,
+                    max_text_bytes,
+                );
+                index.calls.insert(call_id.clone(), call);
+                index.outputs.insert(call_id, output);
+            }
+            return;
+        }
+        let turn = session.loop_mut(seq);
+        let positions = (
+            turn.calls.get(&call_id).copied(),
+            turn.outputs.get(&call_id).copied(),
+        );
+        let (call_index, output_index) =
+            upsert_command_execution(&mut turn.items, positions, seq, ts_ms, item, max_text_bytes);
+        turn.calls.insert(call_id.clone(), call_index);
+        turn.outputs.insert(call_id.clone(), output_index);
+        if let Some(ended) = turn.pending_tool_ends.remove(&call_id) {
+            merge_tool_end(&mut turn.items[output_index], &ended);
+        }
+        turn.end_seq = turn.end_seq.max(seq);
+    }
+
     fn tool_call(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>, call_kind: &str) {
         let call_id = string_at(payload, "call_id")
             .or_else(|| string_at(payload, "id"))
@@ -1216,7 +1347,45 @@ impl CodexProjector {
             searchable: is_delegation,
         };
         let turn = self.session_mut(seq).loop_mut(seq);
-        let index = turn.push_item(item);
+        let index = if let Some(&index) = turn.calls.get(&call_id) {
+            // Completion may precede its model-input twin. Keep the native
+            // execution evidence and adopt Agent-authored arguments when they
+            // arrive, rather than publishing a second invocation.
+            let existing = &mut turn.items[index];
+            adopt_response_witness(existing, seq);
+            if let (
+                ItemDetail::ToolCall {
+                    name,
+                    args,
+                    cmd,
+                    cmd_lang,
+                    workdir,
+                    ..
+                },
+                ItemDetail::ToolCall {
+                    name: new_name,
+                    args: new_args,
+                    cmd: new_cmd,
+                    cmd_lang: new_lang,
+                    workdir: new_workdir,
+                    ..
+                },
+            ) = (&mut existing.detail, item.detail)
+            {
+                *name = new_name;
+                *args = new_args;
+                if cmd.is_none() {
+                    *cmd = new_cmd;
+                    *cmd_lang = new_lang;
+                }
+                if workdir.is_none() {
+                    *workdir = new_workdir;
+                }
+            }
+            index
+        } else {
+            turn.push_item(item)
+        };
         if awaits_output(call_kind) {
             turn.calls.insert(call_id.clone(), index);
         }
@@ -1257,7 +1426,34 @@ impl CodexProjector {
             searchable: false,
         };
         let turn = self.session_mut(seq).loop_mut(seq);
-        let index = turn.push_item(item);
+        let index = if let Some(&index) = turn.outputs.get(&call_id) {
+            let existing = &mut turn.items[index];
+            adopt_response_witness(existing, seq);
+            // Native outcome/duration win, while the response owns its earlier
+            // Runtime truncation and token boundary. Preserve both witnesses.
+            if let (
+                ItemDetail::ToolOutput { output, facts, .. },
+                ItemDetail::ToolOutput {
+                    output: new_output,
+                    facts: new_facts,
+                    ..
+                },
+            ) = (&mut existing.detail, item.detail)
+            {
+                if output.is_none() {
+                    existing.preview.clone_from(&new_output);
+                    *output = new_output;
+                }
+                facts.exit_code = facts.exit_code.or(new_facts.exit_code);
+                facts.nonzero_exit = facts.nonzero_exit.or(new_facts.nonzero_exit);
+                facts.duration_ms = facts.duration_ms.or(new_facts.duration_ms);
+                facts.truncated = new_facts.truncated.or(facts.truncated);
+                facts.output_tokens = new_facts.output_tokens.or(facts.output_tokens);
+            }
+            index
+        } else {
+            turn.push_item(item)
+        };
         turn.outputs.insert(call_id.clone(), index);
         if let Some(ended) = turn.pending_tool_ends.remove(&call_id) {
             merge_tool_end(&mut turn.items[index], &ended);
@@ -1413,18 +1609,201 @@ impl CodexProjector {
     }
 }
 
-/// Decides a message's semantic role.
-///
-/// Authorship is structural: `paired` means a matching UI-track user event
-/// exists, which is the only proof a human supplied the text. Tag prefixes
-/// only subdivide runtime injections; they never decide authorship, because
-/// they change between Codex versions while the dual-track structure does not.
-///
-/// Both findings are recorded. Codex is the only adapter that establishes
-/// authorship without reading the text, so it is the only one with two things
-/// to say, and saying only the first left `basis = 'tag_prefix'` selecting
-/// every Claude and Pi injection and no Codex one — the marker had matched
-/// there too, and the record of it was thrown away.
+/// Normalizes a Codex counter whose input already includes cache tokens.
+fn codex_usage(usage: &Value) -> Option<crate::domain::Usage> {
+    projection::normalized_usage(
+        usage.get("input_tokens").and_then(Value::as_u64),
+        usage.get("cached_input_tokens").and_then(Value::as_u64),
+        usage
+            .get("cache_write_input_tokens")
+            .and_then(Value::as_u64),
+        usage.get("output_tokens").and_then(Value::as_u64),
+        usage.get("reasoning_output_tokens").and_then(Value::as_u64),
+        true,
+    )
+}
+
+/// Keep Agent-authored arguments and response-only output boundaries in the
+/// primary witness slot. Repeated native completions may refresh the other
+/// slot, but cannot discard the source of those retained fields.
+fn adopt_response_witness(item: &mut ItemProjection, seq: u64) {
+    let native_seq = item.ui_seq.unwrap_or(item.record_seq);
+    item.record_seq = seq;
+    item.ui_seq = (native_seq != seq).then_some(native_seq);
+}
+
+/// Refreshes native command evidence by its id, shared by modern Items and
+/// legacy exec events. Runtime-resolved argv is not an Agent argument object.
+fn upsert_command_execution(
+    items: &mut Vec<ItemProjection>,
+    positions: (Option<usize>, Option<usize>),
+    seq: u64,
+    ts_ms: Option<i64>,
+    item: &Value,
+    max_text_bytes: usize,
+) -> (usize, usize) {
+    let id = string_at(item, "id").expect("checked command identity");
+    let blob = |text: &str| BoundedText::bounded(text, max_text_bytes);
+    let call_index = positions.0.unwrap_or_else(|| {
+        let cmd = execution_shell_text(item);
+        let index = items.len();
+        items.push(ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms,
+            semantic_role: semantic::AGENT_TOOL_CALL.to_owned(),
+            basis: basis::RECORD_KIND.to_owned(),
+            preview: cmd.as_deref().map(blob),
+            detail: ItemDetail::ToolCall {
+                call_id: id.to_owned(),
+                name: (string_at(item, "source") == Some("unified_exec_startup"))
+                    .then(|| "exec_command".to_owned()),
+                cmd_lang: cmd.as_ref().map(|_| lang::SHELL),
+                cmd,
+                workdir: string_at(item, "cwd").and_then(execution_workdir),
+                args: None,
+                syntax: None,
+            },
+            linked_session_native_id: None,
+            searchable: false,
+        });
+        index
+    });
+    let call = &mut items[call_index];
+    if call.record_seq != seq {
+        call.ui_seq = Some(seq);
+    }
+    if let ItemDetail::ToolCall {
+        workdir,
+        cmd,
+        cmd_lang,
+        ..
+    } = &mut call.detail
+    {
+        if let Some(cwd) = string_at(item, "cwd").and_then(execution_workdir) {
+            *workdir = Some(cwd);
+        }
+        if cmd.is_none() {
+            *cmd = execution_shell_text(item);
+            *cmd_lang = cmd.as_ref().map(|_| lang::SHELL);
+        }
+    }
+    let text = string_at(item, "aggregated_output")
+        .or_else(|| string_at(item, "formatted_output"))
+        .map(str::to_owned)
+        .or_else(|| {
+            let parts = [string_at(item, "stdout"), string_at(item, "stderr")];
+            parts
+                .iter()
+                .any(Option::is_some)
+                .then(|| parts.into_iter().flatten().collect::<String>())
+        });
+    let output = text.as_deref().map(blob);
+    let facts = command_execution_facts(item);
+    let output_index = if let Some(index) = positions.1 {
+        if items[index].record_seq != seq {
+            items[index].ui_seq = Some(seq);
+        }
+        let existing_item = &mut items[index];
+        if let ItemDetail::ToolOutput {
+            output: existing,
+            facts: existing_facts,
+            ..
+        } = &mut existing_item.detail
+        {
+            if output.is_some() {
+                existing.clone_from(&output);
+                existing_item.preview = output;
+            }
+            existing_facts.exit_code = facts.exit_code.or(existing_facts.exit_code);
+            existing_facts.nonzero_exit = facts.nonzero_exit.or(existing_facts.nonzero_exit);
+            existing_facts.duration_ms = facts.duration_ms.or(existing_facts.duration_ms);
+        }
+        index
+    } else {
+        let index = items.len();
+        items.push(ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms,
+            semantic_role: semantic::TOOL_OUTPUT.to_owned(),
+            basis: basis::RECORD_KIND.to_owned(),
+            preview: output.clone(),
+            detail: ItemDetail::ToolOutput {
+                call_id: id.to_owned(),
+                output,
+                facts,
+            },
+            linked_session_native_id: None,
+            searchable: false,
+        });
+        index
+    };
+    (call_index, output_index)
+}
+
+fn command_execution_facts(item: &Value) -> ToolOutputFacts {
+    let exit_code = item.get("exit_code").and_then(Value::as_i64);
+    ToolOutputFacts {
+        exit_code,
+        nonzero_exit: exit_code
+            .map(|code| code != 0)
+            .or_else(|| match string_at(item, "status") {
+                Some("failed" | "declined") => Some(true),
+                Some("completed") => Some(false),
+                _ => None,
+            }),
+        duration_ms: structured_duration_ms(item.get("duration")),
+        ..ToolOutputFacts::default()
+    }
+}
+
+/// Only recognized shell `-c` argv contains shell source. Other executables'
+/// arguments and Codex's parsed-command summaries are not shell scripts.
+fn execution_shell_text(item: &Value) -> Option<String> {
+    let command = item.get("command")?.as_array()?;
+    if command.len() < 3 {
+        return None;
+    }
+    let executable = command[0].as_str()?.rsplit('/').next()?;
+    if !matches!(executable, "sh" | "bash" | "zsh" | "dash" | "ksh")
+        || !matches!(command[1].as_str()?, "-c" | "-lc" | "-cl")
+    {
+        return None;
+    }
+    command[2].as_str().map(str::to_owned)
+}
+
+/// Native `CommandExecution.cwd` is a `PathUri`. Only local file URIs or legacy
+/// absolute paths can establish a working directory on this machine.
+fn execution_workdir(value: &str) -> Option<String> {
+    if !value.starts_with("file:") {
+        return value.starts_with('/').then(|| value.to_owned());
+    }
+    let path = value
+        .strip_prefix("file://localhost")
+        .or_else(|| value.strip_prefix("file://"))?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut input = path.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let hi = char::from(input.next()?).to_digit(16)?;
+            let lo = char::from(input.next()?).to_digit(16)?;
+            bytes.push(u8::try_from(hi * 16 + lo).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Paired UI evidence determines Human authorship; markers only subdivide
+/// Runtime injections. Preserve both authorship and classification evidence.
 fn classify_message(
     wire_role: &str,
     text: Option<&str>,
@@ -2091,8 +2470,9 @@ fn linked_session_from_tagged_text(role: &str, text: Option<&str>) -> Option<Str
 ///
 /// `exec` is deliberately absent. Its argument is JavaScript run in a V8
 /// sandbox (`code-mode-runtime/src/runtime/globals.rs`), and the shell command
-/// is a string inside a `tools.exec_command({cmd})` call within it. Reaching it
-/// needs a JavaScript parse, not a field lookup.
+/// is a string inside a `tools.exec_command({cmd})` call within it. Child
+/// executions are established from native `CommandExecution` evidence, never
+/// by interpreting strings in the orchestration script.
 fn shell_command(tool_name: Option<&str>, arguments: Option<&Value>) -> Option<String> {
     let arguments = arguments?;
     match tool_name {

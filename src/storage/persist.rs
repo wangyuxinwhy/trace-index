@@ -799,7 +799,8 @@ fn normalized_role(role: &str, detail: &ItemDetail) -> Result<SemanticRole> {
         semantic::RUNTIME_STATE | semantic::RUNTIME_BUDGET | semantic::RUNTIME_FILE_CHANGE => {
             SemanticRole::RuntimeState
         }
-        semantic::RUNTIME_PROJECT_INSTRUCTIONS
+        semantic::RUNTIME_INSTRUCTIONS
+        | semantic::RUNTIME_PROJECT_INSTRUCTIONS
         | semantic::RUNTIME_USER_INSTRUCTIONS
         | semantic::RUNTIME_SKILL_INSTRUCTIONS
         | semantic::RUNTIME_PERMISSIONS

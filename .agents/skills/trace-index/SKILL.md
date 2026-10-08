@@ -7,9 +7,7 @@ description: Query indexed Codex, Pi, and Claude Code traces with trace-index wh
 
 Use `trace-index` as the read-only, source-traceable SQL query plane for Codex, Pi, and Claude Code traces. Trace Index returns facts and provenance; interpret them and form the conclusion yourself.
 
-At the start of each trace-analysis task, read the chosen entry point's root Help once: CLI `trace-index --help`, or standard Python `help(trace_index)` after importing the native package. Both share the same bootstrap knowledge. Use that entry point's version-matched Help, bundled docs, and Schema rather than mixing a separately installed CLI and wheel. Follow the discovery path instead of guessing relation names, columns, JSON shapes, or arguments:
-
-CLI:
+At the start of each trace-analysis task, run `trace-index --help` once. Its help, bundled documentation, and Schema match the installed binary. Follow the discovery path instead of guessing relation names, columns, JSON shapes, or flags:
 
 ```bash
 trace-index docs list
@@ -17,21 +15,7 @@ trace-index schema list
 trace-index schema get <RELATION> --compact
 ```
 
-Native Python, for an existing index:
-
-```python
-import trace_index as ti
-
-help(ti)
-print(ti.docs())
-index = ti.Index.open()
-print(index.schema())
-print(index.schema("items"))
-```
-
-Use `help(ti.Index.query)` and other method docstrings for Python arguments, budgets, return types, and exceptions. The wheel needs no CLI executable. SQL is shared, but CLI JSON/exit codes and Python objects/exceptions are not interchangeable.
-
-Load the bundled `start-here` tutorial with `trace-index docs get start-here` or `ti.doc("start-here")` when the index has not been built or the first-use workflow is needed. On the CLI, run `config init` only when the selected configuration file does not exist; it creates only that file and refuses to overwrite one. Use `config show` and `config check` to inspect the selected values and readiness, then run `index sync` to write the database. Python `ti.Index(db=...)` selects without creating a database; `index.sync(paths)` explicitly builds or refreshes it, with partial failures retained in `SyncFailedError.report`. Do not initialize or synchronize when the existing indexed facts are sufficient. Close Python indexes when done or use a context manager.
+Load `trace-index docs get start-here` when the index has not been built or the first-use workflow is needed. Run `config init` only when the selected configuration file does not exist; it creates only that file and refuses to overwrite one. Use `config show` and `config check` to inspect the selected values and readiness, then run `index sync` to write the database. Do not initialize or synchronize when the existing indexed facts are sufficient.
 
 Load the full schema for one relation only when its field descriptions or JSON contract are needed.
 
@@ -64,11 +48,11 @@ Read `semantic.role` with these stable meanings:
 
 Inspect the Item schema before extracting JSON. `semantic.role` selects the type of `semantic.value`; do not assume every value has a `text` field. Report a judgment whose `semantic.evidence_strength` is `heuristic` more cautiously than one marked `structural`. When a claim depends on an exact Runtime field that the Semantic contract does not publish, follow `record_ids` and inspect the supporting Record instead of assuming the Item contains a Runtime payload copy.
 
-In the public SQL encoding, top-level domain TextContent is not inline. `semantic.value.text`, or `semantic.value.summary` for `runtime.compaction_summary`, is a `BlobRef {blob_id}`. Inspect the `blobs` Schema (`schema get blobs` or `index.schema("blobs")`) before the first text query, then join that id to `blobs.blob_id` only when the query needs `text`, `full_bytes`, or `estimated_tokens`. Start from `items`; a standalone Blob row is access data and has no published domain meaning. Compare the UTF-8 byte length of `blobs.text` with `blobs.full_bytes` before treating it as the whole Source text. On Tool Outputs, `runtime_truncated` and `runtime_output_tokens` describe an earlier Runtime boundary and must not be conflated with the Blob's Source-text boundary.
+In the public SQL encoding, top-level domain TextContent is not inline. `semantic.value.text`, or `semantic.value.summary` for `runtime.compaction_summary`, is a `BlobRef {blob_id}`. Inspect `schema get blobs` before the first text query, then join that id to `blobs.blob_id` only when the query needs `text`, `full_bytes`, or `estimated_tokens`. Start from `items`; a standalone Blob row is access data and has no published domain meaning. Compare the UTF-8 byte length of `blobs.text` with `blobs.full_bytes` before treating it as the whole Source text. On Tool Outputs, `runtime_truncated` and `runtime_output_tokens` describe an earlier Runtime boundary and must not be conflated with the Blob's Source-text boundary.
 
 Loop model identity and normalized token usage are nested under `loops.model` and `loops.usage`. Cache-read and cache-write tokens are already subsets of `usage.input`, and reasoning tokens are already a subset of `usage.output`. Derive total model tokens as `input + output`; never add the subsets again or treat missing Usage as zero.
 
-Run bounded projections, filters, counts, groups, and joins with CLI `query run` or Python `index.query(sql)`. Stop when the requested claim is supported. When `complete` is false, the rows are only a partial result set; follow the returned `hint` before drawing an exhaustive conclusion. Python `result.require_complete()` checks query-budget omissions, not index freshness or Source/Runtime text boundaries. Reads never refresh the index; synchronize explicitly only when newly written traces are required.
+Run bounded projections, filters, counts, groups, and joins with `query run`. Stop when the requested claim is supported. When `complete` is false, the rows are only a partial result set; follow the returned `hint` before drawing an exhaustive conclusion. Reads never refresh the index; run `index sync` only when newly written traces are required.
 
 For broad text recall, use search only to generate candidates instead of fetching whole conversations. Derive several literal anchors from the user's wording, measure candidate density, and initially return only identities, scope, role, and short snippets. Compare candidates against the Runtime, time, project, actor, and provenance constraints that the request actually supplies before expanding any conversation. If the evidence does not identify one Session, preserve that ambiguity or ask for the missing discriminator. The bundled `how-to/search-literals` document gives the complete workflow and SQL patterns.
 
@@ -78,7 +62,7 @@ Use `item_search` only to generate broad literal candidates. Its contentless `te
 
 Do not join `blobs` for role counts, timelines, tool metadata, Loop usage, or any other query that does not read text. Keeping Blob access demand-driven avoids loading large values into routine analysis.
 
-Do not inspect physical Records or include Record ids by default. Expand `items.record_ids` and use CLI `record inspect <ID>` or Python `index.record(record_id).inspect()` only when the user asks for raw source evidence, an exact physical representation, or index-integrity debugging. Export Records or Assets only to an explicit destination.
+Do not inspect physical Records or include Record ids by default. Expand `items.record_ids` and use `record inspect <ID>` only when the user asks for raw source evidence, an exact physical representation, or index-integrity debugging. Export Records or Assets only to an explicit destination.
 
 Match evidence scope to the claim. Keep Runtime, Session, Source, Loop, time, and semantic-role boundaries visible when they affect whether rows are comparable. An empty result can reflect an Adapter coverage gap, so verify the relevant Runtime coverage before concluding that something never occurred.
 

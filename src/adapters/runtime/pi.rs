@@ -2,7 +2,7 @@
 //!
 //! The format is declared exhaustively in the runtime's own
 //! `packages/coding-agent/src/core/session-manager.ts`: one `session` header
-//! plus nine entry types, every one of them carrying `{id, parentId,
+//! plus tree entries, every one of them carrying `{id, parentId,
 //! timestamp}`. This projector follows that declaration rather than the shapes
 //! a corpus happens to contain.
 //!
@@ -42,7 +42,6 @@ use crate::adapters::semantic::{self, basis};
 /// stopped. The remaining three are the provider reporting the reply did not
 /// complete, and each keeps its own name as the abort reason.
 const STOP_REASON_STOP: &str = "stop";
-const STOP_REASON_TOOL_USE: &str = "toolUse";
 
 const SETTINGS_MODEL: &str = "model_change";
 const SETTINGS_EFFORT: &str = "thinking_level_change";
@@ -113,9 +112,10 @@ impl LoopBuilder {
     /// Whether the provider reported the reply did not complete, which makes
     /// the next human message a correction rather than a fresh request.
     fn aborted(&self) -> bool {
-        self.last_stop_reason
-            .as_deref()
-            .is_some_and(|reason| !matches!(reason, STOP_REASON_STOP | STOP_REASON_TOOL_USE))
+        matches!(
+            self.last_stop_reason.as_deref(),
+            Some("error" | "length" | "aborted")
+        )
     }
 
     fn finish(self) -> LoopProjection {
@@ -238,6 +238,18 @@ impl SessionBuilder {
         self.adopt_pending_settings();
     }
 
+    fn push_runtime(&mut self, item: ItemProjection) {
+        if let Some(turn) = self.active_loop.as_mut()
+            && !matches!(turn.last_stop_reason.as_deref(), Some("stop" | "aborted"))
+        {
+            // A failed model attempt can be followed by an automatic retry
+            // and context_edit recovery before this outer Loop settles.
+            turn.push(item);
+        } else {
+            self.items.push(item);
+        }
+    }
+
     fn close_loop(&mut self) {
         if let Some(turn) = self.active_loop.take() {
             self.end_seq = self.end_seq.max(turn.end_seq);
@@ -320,6 +332,7 @@ impl PiProjector {
             // role, with `native_type` keeping them apart.
             "compaction" | "branch_summary" => self.summary_entry(seq, value, ts_ms),
             "custom_message" => self.custom_message(seq, value, ts_ms),
+            "context_edit" => self.context_edit(seq, value, ts_ms),
             "session_info" => self.session_info(seq, value),
             SETTINGS_MODEL => self.model_change(seq, value),
             SETTINGS_EFFORT => self.effort_change(seq, value),
@@ -353,6 +366,10 @@ impl PiProjector {
         let message = value.get("message").unwrap_or(&Value::Null);
         let role = string(message, "role").unwrap_or("unknown").to_owned();
 
+        if role == "system" {
+            self.system_message(seq, message, ts_ms);
+            return;
+        }
         if role == "toolResult" {
             self.tool_result(seq, message, ts_ms);
             return;
@@ -360,6 +377,7 @@ impl PiProjector {
 
         let model = string(message, "model").map(str::to_owned);
         let provider = string(message, "provider").map(str::to_owned);
+        let effort = string(message, "thinkingLevel").map(str::to_owned);
         let stop_reason = string(message, "stopReason").map(str::to_owned);
         let usage = message.get("usage").and_then(|usage| {
             projection::normalized_usage(
@@ -446,7 +464,10 @@ impl PiProjector {
         let turn = session.loop_mut(seq);
         turn.started_at = turn.started_at.or(ts_ms);
         turn.ended_at = ts_ms.or(turn.ended_at);
-        turn.model = turn.model.take().or(model);
+        // A virtual-model selection is not necessarily the physical model
+        // that answered. Per-response metadata is the stronger evidence.
+        turn.model = model.or_else(|| turn.model.take());
+        turn.effort = effort.or_else(|| turn.effort.take());
         if let Some(usage) = usage {
             turn.usage = Some(projection::add_usage(turn.usage.take(), usage));
         }
@@ -569,6 +590,68 @@ impl PiProjector {
         }
     }
 
+    /// Prompt and tool-loadout declarations configure execution; they never
+    /// create a Human Loop. Keep patches as timeline facts, not a rewritten
+    /// copy of earlier instructions. Their Record retains the exact delta.
+    fn system_message(&mut self, seq: u64, message: &Value, ts_ms: Option<i64>) {
+        let mut texts = Vec::new();
+        if let Some(text) = message_text(message) {
+            texts.push((semantic::RUNTIME_INSTRUCTIONS, text));
+        }
+        if let Some(sections) = message.get("sections").and_then(Value::as_object) {
+            for (name, content) in sections {
+                if let Some(text) = content.as_str() {
+                    let role = match name.as_str() {
+                        "cwd" => semantic::RUNTIME_ENV_CONTEXT,
+                        "skills" => semantic::RUNTIME_SKILL_INSTRUCTIONS,
+                        "tools" => semantic::RUNTIME_TOOL_CATALOG,
+                        _ => semantic::RUNTIME_INSTRUCTIONS,
+                    };
+                    texts.push((role, format!("Prompt section {name}:\n{text}")));
+                } else if content.is_null() {
+                    texts.push((
+                        semantic::RUNTIME_STATE,
+                        format!("Removed prompt section: {name}"),
+                    ));
+                }
+            }
+        }
+        for (key, action) in [("toolsAdded", "Added"), ("toolsRemoved", "Removed")] {
+            if let Some(tools) = message.get(key).and_then(Value::as_array) {
+                for tool in tools {
+                    let Some(name) = string(tool, "name") else {
+                        continue;
+                    };
+                    let mut text = format!("{action} tool: {name}");
+                    if let Some(description) = string(tool, "description") {
+                        text.push('\n');
+                        text.push_str(description);
+                    }
+                    if let Some(parameters) = tool.get("parameters") {
+                        text.push_str("\nParameters: ");
+                        text.push_str(&parameters.to_string());
+                    }
+                    texts.push((semantic::RUNTIME_TOOL_CATALOG, text));
+                }
+            }
+        }
+        for (role, text) in texts {
+            let item = ItemProjection {
+                seq,
+                record_seq: seq,
+                ui_seq: None,
+                ts_ms,
+                semantic_role: role.to_owned(),
+                basis: basis::WIRE_ROLE_SYSTEM.to_owned(),
+                preview: Some(self.blob(&text)),
+                detail: ItemDetail::Misc,
+                searchable: false,
+                linked_session_native_id: None,
+            };
+            self.session_mut(seq).push_runtime(item);
+        }
+    }
+
     fn tool_result(&mut self, seq: u64, message: &Value, ts_ms: Option<i64>) {
         let call_id =
             string(message, "toolCallId").map_or_else(|| format!("seq-{seq}"), str::to_owned);
@@ -586,6 +669,7 @@ impl PiProjector {
                 call_id,
                 output: blob,
                 facts: ToolOutputFacts {
+                    duration_ms: message.get("durationMs").and_then(Value::as_u64),
                     nonzero_exit: message.get("isError").and_then(Value::as_bool),
                     truncated: message
                         .pointer("/details/truncation/truncated")
@@ -601,8 +685,11 @@ impl PiProjector {
 
     /// An entry whose payload is a summary standing in for dropped context.
     fn summary_entry(&mut self, seq: u64, value: &Value, ts_ms: Option<i64>) {
-        // The summary text is the whole point of the entry; the previous
-        // projection stored the literal record type instead and dropped it.
+        // Compaction includes a complete prompt/tool checkpoint in newer Pi
+        // traces. It has the same declaration semantics as a system message.
+        if let Some(system) = value.get("systemMessage") {
+            self.system_message(seq, system, ts_ms);
+        }
         let preview = string(value, "summary").map(|summary| self.blob(summary));
         let item = ItemProjection {
             seq,
@@ -617,6 +704,40 @@ impl PiProjector {
             linked_session_native_id: None,
         };
         self.session_mut(seq).loop_mut(seq).push(item);
+    }
+
+    /// Context edits affect future provider input, not the historical message
+    /// or its authorship. Publish the change without mutating its target Item.
+    fn context_edit(&mut self, seq: u64, value: &Value, ts_ms: Option<i64>) {
+        let Some(target) = string(value, "targetId") else {
+            return;
+        };
+        let Some(replacement) = value.get("replacement") else {
+            return;
+        };
+        let text = if replacement.is_null() {
+            format!("Omitted context entry: {target}")
+        } else if let Some(content) = replacement.get("content") {
+            let replacement_text = content_text(Some(content)).unwrap_or_default();
+            format!("Replaced context entry: {target}\n{replacement_text}")
+        } else {
+            return;
+        };
+        let item = ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms,
+            semantic_role: semantic::RUNTIME_STATE.to_owned(),
+            basis: basis::RECORD_KIND.to_owned(),
+            preview: Some(self.blob(&text)),
+            detail: ItemDetail::Message {
+                has_images: has_images(replacement),
+            },
+            searchable: false,
+            linked_session_native_id: None,
+        };
+        self.session_mut(seq).push_runtime(item);
     }
 
     /// An extension's injected message, typed by the `customType` it declared.

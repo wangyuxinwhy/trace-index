@@ -1,4 +1,5 @@
 use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -8,16 +9,15 @@ use super::{
     AssetCommand, Cli, Command, ConfigCommand, DocsCommand, DocsOutput, IndexCommand,
     MAX_SQL_INPUT_BYTES, QueryCommand, QueryRunArgs, RecordCommand, SchemaCommand, StderrProgress,
 };
-use crate::api::{explicit_roots, resolve_indexing_policy};
 use crate::indexing::indexer::IndexOptions;
 use crate::indexing::status::status;
-use crate::indexing::sync;
+use crate::indexing::sync::{self, SyncRoot};
 use crate::ingest::record::{export_record, extract_asset, inspect_record, verify_record};
-use crate::interface::config::{self, LoadedConfig};
+use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
 use crate::interface::output::ResponseEnvelope;
 use crate::interface::query::{public_schema, query_sql};
-use crate::storage::db::Store;
+use crate::storage::db::{IndexingPolicy, Store};
 
 pub(crate) fn run() -> Result<()> {
     let Cli {
@@ -70,13 +70,42 @@ fn run_operational(command: Command, loaded: &LoadedConfig) -> Result<()> {
     }
 }
 
+fn configured_roots(loaded: &LoadedConfig) -> Vec<SyncRoot> {
+    loaded
+        .effective
+        .roots
+        .iter()
+        .map(|root| SyncRoot {
+            label: root.label.clone(),
+            path: root.path.clone(),
+        })
+        .collect()
+}
+
+fn explicit_roots(paths: Vec<PathBuf>, loaded: &LoadedConfig) -> Result<Vec<SyncRoot>> {
+    if paths.is_empty() {
+        let roots = configured_roots(loaded);
+        if roots.is_empty() {
+            bail!("index sync requires paths or at least one configured [[roots]] entry");
+        }
+        return Ok(roots);
+    }
+    Ok(paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| SyncRoot {
+            label: Some(format!("argument-{}", index + 1)),
+            path,
+        })
+        .collect())
+}
+
 fn run_docs(command: DocsCommand) -> Result<()> {
     match command {
         DocsCommand::List => print_envelope(&docs::list()),
         DocsCommand::Search { query } => print_envelope(&docs::search(&query)?),
         DocsCommand::Get(args) => {
-            let document = docs::get(&args.topic)
-                .context("Hint: run `trace-index docs list` to discover valid topic names")?;
+            let document = docs::get(&args.topic)?;
             match args.output {
                 DocsOutput::Markdown => print_markdown(&document.content),
                 DocsOutput::Json => print_envelope(&document),
@@ -163,22 +192,42 @@ fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) ->
     Ok(())
 }
 
+/// Resolves the policy requested by one synchronization at the point where
+/// CLI, configuration, and storage state meet.
+fn resolve_indexing_policy(
+    configured: &EffectiveIndexingConfig,
+    stored: Option<IndexingPolicy>,
+    index_is_empty: bool,
+    cli_max_record_bytes: Option<usize>,
+    cli_max_text_bytes: Option<usize>,
+) -> IndexingPolicy {
+    let baseline = if index_is_empty {
+        IndexingPolicy {
+            max_indexed_record_bytes: configured.max_indexed_record_bytes.value,
+            max_published_text_bytes: configured.max_published_text_bytes.value,
+        }
+    } else {
+        stored.unwrap_or(IndexingPolicy {
+            max_indexed_record_bytes: configured.max_indexed_record_bytes.value,
+            max_published_text_bytes: configured.max_published_text_bytes.value,
+        })
+    };
+    IndexingPolicy {
+        max_indexed_record_bytes: cli_max_record_bytes.unwrap_or(baseline.max_indexed_record_bytes),
+        max_published_text_bytes: cli_max_text_bytes.unwrap_or(baseline.max_published_text_bytes),
+    }
+}
+
 fn run_schema(store: &Store, command: SchemaCommand) -> Result<()> {
     let (object, include_descriptions) = match command {
         SchemaCommand::List => (None, true),
         SchemaCommand::Get { object, compact } => (Some(object), !compact),
     };
-    let report =
-        public_schema(store, object.as_deref(), include_descriptions).map_err(|error| {
-            if error.is::<crate::interface::query::UnknownRelation>() {
-                error.context(
-                    "Hint: run `trace-index schema list` to discover valid public relation names",
-                )
-            } else {
-                error
-            }
-        })?;
-    print_envelope(&report)
+    print_envelope(&public_schema(
+        store,
+        object.as_deref(),
+        include_descriptions,
+    )?)
 }
 
 fn run_query(store: &Store, command: QueryCommand) -> Result<()> {

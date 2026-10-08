@@ -109,6 +109,7 @@ impl SemanticRole {
     }
 
     /// Short stable meaning used by every Agent-facing discovery surface.
+    #[cfg(test)]
     pub(crate) const fn meaning(self) -> &'static str {
         match self {
             Self::HumanRequest => "Human input that opens a new Loop.",

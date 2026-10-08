@@ -9,6 +9,9 @@ use tempfile::tempdir;
 use super::{IndexOptions, index_paths};
 use crate::storage::db::Store;
 
+#[path = "runtime_upgrade_tests.rs"]
+mod runtime_upgrade_tests;
+
 fn write_jsonl(path: &Path, records: &[Value]) {
     let mut text = records
         .iter()

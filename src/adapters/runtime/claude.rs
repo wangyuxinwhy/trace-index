@@ -1460,11 +1460,14 @@ fn attachment_role(attachment_kind: &str) -> &'static str {
         // The last two are `{banner, toolUseID}` after a read was cut short,
         // and `{maxTurns, turnCount}` when the loop hit its cap.
         "task_reminder"
+        | "silent_turn_reminder"
+        | "elapsed_time_reminder"
         | "date_change"
         | "goal_status"
         | "read_truncation_notice"
         | "max_turns_reached" => semantic::RUNTIME_NOTICE,
         "total_tokens_reminder" => semantic::RUNTIME_BUDGET,
+        "model" => semantic::RUNTIME_INTERNAL_CONTEXT,
         "queued_command" => semantic::RUNTIME_SLASH_COMMAND,
         "edited_text_file" | "file_history_snapshot" => semantic::RUNTIME_FILE_CHANGE,
         // `{filename, content: {file: {filePath, content, numLines, …}}}`, and

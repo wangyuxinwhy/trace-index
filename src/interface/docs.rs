@@ -1,4 +1,4 @@
-//! Version-matched documents shared by the CLI and native bindings.
+//! Version-matched documentation exposed through the CLI.
 
 use std::borrow::Cow;
 
@@ -219,7 +219,10 @@ pub fn search(query: &str) -> Result<TopicList> {
 /// Returns an error when the topic does not exist.
 pub fn get(name: &str) -> Result<TopicDocument> {
     let Some(topic) = TOPICS.iter().find(|topic| topic.summary.name == name) else {
-        bail!("documentation topic not found: {name:?}");
+        bail!(
+            "documentation topic not found: {name:?}\n\
+             Hint: run `trace-index docs list` to discover valid topic names"
+        );
     };
     Ok(TopicDocument {
         name: topic.summary.name,
@@ -300,7 +303,7 @@ mod tests {
         let error = get("sessions").expect_err("reject unknown topic");
         let message = error.to_string();
         assert!(message.contains("documentation topic not found"));
-        assert!(!message.contains("trace-index docs list"));
+        assert!(message.contains("trace-index docs list"));
     }
 
     #[test]
