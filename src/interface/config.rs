@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_ENV: &str = "TRACE_INDEX_CONFIG";
 const DATABASE_ENV: &str = "TRACE_INDEX_DB";
+const METADATA_ENV: &str = "TRACE_INDEX_METADATA_DB";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 
 pub const DEFAULT_MAX_INDEXED_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -32,6 +33,8 @@ struct FileConfig {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     database: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_database: Option<PathBuf>,
     #[serde(default)]
     indexing: FileIndexingConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +46,7 @@ impl Default for FileConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             database: None,
+            metadata_database: None,
             indexing: FileIndexingConfig::default(),
             roots: Vec::new(),
         }
@@ -119,6 +123,7 @@ pub struct EffectiveConfig {
     pub schema_version: u32,
     pub config_file: ConfigFileSelection,
     pub database: ResolvedPath,
+    pub metadata_database: ResolvedPath,
     pub indexing: EffectiveIndexingConfig,
     pub roots: Vec<EffectiveRootConfig>,
 }
@@ -166,6 +171,7 @@ struct ResolutionContext {
     xdg_data_home: Option<PathBuf>,
     config_env: Option<PathBuf>,
     database_env: Option<PathBuf>,
+    metadata_env: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -187,6 +193,24 @@ pub fn load(cli_config: Option<&Path>, cli_database: Option<&Path>) -> Result<Lo
         cli_database,
         &ResolutionContext::from_environment()?,
     )
+}
+
+/// Loads index and metadata selections with CLI precedence.
+///
+/// # Errors
+/// Returns an error for invalid configuration or shared database paths.
+pub(crate) fn load_selected(
+    cli_config: Option<&Path>,
+    cli_database: Option<&Path>,
+    cli_metadata: Option<&Path>,
+) -> Result<LoadedConfig> {
+    let mut context = ResolutionContext::from_environment()?;
+    if let Some(path) = cli_metadata {
+        context.metadata_env = Some(path.to_owned());
+    }
+    let mut loaded = load_with_context(cli_config, cli_database, &context)?;
+    select_metadata(&mut loaded, cli_metadata)?;
+    Ok(loaded)
 }
 
 fn load_with_context(
@@ -248,6 +272,23 @@ fn resolve_config(
         }
     };
 
+    let metadata_database = if let Some(path) = &context.metadata_env {
+        validate_explicit_override(path, METADATA_ENV)?;
+        ResolvedPath {
+            path: resolve_cli_path(path, context)?,
+            origin: environment_origin(METADATA_ENV),
+        }
+    } else if let Some(path) = config.metadata_database.as_deref() {
+        ResolvedPath {
+            path: resolve_file_path(path, base, context)?,
+            origin: file_origin(),
+        }
+    } else {
+        ResolvedPath {
+            path: default_database_path(context)?.with_file_name("metadata.sqlite"),
+            origin: default_origin(),
+        }
+    };
     let max_indexed_record_bytes = resolve_usize(
         config.indexing.max_indexed_record_bytes,
         DEFAULT_MAX_INDEXED_RECORD_BYTES,
@@ -277,6 +318,7 @@ fn resolve_config(
                 loaded: config_loaded,
             },
             database,
+            metadata_database,
             indexing: EffectiveIndexingConfig {
                 max_indexed_record_bytes,
                 max_published_text_bytes,
@@ -302,7 +344,24 @@ pub fn initialize(
     cli_roots: &[PathBuf],
     discover: bool,
 ) -> Result<ConfigInitReport> {
-    let context = ResolutionContext::from_environment()?;
+    initialize_selected(cli_config, cli_database, None, cli_roots, discover)
+}
+
+/// Initializes only configuration, including an explicit metadata selection.
+///
+/// # Errors
+/// Returns an error for invalid inputs, existing configuration or write failure.
+pub(crate) fn initialize_selected(
+    cli_config: Option<&Path>,
+    cli_database: Option<&Path>,
+    cli_metadata: Option<&Path>,
+    cli_roots: &[PathBuf],
+    discover: bool,
+) -> Result<ConfigInitReport> {
+    let mut context = ResolutionContext::from_environment()?;
+    if let Some(path) = cli_metadata {
+        context.metadata_env = Some(path.to_owned());
+    }
     let selected = selected_path(cli_config, &context)?;
     if selected.path.exists() {
         bail!(
@@ -326,6 +385,9 @@ pub fn initialize(
     deduplicate_file_roots(&mut roots, &context)?;
 
     let config = FileConfig {
+        metadata_database: cli_metadata
+            .map(|p| resolve_cli_path(p, &context))
+            .transpose()?,
         schema_version: CONFIG_SCHEMA_VERSION,
         database: cli_database
             .map(|path| resolve_cli_path(path, &context))
@@ -342,6 +404,21 @@ pub fn initialize(
         toml::to_string_pretty(&config).context("failed to render configuration")?
     );
     toml::from_str::<FileConfig>(&body).context("generated configuration did not parse")?;
+
+    // Validate selections before creating the configuration file, including
+    // targets whose parent directories have not been created yet.
+    let mut checked = resolve_config(
+        config,
+        SelectedConfigPath {
+            path: selected.path.clone(),
+            origin: selected.origin.clone(),
+            explicit: selected.explicit,
+        },
+        false,
+        cli_database,
+        &context,
+    )?;
+    select_metadata(&mut checked, cli_metadata)?;
 
     if let Some(parent) = selected.path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -365,6 +442,7 @@ pub fn initialize(
         .with_context(|| format!("failed to write configuration {}", selected.path.display()))?;
 
     let mut loaded = load_with_context(Some(&selected.path), cli_database, &context)?;
+    select_metadata(&mut loaded, cli_metadata)?;
     loaded.effective.config_file.origin = selected.origin;
     Ok(ConfigInitReport {
         created: true,
@@ -380,7 +458,19 @@ pub fn initialize(
 ///
 /// Returns an error when configuration loading itself fails.
 pub fn check(cli_config: Option<&Path>, cli_database: Option<&Path>) -> Result<ConfigCheckReport> {
-    let loaded = load(cli_config, cli_database)?;
+    check_selected(cli_config, cli_database, None)
+}
+
+/// Checks both independently selected databases without creating either.
+///
+/// # Errors
+/// Returns an error when configuration loading fails.
+pub(crate) fn check_selected(
+    cli_config: Option<&Path>,
+    cli_database: Option<&Path>,
+    cli_metadata: Option<&Path>,
+) -> Result<ConfigCheckReport> {
+    let loaded = load_selected(cli_config, cli_database, cli_metadata)?;
     let mut issues = Vec::new();
     if !loaded.effective.config_file.loaded {
         issues.push(ConfigCheckIssue {
@@ -770,6 +860,7 @@ impl ResolutionContext {
             xdg_data_home: optional_standard_directory("XDG_DATA_HOME"),
             config_env: environment_override(CONFIG_ENV),
             database_env: environment_override(DATABASE_ENV),
+            metadata_env: environment_override(METADATA_ENV),
         })
     }
 }
@@ -806,6 +897,55 @@ fn non_empty_environment(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
 
+/// Resolves a CLI metadata override without changing the index selection.
+///
+/// # Errors
+/// Returns an error for an invalid path or a shared index/metadata file.
+pub(crate) fn select_metadata(loaded: &mut LoadedConfig, path: Option<&Path>) -> Result<()> {
+    if let Some(path) = path {
+        loaded.effective.metadata_database = ResolvedPath {
+            path: resolve_cli_path(path, &ResolutionContext::from_environment()?)?,
+            origin: cli_origin(),
+        };
+    }
+    validate_distinct_databases(
+        &loaded.effective.database.path,
+        &loaded.effective.metadata_database.path,
+    )
+}
+
+fn validate_distinct_databases(index: &Path, metadata: &Path) -> Result<()> {
+    fn normalized(path: &Path) -> Result<PathBuf> {
+        if path.exists() {
+            return Ok(path.canonicalize()?);
+        }
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            return Ok(normalized(parent)?.join(name));
+        }
+        if path.components().next_back() == Some(std::path::Component::ParentDir) {
+            let mut parent = normalized(path.parent().context("invalid parent path")?)?;
+            parent.pop();
+            return Ok(parent);
+        }
+        Ok(path.to_owned())
+    }
+    anyhow::ensure!(
+        normalized(index)? != normalized(metadata)?,
+        "index and metadata database paths must differ"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(a), Ok(b)) = (fs::metadata(index), fs::metadata(metadata)) {
+            anyhow::ensure!(
+                (a.dev(), a.ino()) != (b.dev(), b.ino()),
+                "index and metadata database paths refer to the same file"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -823,6 +963,7 @@ mod tests {
             xdg_data_home: Some(directory.join("data")),
             config_env: None,
             database_env: None,
+            metadata_env: None,
         }
     }
 
@@ -958,9 +1099,10 @@ path = "sessions"
             cwd: directory.path().to_path_buf(),
             home: None,
             xdg_config_home: None,
-            xdg_data_home: None,
+            xdg_data_home: Some(directory.path().join("data")),
             config_env: None,
             database_env: None,
+            metadata_env: None,
         };
 
         let loaded = load_with_context(Some(&config), Some(&database), &context)
@@ -981,6 +1123,7 @@ path = "sessions"
             xdg_data_home: Some(PathBuf::from("relative-data")),
             config_env: Some(PathBuf::new()),
             database_env: Some(PathBuf::new()),
+            metadata_env: Some(directory.path().join("metadata.sqlite")),
         };
 
         let loaded = load_with_context(Some(&config), Some(&database), &context)

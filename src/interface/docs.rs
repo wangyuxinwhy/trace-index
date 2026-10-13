@@ -62,6 +62,15 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         summary: TopicSummary {
+            name: "how-to/session-metadata",
+            category: "how-to",
+            title: "Session Metadata",
+            summary: "Store caller-defined JSON independently and query Session associations.",
+        },
+        content: include_str!("../../docs/how-to/session-metadata.md"),
+    },
+    Topic {
+        summary: TopicSummary {
             name: "how-to/query-evidence",
             category: "how-to",
             title: "Query Indexed Facts",
@@ -272,7 +281,7 @@ mod tests {
 
     #[test]
     fn lists_gets_and_searches_bundled_topics() {
-        assert_eq!(list().returned, 16);
+        assert_eq!(list().returned, 17);
         assert!(
             get("how-to/install")
                 .expect("install docs")

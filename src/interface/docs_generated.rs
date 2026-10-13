@@ -43,19 +43,20 @@ fn about(command: &ClapCommand) -> String {
 fn cli_table() -> String {
     let root = Cli::command();
     let mut out = String::from("| Command | What it does |\n| --- | --- |\n");
-    for noun in root.get_subcommands().filter(|c| c.get_name() != "help") {
-        let _ = writeln!(out, "| `{}` | {} |", noun.get_name(), about(noun));
-        for verb in noun.get_subcommands().filter(|c| c.get_name() != "help") {
-            let _ = writeln!(
-                out,
-                "| `{} {}` | {} |",
-                noun.get_name(),
-                verb.get_name(),
-                about(verb)
-            );
-        }
-    }
+    append_commands(&root, "", &mut out);
     out.trim_end().to_string()
+}
+
+fn append_commands(command: &clap::Command, prefix: &str, out: &mut String) {
+    for child in command.get_subcommands().filter(|c| c.get_name() != "help") {
+        let name = if prefix.is_empty() {
+            child.get_name().to_owned()
+        } else {
+            format!("{prefix} {}", child.get_name())
+        };
+        let _ = writeln!(out, "| `{name}` | {} |", about(child));
+        append_commands(child, &name, out);
+    }
 }
 
 /// The first paragraph of a declaration's documentation, whitespace collapsed:
@@ -247,8 +248,15 @@ mod tests {
                 .find(|region| region.name == name)
                 .expect("region")
         };
-        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 22);
-        assert_eq!(by_name("relation-list").body.lines().count(), 7);
+        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 27);
+        assert!(by_name("cli-table").body.contains("`session metadata set`"));
+        assert!(by_name("cli-table").body.contains("`session metadata get`"));
+        assert!(
+            by_name("cli-table")
+                .body
+                .contains("`session metadata delete`")
+        );
+        assert_eq!(by_name("relation-list").body.lines().count(), 8);
         assert_eq!(by_name("persist-sites").body.matches('`').count(), 6 * 2);
     }
 }

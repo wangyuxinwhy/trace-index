@@ -192,14 +192,14 @@ fn query_hint(incomplete_reason: Option<&str>, cells_truncated: usize) -> Option
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Bounds the Query Plane to reading this one database.
+/// Bounds user SQL to reading the index and tool-selected metadata store.
 ///
 /// Reading is unrestricted, including the private storage tables behind the
-/// public Relations. They hold the same local Trace data the caller owns. The
-/// seven public Relations remain the stable contract; private tables are free to
+/// public Relations. They hold local data the caller owns. The
+/// declared public Relations remain the stable contract; private tables are free to
 /// change with the storage format.
 ///
-/// What stays denied is everything that leaves the database or changes it.
+/// User SQL cannot select another database or modify either selected store.
 /// `ATTACH` is the one that matters: read-only open flags do not stop it, and
 /// it would reach any `SQLite` file on disk.
 fn authorize_read_only_query(context: AuthContext<'_>, executing: bool) -> Authorization {
@@ -267,6 +267,18 @@ pub fn public_schema(
     requested: Option<&str>,
     include_descriptions: bool,
 ) -> Result<SchemaReport> {
+    validate_public_relations(store.connection())?;
+    describe_schema(requested, include_descriptions)
+}
+
+/// Describes declarations without opening or creating any database.
+///
+/// # Errors
+/// Returns an error for an unknown relation name.
+pub(crate) fn describe_schema(
+    requested: Option<&str>,
+    include_descriptions: bool,
+) -> Result<SchemaReport> {
     if let Some(name) = requested
         && find_public_relation(name).is_none()
     {
@@ -276,7 +288,6 @@ pub fn public_schema(
         );
     }
 
-    validate_public_relations(store.connection())?;
     let mut objects = Vec::with_capacity(requested.map_or(PUBLIC_RELATIONS.len(), |_| 1));
     for relation in PUBLIC_RELATIONS
         .iter()

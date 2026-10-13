@@ -32,6 +32,7 @@ Fields:
 
 - `schema_version`: configuration contract version. It defaults to `1` for compatibility with files created before this field existed; new files write it explicitly.
 - `database`: optional path to the rebuildable SQLite index.
+- `metadata_database`: optional path to independent persistent caller-owned Session metadata. It is not derived from `database` or `--db`.
 - `indexing.max_indexed_record_bytes`: maximum bytes retained and parsed for one JSONL Record. The built-in value is `16777216`.
 - `indexing.max_published_text_bytes`: maximum UTF-8 bytes published for one Semantic text value. The built-in value is `65536`.
 - `roots`: zero or more files or directories recursively searched for `.jsonl` Sources.
@@ -53,6 +54,12 @@ Every path returned by `config show` is absolute.
 - `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, when non-empty, must be absolute.
 
 Paths are not canonicalized during loading because a database or root may not exist yet. `config check` and `index sync` canonicalize existing roots when they need physical identity.
+
+## Metadata storage
+
+`metadata_database` optionally selects persistent caller-owned Session data. Its path is resolved like `database`, but independently: `--metadata-db` > `TRACE_INDEX_METADATA_DB` > `metadata_database` > the platform data directory plus `trace-index/metadata.sqlite`. Changing `--db` does not change this selection. `config show` reports both absolute paths and origins; the files must differ. `config init --metadata-db PATH` records an explicit metadata path without creating the store. `config check` validates an existing store read-only; absence is normal before its first write. See [Session Metadata](../how-to/session-metadata.md).
+
+Older CLI versions reject a configuration containing `metadata_database` under their existing unknown-field rule. Use version 0.3.0 or later for this field; old configurations without it remain valid.
 
 ## Precedence and provenance
 

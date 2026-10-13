@@ -13,6 +13,7 @@ fn trace_index() -> Command {
     command
         .env_remove("TRACE_INDEX_CONFIG")
         .env_remove("TRACE_INDEX_DB")
+        .env_remove("TRACE_INDEX_METADATA_DB")
         .env("XDG_CONFIG_HOME", isolated.join("config"))
         .env("XDG_DATA_HOME", isolated.join("data"));
     command
@@ -491,7 +492,8 @@ fn sync_schema_and_query_form_one_machine_readable_workflow() {
             "loops",
             "items",
             "blobs",
-            "item_search"
+            "item_search",
+            "session_metadata"
         ]
     );
 

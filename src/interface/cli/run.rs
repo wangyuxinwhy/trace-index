@@ -23,15 +23,27 @@ pub(crate) fn run() -> Result<()> {
     let Cli {
         config: config_file,
         db: database,
+        metadata_db,
         command,
     } = Cli::parse();
     match command {
         Command::Docs { command } => run_docs(command),
-        Command::Config { command } => {
-            run_config(command, config_file.as_deref(), database.as_deref())
-        }
+        Command::Schema { command } => run_declared_schema(command),
+        Command::Config { command } => run_config(
+            command,
+            config_file.as_deref(),
+            database.as_deref(),
+            metadata_db.as_deref(),
+        ),
         command => {
-            let loaded = config::load(config_file.as_deref(), database.as_deref())?;
+            let loaded = config::load_selected(
+                config_file.as_deref(),
+                database.as_deref(),
+                metadata_db.as_deref(),
+            )?;
+            if let Command::Session { command } = command {
+                return run_session(command, &loaded);
+            }
             run_operational(command, &loaded)
         }
     }
@@ -61,10 +73,16 @@ fn run_operational(command: Command, loaded: &LoadedConfig) -> Result<()> {
     match command {
         Command::Index { command } => run_index(&mut store, loaded, command),
         Command::Schema { command } => run_schema(&store, command),
-        Command::Query { command } => run_query(&store, command),
+        Command::Query { command } => {
+            crate::storage::metadata::attach_query(
+                store.connection(),
+                Some(&loaded.effective.metadata_database.path),
+            )?;
+            run_query(&store, command)
+        }
         Command::Record { command } => run_record(&store, command),
         Command::Asset { command } => run_asset(&store, command),
-        Command::Docs { .. } | Command::Config { .. } => {
+        Command::Docs { .. } | Command::Config { .. } | Command::Session { .. } => {
             unreachable!("non-operational commands are dispatched before opening the database")
         }
     }
@@ -118,17 +136,54 @@ fn run_config(
     command: ConfigCommand,
     config_file: Option<&std::path::Path>,
     database: Option<&std::path::Path>,
+    metadata_db: Option<&std::path::Path>,
 ) -> Result<()> {
     match command {
         ConfigCommand::Init { root, discover } => {
-            print_envelope(&config::initialize(config_file, database, &root, discover)?)
+            let mut report = if metadata_db.is_some() {
+                config::initialize_selected(config_file, database, metadata_db, &root, discover)?
+            } else {
+                config::initialize(config_file, database, &root, discover)?
+            };
+            let mut loaded = config::LoadedConfig {
+                effective: report.config,
+            };
+            config::select_metadata(&mut loaded, metadata_db)?;
+            report.config = loaded.effective;
+            print_envelope(&report)
         }
         ConfigCommand::Show => {
-            let loaded = config::load(config_file, database)?;
+            let loaded = if metadata_db.is_some() {
+                config::load_selected(config_file, database, metadata_db)?
+            } else {
+                let mut loaded = config::load(config_file, database)?;
+                config::select_metadata(&mut loaded, None)?;
+                loaded
+            };
             print_envelope(&loaded.effective)
         }
         ConfigCommand::Check => {
-            let report = config::check(config_file, database)?;
+            let mut report = if metadata_db.is_some() {
+                config::check_selected(config_file, database, metadata_db)?
+            } else {
+                config::check(config_file, database)?
+            };
+            let mut loaded = config::LoadedConfig {
+                effective: report.config,
+            };
+            config::select_metadata(&mut loaded, metadata_db)?;
+            report.config = loaded.effective;
+            if let Err(error) =
+                crate::storage::metadata::open_read(&report.config.metadata_database.path)
+            {
+                report.valid = false;
+                report.issues.push(config::ConfigCheckIssue {
+                    level: config::ConfigCheckLevel::Error,
+                    code: "metadata_unreadable",
+                    message: error.to_string(),
+                    path: Some(report.config.metadata_database.path.clone()),
+                });
+            }
             let valid = report.valid;
             print_envelope(&report)?;
             if !valid {
@@ -344,4 +399,59 @@ fn print_markdown(markdown: &str) -> Result<()> {
         writeln!(lock).context("failed to terminate Markdown output")?;
     }
     Ok(())
+}
+
+fn run_session(command: super::SessionCommand, loaded: &LoadedConfig) -> Result<()> {
+    use super::{MetadataCommand, SessionCommand};
+    use crate::storage::metadata;
+    let SessionCommand::Metadata { command } = command;
+    let path = &loaded.effective.metadata_database.path;
+    match command {
+        MetadataCommand::Get { target } => {
+            print_envelope(&metadata::get(path, &target.runtime, &target.native_id)?)
+        }
+        MetadataCommand::Delete { target, if_version } => print_envelope(&metadata::write(
+            path,
+            &target.runtime,
+            &target.native_id,
+            None,
+            if_version,
+        )?),
+        MetadataCommand::Set {
+            target,
+            json,
+            file,
+            stdin: _,
+            if_version,
+        } => {
+            let text = if let Some(text) = json {
+                text
+            } else if let Some(path) = file {
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read metadata {}", path.display()))?
+            } else {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text
+            };
+            print_envelope(&metadata::write(
+                path,
+                &target.runtime,
+                &target.native_id,
+                Some(&text),
+                if_version,
+            )?)
+        }
+    }
+}
+
+fn run_declared_schema(command: SchemaCommand) -> Result<()> {
+    match command {
+        SchemaCommand::List => {
+            print_envelope(&crate::interface::query::describe_schema(None, true)?)
+        }
+        SchemaCommand::Get { object, compact } => print_envelope(
+            &crate::interface::query::describe_schema(Some(&object), !compact)?,
+        ),
+    }
 }

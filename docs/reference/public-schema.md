@@ -5,7 +5,7 @@ description: Public relations and their evidence semantics.
 
 # Public SQL Schema
 
-Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` for candidate retrieval. These seven relations form the stable query contract; the two access relations do not add domain objects.
+Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` for candidate retrieval. The caller-owned `session_metadata` relation adds uninterpreted JSON associations. It is independent of Runtime evidence and is not another trace domain object.
 
 Discover the exact names, columns, SQLite types, nullability, and descriptions from the running binary:
 
@@ -25,6 +25,7 @@ trace-index schema get items --compact
 - `items`: Individually queryable Agent program facts. `semantic` is the typed Trace Index meaning; `record_ids` identifies its physical evidence.
 - `blobs`: Bounded Semantic text addressable through Item BlobRef values. Blob rows are access data, not independent trace facts.
 - `item_search`: Trigram candidate index over explicitly documented Item semantic text. `rowid` is the matching `items.item_id`; exact-check candidate text.
+- `session_metadata`: Caller-owned, uninterpreted Session JSON from the independent metadata database.
 
 <!-- /generated -->
 
@@ -158,4 +159,8 @@ Use SQLite JSON functions for direct projection. For example, `json_each(source_
 
 SQLite tables such as `domain_items`, `content_blobs`, `item_records`, or `session_parents` are storage choices. They may deduplicate bounded Semantic text, normalize arrays and sparse attributes, or maintain checkpoints and write-time state, but their private names and shapes are not stable query interfaces. Public `items.semantic` preserves the declared BlobRef, while the public `blobs` access relation owns text lookup. The existence of that access relation does not make Blob a domain entity.
 
-`query run` may read those tables for index-integrity debugging. Ordinary analysis should use the seven Public Relations. A query that succeeds against a private table can still be semantically wrong and can break on the next Storage Format.
+`query run` may read those tables for index-integrity debugging. Ordinary analysis should use the declared Public Relations. A query that succeeds against a private table can still be semantically wrong and can break on the next Storage Format.
+
+## Caller-owned Session metadata
+
+`session_metadata` joins independent persistent user data to this index by `(runtime, native_id)`. Its `session_id` is nullable: an unmatched association remains queryable without manufacturing a Session. `metadata` is the complete caller-defined JSON text; `version` supports compare-and-set, and `updated_at` is the last committed update in UTC milliseconds. No field meaning is inferred and no Runtime Record is fabricated. Metadata writes are visible to the next query without index sync. See [Session Metadata](../how-to/session-metadata.md) for storage selection, replacement, null versus absence, and backup.

@@ -121,6 +121,7 @@ impl Store {
         if is_new {
             set_owner_only_permissions(path)?;
         }
+        super::metadata::attach_query(store.connection(), None)?;
         Ok(store)
     }
 
@@ -166,6 +167,7 @@ impl Store {
         };
         store.validate_schema()?;
         store.connect_public_virtual_tables()?;
+        super::metadata::attach_query(store.connection(), None)?;
         Ok(store)
     }
 

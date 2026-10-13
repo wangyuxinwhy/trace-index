@@ -13,6 +13,11 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 
 | Command | What it does |
 | --- | --- |
+| `session` | Store and read caller-defined Session data, independent of trace indexing |
+| `session metadata` | Associate a Session with arbitrary caller-defined JSON (no business schema) |
+| `session metadata set` | Replace the whole JSON document; no merge, history or implicit index sync |
+| `session metadata get` | Read one whole document and its version; absence is found=false, JSON null is found=true |
+| `session metadata delete` | Remove the association, retaining its version; does not delete trace or index data |
 | `docs` | Read documentation bundled with the current CLI |
 | `docs list` | List bundled documentation topics |
 | `docs get` | Get one documentation topic |
@@ -40,6 +45,6 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 
 Use `trace-index --help`, `trace-index <noun> --help`, and `trace-index <noun> <verb> --help` for version-matched concepts and command details.
 
-`docs` and `config` can operate without opening the index. `index sync` is the only command that writes the database. All other operational commands open an existing database read-only.
+`docs`, `config`, `schema`, and `session metadata` can operate without opening the index. `index sync` writes the trace index; `session metadata set/delete` write the independent caller-owned metadata store. Queries open the selected index and metadata store read-only. See [Session Metadata](../how-to/session-metadata.md) for whole-document replacement and version checks.
 
 The CLI intentionally has no shortcut command for a query that SQL already expresses. A new command must establish a safety or side-effect boundary, expose a capability SQL cannot reliably express, or be justified by repeated experiments.

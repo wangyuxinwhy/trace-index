@@ -3,5 +3,6 @@
   "configure-and-sync",
   "query-evidence",
   "search-literals",
-  "inspect-and-export"
+  "inspect-and-export",
+  "session-metadata"
 ]

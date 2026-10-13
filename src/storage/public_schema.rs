@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension as _};
 pub(crate) enum PublicRelationKind {
     View { from_sql: &'static str },
     VirtualTable,
+    ConnectionView,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,8 +233,38 @@ public_virtual_table! {
     }
 }
 
-pub(crate) const PUBLIC_RELATIONS: &[PublicRelation] =
-    &[SOURCES, RECORDS, SESSIONS, LOOPS, ITEMS, BLOBS, ITEM_SEARCH];
+public_virtual_table! {
+    /// Caller-owned, uninterpreted Session JSON from the independent metadata database.
+    pub(crate) const METADATA_COLUMNS = "session_metadata" {
+        /// Current index join key, absent when the target is not indexed.
+        session_id: Option<i64>,
+        /// Runtime owning the target identity.
+        runtime: String,
+        /// Stable Runtime-native target identity.
+        native_id: String,
+        /// Complete caller-provided JSON text, without inferred meaning.
+        metadata: String,
+        /// Storage revision for compare-and-set; not a field inside the JSON.
+        version: i64,
+        /// Last committed update time in UTC epoch milliseconds.
+        updated_at: i64,
+    }
+}
+pub(crate) const SESSION_METADATA: PublicRelation = PublicRelation {
+    kind: PublicRelationKind::ConnectionView,
+    ..METADATA_COLUMNS
+};
+
+pub(crate) const PUBLIC_RELATIONS: &[PublicRelation] = &[
+    SOURCES,
+    RECORDS,
+    SESSIONS,
+    LOOPS,
+    ITEMS,
+    BLOBS,
+    ITEM_SEARCH,
+    SESSION_METADATA,
+];
 
 impl PublicRelation {
     fn create_sql(self) -> Result<Option<String>> {
@@ -289,6 +320,7 @@ pub(crate) fn validate_public_relations(connection: &Connection) -> Result<()> {
         let expected_kind = match relation.kind {
             PublicRelationKind::View { .. } => "view",
             PublicRelationKind::VirtualTable => "table",
+            PublicRelationKind::ConnectionView => continue,
         };
         let actual_kind = connection
             .query_row(
@@ -356,11 +388,39 @@ mod tests {
                 "loops",
                 "items",
                 "blobs",
-                "item_search"
+                "item_search",
+                "session_metadata"
             ]
         );
         let mut names = BTreeSet::new();
-        let expected_columns = [
+        for (relation, (expected_name, expected)) in PUBLIC_RELATIONS.iter().zip(expected_columns())
+        {
+            assert!(names.insert(relation.name));
+            assert_eq!(relation.name, expected_name);
+            assert_eq!(
+                relation
+                    .columns
+                    .iter()
+                    .map(|column| column.name)
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected {} contract",
+                relation.name
+            );
+            assert!(!relation.description.trim().is_empty());
+            assert!(!relation.columns.is_empty());
+            for column in relation.columns {
+                assert!(!column.description.trim().is_empty());
+                assert_eq!(
+                    column.expression.is_some(),
+                    matches!(relation.kind, PublicRelationKind::View { .. })
+                );
+            }
+        }
+    }
+
+    fn expected_columns() -> [(&'static str, &'static [&'static str]); 8] {
+        [
             ("sources", &["source_id", "locator", "runtime"][..]),
             (
                 "records",
@@ -418,30 +478,18 @@ mod tests {
                 &["blob_id", "text", "full_bytes", "estimated_tokens"][..],
             ),
             ("item_search", &["text"][..]),
-        ];
-        for (relation, (expected_name, expected)) in PUBLIC_RELATIONS.iter().zip(expected_columns) {
-            assert!(names.insert(relation.name));
-            assert_eq!(relation.name, expected_name);
-            assert_eq!(
-                relation
-                    .columns
-                    .iter()
-                    .map(|column| column.name)
-                    .collect::<Vec<_>>(),
-                expected,
-                "unexpected {} contract",
-                relation.name
-            );
-            assert!(!relation.description.trim().is_empty());
-            assert!(!relation.columns.is_empty());
-            for column in relation.columns {
-                assert!(!column.description.trim().is_empty());
-                assert_eq!(
-                    column.expression.is_some(),
-                    matches!(relation.kind, PublicRelationKind::View { .. })
-                );
-            }
-        }
+            (
+                "session_metadata",
+                &[
+                    "session_id",
+                    "runtime",
+                    "native_id",
+                    "metadata",
+                    "version",
+                    "updated_at",
+                ][..],
+            ),
+        ]
     }
 
     #[test]

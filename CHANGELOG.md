@@ -4,6 +4,18 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-13
+
+### Added
+
+- Independent persistent Session metadata with whole-document JSON set/get/delete, optional atomic version checks, and rebuild-safe Runtime-native associations.
+- The read-only `session_metadata` SQL relation, including unmatched targets, with immediate visibility after committed writes and no index synchronization.
+- Metadata storage configuration with independent CLI, environment, file, and default selections; metadata input and key meanings remain caller-defined.
+
+### Changed
+
+- Schema discovery reads declarations without requiring an index. The five trace domain objects and Storage Format 2 are unchanged.
+
 ## [0.2.2] - 2026-10-13
 
 ### Fixed
@@ -50,7 +62,8 @@ Initial public release.
 - Compact machine-readable output, explicit incomplete-result hints, bundled Agent documentation, and an Agent skill.
 - Storage Format 1. Databases created by non-public development builds must be rebuilt.
 
-[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wangyuxinwhy/trace-index/compare/v0.1.0...v0.2.0

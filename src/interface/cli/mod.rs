@@ -83,6 +83,7 @@ Semantic role vocabulary:
 Public SQL surface:
   Domain Relations: sources, records, sessions, loops, items
   Access Relations: blobs, item_search
+  Caller-owned data: session_metadata
 
   Access Relations provide text lookup and candidate retrieval; they are not
   additional domain objects. Facts and provenance still come from Items and Records.
@@ -151,10 +152,20 @@ Investigation defaults:
     requires. Preserve unresolved ambiguity instead of selecting a convenient
     Session, interpretation, or denominator.
 
+Caller-owned Session metadata:
+  session metadata set/get/delete stores arbitrary JSON by (runtime, native_id).
+  set replaces the whole document; no merge, inherited meaning or history recovery.
+  --metadata-db selects persistent user data independently of --db; config show
+  reports both paths. Reads never create the metadata store. The next query sees
+  committed metadata without index sync. session_metadata.session_id is null for
+  targets absent from this index. Metadata is not Runtime Record evidence.
+  Use docs get how-to/session-metadata for input, version checks and backup.
+
 Operational boundary:
   Reads never synchronize or mutate the index. Run index sync explicitly only
   when newly written traces are required. Commands return compact JSON on stdout;
-  synchronization progress and diagnostics use stderr.
+  synchronization progress and diagnostics use stderr. Metadata set/delete write
+  only the independent metadata store; they do not modify trace or index data.
 
 Use '<noun> --help' for capabilities and '<noun> <verb> --help' for exact
 arguments, defaults, limits, side effects, and command-specific examples.";
@@ -282,6 +293,9 @@ pub(crate) struct Cli {
     /// `SQLite` index path.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Independent caller-owned metadata database; --db does not change it.
+    #[arg(long, global = true)]
+    metadata_db: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -293,6 +307,11 @@ pub(crate) struct Cli {
     reason = "the command is parsed once, so boxing its flat CLI arguments adds indirection without value"
 )]
 enum Command {
+    /// Store and read caller-defined Session data, independent of trace indexing
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Read documentation bundled with the current CLI.
     #[command(after_help = DOCS_AFTER_HELP)]
     Docs {
@@ -661,4 +680,63 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Associate a Session with arbitrary caller-defined JSON (no business schema)
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct MetadataTarget {
+    /// Runtime owning the native identity: codex, pi or claude
+    #[arg(long)]
+    runtime: String,
+    /// Stable Runtime-native Session id; not the index-local integer `session_id`
+    #[arg(long)]
+    native_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum MetadataCommand {
+    /// Replace the whole JSON document; no merge, history or implicit index sync
+    #[command(
+        after_help = "Writes only the selected metadata database. The next query sees committed changes.
+Use --if-version from get for read-modify-write; a stale version fails without writing.
+Example: trace-index session metadata set --runtime pi --native-id SESSION --file metadata.json"
+    )]
+    Set {
+        #[command(flatten)]
+        target: MetadataTarget,
+        #[arg(long, conflicts_with_all=["file","stdin"], required_unless_present_any=["file","stdin"])]
+        json: Option<String>,
+        #[arg(long, conflicts_with_all=["json","stdin"])]
+        file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all=["json","file"])]
+        stdin: bool,
+        #[arg(long)]
+        if_version: Option<i64>,
+    },
+    /// Read one whole document and its version; absence is found=false, JSON null is found=true
+    #[command(
+        after_help = "Reads only the selected metadata store, without creating it. Returns one whole document.\n--db does not change the metadata store. For bounded field reads use query run.\nExample: trace-index session metadata get --runtime pi --native-id SESSION"
+    )]
+    Get {
+        #[command(flatten)]
+        target: MetadataTarget,
+    },
+    /// Remove the association, retaining its version; does not delete trace or index data
+    #[command(
+        after_help = "Writes only the selected metadata store, preserving its deletion version.\nAn absent association is a no-op. The deleted document has no history recovery.\nExample: trace-index session metadata delete --runtime pi --native-id SESSION --if-version VERSION"
+    )]
+    Delete {
+        #[command(flatten)]
+        target: MetadataTarget,
+        #[arg(long)]
+        if_version: Option<i64>,
+    },
 }

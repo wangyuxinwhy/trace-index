@@ -6,3 +6,5 @@ pub(crate) mod persist;
 pub(crate) mod public_schema;
 pub(crate) mod schema;
 mod schema_v2;
+
+pub(crate) mod metadata;
