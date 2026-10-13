@@ -742,6 +742,12 @@ impl PiProjector {
 
     /// An extension's injected message, typed by the `customType` it declared.
     fn custom_message(&mut self, seq: u64, value: &Value, ts_ms: Option<i64>) {
+        let session = self.session_mut(seq);
+        if session.active_loop.as_ref().is_some_and(|turn| {
+            matches!(turn.last_stop_reason.as_deref(), Some("stop" | "aborted"))
+        }) {
+            session.close_loop();
+        }
         let custom_type = string(value, "customType").unwrap_or("unknown");
         let (semantic_role, why) = semantic::pi_custom_message(custom_type);
         let text = content_text(value.get("content"));
@@ -762,7 +768,10 @@ impl PiProjector {
             searchable: false,
             linked_session_native_id: None,
         };
-        self.session_mut(seq).loop_mut(seq).push(item);
+        // A custom message can be delivered without starting a run. Keep idle
+        // delivery at Session scope; subsequent Agent execution supplies its
+        // own Loop evidence rather than extending a completed Loop.
+        self.session_mut(seq).push_runtime(item);
     }
 
     /// A name a person gave the Session. Kept as a Session fact rather than a

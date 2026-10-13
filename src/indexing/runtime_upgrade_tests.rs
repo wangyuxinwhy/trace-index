@@ -132,6 +132,40 @@ fn pi_system_only_source_has_no_loop() {
 }
 
 #[test]
+fn pi_idle_custom_messages_do_not_extend_completed_loops_or_invent_runs() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("pi-custom.jsonl");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"session","version":3,"id":"pi-custom","cwd":"/workspace"}),
+            json!({"type":"message","message":{"role":"user","content":"First request"}}),
+            json!({"type":"message","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"First answer"}]}}),
+            json!({"type":"custom_message","customType":"context-update","content":"Idle context"}),
+            json!({"type":"message","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Extension-triggered answer"}]}}),
+            json!({"type":"custom_message","customType":"context-update","content":"Notification only"}),
+            json!({"type":"message","message":{"role":"user","content":"Next request"}}),
+            json!({"type":"message","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Next answer"}]}}),
+            json!({"type":"custom_message","customType":"context-update","content":"Trailing notification"}),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let db = store.connection();
+    assert_eq!(count(db, "loops"), 3);
+    let items = semantics(db);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|s| s["role"] == "human.request")
+            .count(),
+        2
+    );
+    assert!(!items.iter().any(|s| s["role"] == "human.steering"));
+    assert_eq!(db.query_row::<i64,_,_>("SELECT COUNT(*) FROM items WHERE loop_id IS NULL AND json_extract(semantic,'$.role') = 'runtime.unknown'",[],|r|r.get(0)).expect("idle context"),3);
+    assert_eq!(db.query_row::<i64,_,_>("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM items WHERE json_extract(semantic,'$.role') = 'agent.final_answer' GROUP BY loop_id)",[],|r|r.get(0)).expect("one answer per run"),1);
+}
+
+#[test]
 fn pi_context_edits_and_compaction_checkpoints_preserve_original_items() {
     let traces = tempdir().expect("traces");
     let trace = traces.path().join("pi-context.jsonl");

@@ -8,6 +8,8 @@ All notable public changes to Trace Index are documented here.
 
 ### Fixed
 
+- Pi extension-triggered runs no longer extend a completed Loop. Idle custom messages remain Session context until subsequent execution establishes a new Loop, and notifications alone do not create a Loop.
+
 - Query timeout diagnostics retain the configured duration, including fractional seconds; execution budgets are unchanged.
 - Pi system prompt and tool-loadout declarations no longer open a Loop or misclassify the first Human request as steering. Prompt patches, compaction checkpoints, and context edits are published without rewriting historical messages; retry recovery stays in its outer Loop. Tool duration and per-response model metadata are preserved.
 - Codex turn-scoped `token_usage_record` counters update unfinished and completed Loops without adding legacy usage twice. Native `CommandExecution` completion events expose commands executed through JavaScript orchestration, with correlated outputs and source witnesses; event order and repeated completions preserve arguments, working directories, and output boundaries.
