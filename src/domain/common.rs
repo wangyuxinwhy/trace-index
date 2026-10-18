@@ -50,7 +50,7 @@ pub(crate) struct Model {
     pub(crate) context_window: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Usage {
     /// All input tokens processed by the model, including cached input.
     pub(crate) input: u64,

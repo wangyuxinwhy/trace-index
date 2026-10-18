@@ -215,6 +215,7 @@ struct SessionBuilder {
     /// Index into `loops` that new items are appended to.
     current: Option<usize>,
     by_prompt: HashMap<String, usize>,
+    usage: projection::UsageLedger,
     /// Tool calls whose output may identify later Runtime-generated records.
     /// Claude repeats the call id in `sourceToolUseID`, which lets injected
     /// Skill bodies retain their purpose instead of becoming generic notices.
@@ -253,6 +254,7 @@ impl SessionBuilder {
             items: Vec::new(),
             current: None,
             by_prompt: HashMap::new(),
+            usage: projection::UsageLedger::default(),
             skill_call_ids: HashSet::new(),
             async_tasks: HashMap::new(),
             delegation_locations: HashMap::new(),
@@ -289,6 +291,10 @@ impl SessionBuilder {
             .loops
             .iter()
             .fold(self.end_seq, |end, loop_| end.max(loop_.end_seq));
+        let mut usage = self.usage.finish();
+        for turn in &mut self.loops {
+            turn.usage = usage.remove(&turn.start_seq);
+        }
         let loops = self
             .loops
             .drain(..)
@@ -746,9 +752,13 @@ impl ClaudeProjector {
         }
         turn.model = turn.model.take().or(model);
         turn.effort = turn.effort.take().or(effort);
-        if let Some(usage) = usage {
-            turn.usage = Some(projection::add_usage(turn.usage.take(), usage));
+        let usage_loop = turn.start_seq;
+        if string(message, "model") != Some("<synthetic>") {
+            self.session_mut(seq)
+                .usage
+                .observe(string(message, "id"), usage_loop, usage);
         }
+        let turn = self.session_mut(seq).loop_mut(seq);
         if let Some(index) = answer_index {
             turn.final_answer_item = Some(index);
         }

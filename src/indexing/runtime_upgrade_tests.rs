@@ -709,3 +709,148 @@ fn claude_fork_context_header_preserves_identity_evidence_and_append_behavior() 
             .to_string_lossy()
     );
 }
+
+#[test]
+fn claude_usage_replaces_response_snapshots_across_blocks_and_late_replay() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("claude-usage.jsonl");
+    let assistant = |id: Option<&str>, output: u64, model: &str| json!({"type":"assistant","sessionId":"usage-session","message":{"id":id,"model":model,"role":"assistant","content":[{"type":"thinking","thinking":"work"},{"type":"text","text":"answer"}],"usage":{"input_tokens":5,"cache_read_input_tokens":10,"output_tokens":output,"output_tokens_details":{"thinking_tokens":2}},"stop_reason":"end_turn"}});
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"user","sessionId":"usage-session","promptId":"one","message":{"role":"user","content":"first"}}),
+            assistant(Some("response-one"), 3, "model"),
+            assistant(Some("response-one"), 8, "model"),
+            assistant(Some("response-two"), 8, "model"),
+            json!({"type":"user","sessionId":"usage-session","promptId":"two","message":{"role":"user","content":"next"}}),
+            assistant(Some("response-one"), 9, "model"),
+            assistant(Some("synthetic"), 999, "<synthetic>"),
+            assistant(None, 4, "model"),
+            assistant(Some("response-three"), 6, "model"),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let usages: Vec<String> = store
+        .connection()
+        .prepare("SELECT usage FROM loops ORDER BY session_position")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let first: Value = serde_json::from_str(&usages[0]).unwrap();
+    let second: Value = serde_json::from_str(&usages[1]).unwrap();
+    assert_eq!(
+        first,
+        json!({"input":30,"cached":20,"output":17,"reasoning":4})
+    );
+    assert_eq!(
+        second,
+        json!({"input":30,"cached":20,"output":10,"reasoning":4})
+    );
+    // Usage deduplication must not discard the native content blocks or witnesses.
+    assert_eq!(count(store.connection(), "records"), 9);
+    assert_eq!(count(store.connection(), "items"), 16);
+}
+
+#[test]
+fn pi_usage_counts_a_persisted_message_once_and_keeps_distinct_equal_calls() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("pi-usage.jsonl");
+    let assistant = |id: &str, output: u64| json!({"type":"message","id":id,"message":{"role":"assistant","model":"model","content":[{"type":"thinking","thinking":"work"},{"type":"text","text":"answer"}],"usage":{"input":5,"cacheRead":10,"output":output},"stopReason":"toolUse"}});
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"session","id":"pi-usage","version":3,"cwd":"/workspace"}),
+            json!({"type":"message","id":"request","message":{"role":"user","content":"hello"}}),
+            assistant("entry-one", 3),
+            assistant("entry-one", 8),
+            assistant("entry-two", 8),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let value: String = store
+        .connection()
+        .query_row("SELECT usage FROM loops", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&value).unwrap(),
+        json!({"input":30,"cached":20,"output":16})
+    );
+}
+
+#[test]
+fn codex_legacy_usage_ignores_repeated_cumulative_observations_not_equal_calls() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("codex-legacy-usage.jsonl");
+    let snapshot = |total| json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":usage(10,2),"total_token_usage":usage(total,total/5)}}});
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"session_meta","payload":{"id":"legacy-usage"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"one"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":usage(10,2)}}}),
+            snapshot(10),
+            snapshot(10),
+            snapshot(20),
+            snapshot(20),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"one"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"two"}}),
+            snapshot(20),
+            snapshot(10),
+            snapshot(30),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let usages: Vec<String> = store
+        .connection()
+        .prepare("SELECT usage FROM loops ORDER BY session_position")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&usages[0]).unwrap()["input"],
+        20
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&usages[1]).unwrap()["input"],
+        10
+    );
+}
+
+#[test]
+fn response_without_usage_keeps_its_first_loop_when_a_late_snapshot_arrives() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("claude-delayed-usage.jsonl");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"user","sessionId":"parent","agentId":"child","promptId":"one","message":{"role":"user","content":"first"}}),
+            json!({"type":"assistant","sessionId":"parent","agentId":"child","message":{"id":"response","role":"assistant","model":"model","content":[{"type":"text","text":"partial"}],"stop_reason":"end_turn"}}),
+            json!({"type":"system","subtype":"compact_boundary","sessionId":"parent","agentId":"child"}),
+            json!({"type":"user","sessionId":"parent","agentId":"child","promptId":"two","message":{"role":"user","content":"second"}}),
+            json!({"type":"assistant","sessionId":"parent","agentId":"child","isApiErrorMessage":true,"message":{"id":"response","role":"assistant","model":"model","content":[],"usage":{"input_tokens":4,"output_tokens":3}}}),
+            json!({"type":"assistant","sessionId":"parent","agentId":"child","message":{"id":"retry","role":"assistant","model":"model","content":[],"usage":{"input_tokens":6,"output_tokens":5}}}),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let values: Vec<Option<String>> = store
+        .connection()
+        .prepare("SELECT usage FROM loops ORDER BY session_position")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(values[0].as_ref().unwrap()).unwrap(),
+        json!({"input":4,"output":3})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(values[1].as_ref().unwrap()).unwrap(),
+        json!({"input":6,"output":5})
+    );
+}

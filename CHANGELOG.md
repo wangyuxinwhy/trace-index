@@ -4,6 +4,17 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-18
+
+### Fixed
+
+- Claude Code Loop usage counts each native response once, replacing repeated content-block snapshots with the last complete observation and routing late replays to their original Loop. Synthetic model messages do not contribute usage.
+- Pi usage replaces repeated assistant entry snapshots without merging distinct calls with equal counters. Legacy Codex usage ignores repeated unchanged Session-cumulative observations; turn-scoped counters retain precedence.
+
+### Changed
+
+- Document Runtime usage identities, partial-observation limits, Session accounting scope, and the required `index sync --rebuild` after this accounting correction. Storage Format 2 and caller-owned metadata storage are unchanged.
+
 ## [0.3.0] - 2026-10-13
 
 ### Added

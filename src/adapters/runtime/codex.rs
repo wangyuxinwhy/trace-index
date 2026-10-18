@@ -345,6 +345,7 @@ struct SessionBuilder {
     items: Vec<ItemProjection>,
     loops: Vec<LoopProjection>,
     closed_loops: HashMap<String, ClosedLoopIndex>,
+    seen_token_totals: std::collections::HashSet<crate::domain::Usage>,
     active_loop: Option<LoopBuilder>,
 }
 
@@ -371,6 +372,7 @@ impl SessionBuilder {
             items: Vec::new(),
             loops: Vec::new(),
             closed_loops: HashMap::new(),
+            seen_token_totals: std::collections::HashSet::new(),
             active_loop: None,
         }
     }
@@ -807,9 +809,16 @@ impl CodexProjector {
                 )
             });
 
-        let turn = self.session_mut(seq).loop_mut(seq);
+        let session = self.session_mut(seq);
+        let total = info
+            .and_then(|info| info.get("total_token_usage"))
+            .and_then(codex_usage);
+        let repeated =
+            sample.is_some() && total.is_some_and(|total| !session.seen_token_totals.insert(total));
+        let turn = session.loop_mut(seq);
         turn.context_window = context_window.or(turn.context_window);
         if !turn.structured_usage
+            && !repeated
             && let Some(sample) = sample
         {
             turn.usage = Some(projection::add_usage(turn.usage.take(), sample));

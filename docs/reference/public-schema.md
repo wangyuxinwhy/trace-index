@@ -77,6 +77,17 @@ Usage {
 
 `input` includes all model input, including cache reads and writes. `cached` and `cache_write` are subsets of `input`, not additional amounts. `output` includes reasoning tokens, and `reasoning` is a subset of `output`. All numbers are sums of the model calls observed inside this Loop. Derive total model tokens as `input + output`; no separate total is stored. Missing usage is unknown, not zero.
 
+Usage counts native model responses, rather than physical Records or content blocks. Repeated observations update the response instead of adding another call:
+
+- Claude Code: within one projected Session, `message.id` identifies a response. Keep the last complete usage snapshot in Source order, including cumulative output updates. A late replay updates the Loop that first observed that response. `<synthetic>` model messages do not contribute usage. A retry with a new response id is a separate observed call, including usage reported before an error.
+- Pi: within one projected Session, the persisted assistant message entry `id` identifies the response. Its content blocks share one usage snapshot; a repeated entry replaces that snapshot. Distinct entries remain separate even when all counters match. User and tool-result messages do not contribute model usage.
+- Codex: `token_usage_record.turn_id` routes the latest `turn_token_usage` snapshot to its Loop, including delayed updates; response and thread counters are not added to it. Legacy `token_count` records contribute `last_token_usage` once for each previously unseen complete Session-cumulative `total_token_usage` snapshot. Repeated identical cumulative observations do not add another call. An absent or invalid cumulative counter provides no duplicate identity, so the legacy per-record observation is retained.
+
+If Claude or Pi omits a response identity, Trace Index retains each complete usage observation rather than guessing equality from text or token counts. Missing optional counters remain unknown. The accounting scope is a projected Session in a Source: copied history in a different Session is not a globally unique billing ledger. Incomplete streamed responses can expose only intermediate counters; Trace Index does not reconstruct unreported final usage or equate trace counters with an invoice. Filtering by a Loop start timestamp selects whole Loops and differs from filtering individual response timestamps.
+
+After upgrading an Adapter that changes usage accounting, run `trace-index index sync --rebuild` for the affected Sources. Ordinary sync skips unchanged files and does not repair previously indexed projections. Caller-owned Session metadata remains in its independent store.
+
+
 ## Semantic SQL encoding
 
 The public SQL representation of top-level Semantic text uses a small reference:

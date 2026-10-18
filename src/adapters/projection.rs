@@ -192,6 +192,51 @@ pub(crate) struct LoopProjection {
     pub items: Vec<ItemProjection>,
 }
 
+/// Latest complete usage observation per native response, scoped to one Session.
+/// Replayed content remains on the timeline; only its accounting is replaced.
+#[derive(Debug, Default)]
+pub(crate) struct UsageLedger {
+    identified: std::collections::HashMap<String, (u64, Option<crate::domain::Usage>)>,
+    unidentified: std::collections::HashMap<u64, crate::domain::Usage>,
+}
+
+impl UsageLedger {
+    pub(crate) fn observe(
+        &mut self,
+        id: Option<&str>,
+        loop_start: u64,
+        usage: Option<crate::domain::Usage>,
+    ) {
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            let entry = self
+                .identified
+                .entry(id.to_owned())
+                .or_insert((loop_start, usage));
+            // A late snapshot still belongs to the Loop that first observed it.
+            if usage.is_some() {
+                entry.1 = usage;
+            }
+        } else if let Some(usage) = usage {
+            let current = self.unidentified.remove(&loop_start);
+            self.unidentified
+                .insert(loop_start, add_usage(current, usage));
+        }
+    }
+
+    pub(crate) fn finish(self) -> std::collections::HashMap<u64, crate::domain::Usage> {
+        let mut totals = self.unidentified;
+        for (loop_start, usage) in self
+            .identified
+            .into_values()
+            .filter_map(|(start, usage)| usage.map(|usage| (start, usage)))
+        {
+            let current = totals.remove(&loop_start);
+            totals.insert(loop_start, add_usage(current, usage));
+        }
+        totals
+    }
+}
+
 /// Normalizes one Runtime usage report into the Loop contract.
 ///
 /// Codex reports input with cache reads already included. Claude and Pi report

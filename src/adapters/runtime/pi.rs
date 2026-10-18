@@ -167,6 +167,7 @@ struct SessionBuilder {
     /// The model those settings named, waiting for the same Loop.
     pending_model: Option<String>,
     pending_effort: Option<String>,
+    usage: projection::UsageLedger,
 }
 
 impl SessionBuilder {
@@ -186,6 +187,7 @@ impl SessionBuilder {
             active_loop: None,
             pending_model: None,
             pending_effort: None,
+            usage: projection::UsageLedger::default(),
         }
     }
 
@@ -260,6 +262,10 @@ impl SessionBuilder {
 
     fn finish(mut self) -> SessionProjection {
         self.close_loop();
+        let mut usage = self.usage.finish();
+        for turn in &mut self.loops {
+            turn.usage = usage.remove(&turn.start_seq);
+        }
         SessionProjection {
             session_uuid: self.session_uuid,
             identity_confirmed: self.identity_confirmed,
@@ -468,9 +474,13 @@ impl PiProjector {
         // that answered. Per-response metadata is the stronger evidence.
         turn.model = model.or_else(|| turn.model.take());
         turn.effort = effort.or_else(|| turn.effort.take());
-        if let Some(usage) = usage {
-            turn.usage = Some(projection::add_usage(turn.usage.take(), usage));
+        let usage_loop = turn.start_seq;
+        if is_assistant {
+            session
+                .usage
+                .observe(string(value, "id"), usage_loop, usage);
         }
+        let turn = session.loop_mut(seq);
         if is_assistant {
             turn.last_stop_reason = stop_reason;
             turn.last_stop_seq = Some(seq);
