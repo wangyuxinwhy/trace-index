@@ -4,6 +4,12 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-04
+
+### Fixed
+
+- Claude Code fork traces use native `turnPosition` to preserve distinct inherited turns when the Runtime rewrites their `promptId` values to one shared id. Traces without `turnPosition`, queued steering, delayed tool output, and Stop-hook continuation retain their existing routing behavior.
+
 ## [0.3.1] - 2026-10-18
 
 ### Fixed
@@ -73,7 +79,9 @@ Initial public release.
 - Compact machine-readable output, explicit incomplete-result hints, bundled Agent documentation, and an Agent skill.
 - Storage Format 1. Databases created by non-public development builds must be rebuilt.
 
-[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.0...v0.2.1

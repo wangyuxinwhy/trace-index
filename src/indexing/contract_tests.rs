@@ -914,6 +914,80 @@ fn claude_queued_human_prompts_follow_loop_position() {
 }
 
 #[test]
+fn claude_fork_turn_positions_disambiguate_rewritten_prompt_ids() {
+    let traces = tempdir().expect("trace directory");
+    let trace = traces.path().join("claude-fork-rewritten-prompts.jsonl");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"user","sessionId":"fork-session","promptId":"rewritten","turnPosition":{"promptIndex":0,"turnIndex":1},"origin":{"kind":"human"},"message":{"role":"user","content":"first"}}),
+            json!({"type":"assistant","sessionId":"fork-session","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"first answer"}]}}),
+            json!({"type":"user","sessionId":"fork-session","promptId":"rewritten","turnPosition":{"promptIndex":0,"turnIndex":2},"origin":{"kind":"human"},"message":{"role":"user","content":"second"}}),
+            json!({"type":"assistant","sessionId":"fork-session","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"second answer"}]}}),
+            json!({"type":"user","sessionId":"fork-session","promptId":"rewritten","turnPosition":{"promptIndex":0,"turnIndex":3},"origin":{"kind":"human"},"message":{"role":"user","content":"third"}}),
+            json!({"type":"assistant","sessionId":"fork-session","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"third answer"}]}}),
+        ],
+    );
+
+    let (_directory, store) = index_fixture(&trace);
+    let connection = store.connection();
+    assert_eq!(count(connection, "loops"), 3);
+    let loop_shapes = connection
+        .prepare(
+            "SELECT SUM(json_extract(i.semantic, '$.role') = 'human.request'),
+                    SUM(json_extract(i.semantic, '$.role') = 'human.steering'),
+                    SUM(json_extract(i.semantic, '$.role') = 'agent.final_answer')
+               FROM loops l
+               JOIN items i USING (loop_id)
+              GROUP BY l.loop_id
+              ORDER BY l.session_position",
+        )
+        .expect("prepare fork Loop shapes")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .expect("query fork Loop shapes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect fork Loop shapes");
+    assert_eq!(loop_shapes, [(1, 0, 1), (1, 0, 1), (1, 0, 1)]);
+}
+
+#[test]
+fn claude_repeated_prompt_without_turn_position_keeps_legacy_routing() {
+    let traces = tempdir().expect("trace directory");
+    let trace = traces.path().join("claude-legacy-repeated-prompt.jsonl");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"user","sessionId":"legacy-session","promptId":"same","origin":{"kind":"human"},"message":{"role":"user","content":"first"}}),
+            json!({"type":"assistant","sessionId":"legacy-session","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}]}}),
+            json!({"type":"user","sessionId":"legacy-session","promptId":"same","origin":{"kind":"human"},"message":{"role":"user","content":"late record"}}),
+        ],
+    );
+
+    let (_directory, store) = index_fixture(&trace);
+    let connection = store.connection();
+    assert_eq!(count(connection, "loops"), 1);
+    let roles = connection
+        .prepare(
+            "SELECT json_extract(semantic, '$.role')
+               FROM items
+              WHERE json_extract(semantic, '$.role') LIKE 'human.%'
+              ORDER BY loop_position",
+        )
+        .expect("prepare legacy human roles")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query legacy human roles")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect legacy human roles");
+    assert_eq!(roles, ["human.request", "human.steering"]);
+}
+
+#[test]
 fn claude_delayed_tool_output_after_turn_duration_opens_a_loop() {
     let traces = tempdir().expect("trace directory");
     let trace = traces.path().join("claude-delayed-output.jsonl");

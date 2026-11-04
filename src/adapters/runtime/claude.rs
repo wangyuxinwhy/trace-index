@@ -124,6 +124,12 @@ struct LoopBuilder {
     answered: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TurnPosition {
+    prompt_index: u64,
+    turn_index: u64,
+}
+
 impl LoopBuilder {
     fn new(start_seq: u64, prompt_id: Option<String>) -> Self {
         Self {
@@ -215,6 +221,11 @@ struct SessionBuilder {
     /// Index into `loops` that new items are appended to.
     current: Option<usize>,
     by_prompt: HashMap<String, usize>,
+    /// Claude fork sources can rewrite several inherited prompts to one
+    /// `promptId` while preserving their distinct native turn positions.
+    /// Exact positions disambiguate those ids; traces without this newer
+    /// field retain the prompt-only fallback.
+    by_turn_position: HashMap<TurnPosition, usize>,
     usage: projection::UsageLedger,
     /// Tool calls whose output may identify later Runtime-generated records.
     /// Claude repeats the call id in `sourceToolUseID`, which lets injected
@@ -254,6 +265,7 @@ impl SessionBuilder {
             items: Vec::new(),
             current: None,
             by_prompt: HashMap::new(),
+            by_turn_position: HashMap::new(),
             usage: projection::UsageLedger::default(),
             skill_call_ids: HashSet::new(),
             async_tasks: HashMap::new(),
@@ -264,15 +276,23 @@ impl SessionBuilder {
     fn loop_mut(&mut self, seq: u64) -> &mut LoopBuilder {
         let index = match self.current {
             Some(index) => index,
-            None => self.push_loop(seq, None),
+            None => self.push_loop(seq, None, None),
         };
         &mut self.loops[index]
     }
 
-    fn push_loop(&mut self, seq: u64, prompt_id: Option<String>) -> usize {
+    fn push_loop(
+        &mut self,
+        seq: u64,
+        prompt_id: Option<String>,
+        turn_position: Option<TurnPosition>,
+    ) -> usize {
         let index = self.loops.len();
         if let Some(prompt_id) = prompt_id.clone() {
             self.by_prompt.insert(prompt_id, index);
+        }
+        if let Some(turn_position) = turn_position {
+            self.by_turn_position.insert(turn_position, index);
         }
         self.loops.push(LoopBuilder::new(seq, prompt_id));
         self.switch_to(index);
@@ -511,7 +531,7 @@ impl ClaudeProjector {
             self.open_loop_after_end(seq);
         } else {
             let prompt_id = string(value, "promptId").map(str::to_owned);
-            self.open_turn_for_prompt(seq, prompt_id);
+            self.open_turn_for_prompt(seq, prompt_id, turn_position(value));
         }
         if !text.is_empty() || has_images {
             let (role, why) = authorship.classify(&text);
@@ -1002,18 +1022,45 @@ impl ClaudeProjector {
 
     /// Starts a new turn when the prompt changes. A tool result carries the
     /// prompt id of the request it serves, so it never opens one.
-    fn open_turn_for_prompt(&mut self, seq: u64, prompt_id: Option<String>) {
+    fn open_turn_for_prompt(
+        &mut self,
+        seq: u64,
+        prompt_id: Option<String>,
+        turn_position: Option<TurnPosition>,
+    ) {
         let Some(prompt_id) = prompt_id else {
             return;
         };
         let session = self.session_mut(seq);
+        // An exact native position is stronger than prompt identity. This
+        // also routes a late record back to its original Loop after another
+        // prompt has intervened.
+        if let Some(&index) = turn_position
+            .as_ref()
+            .and_then(|position| session.by_turn_position.get(position))
+        {
+            session.switch_to(index);
+            return;
+        }
         // A prompt id already seen names a turn that is still being written to:
         // when a prompt is queued while tools are running, the results of the
         // earlier prompt keep arriving afterwards and carry its id again.
         // Reading each reappearance as a boundary would cut one turn into
         // several and orphan the tool outputs that land in the pieces.
         if let Some(&index) = session.by_prompt.get(&prompt_id) {
-            session.switch_to(index);
+            if turn_position.is_none()
+                || (!session.loops[index].ended && !session.loops[index].aborted)
+            {
+                if let Some(turn_position) = turn_position {
+                    session.by_turn_position.insert(turn_position, index);
+                }
+                session.switch_to(index);
+                return;
+            }
+            // A closed Loop plus a previously unseen native position is a
+            // distinct turn. Claude fork sources exhibit exactly this shape
+            // after rewriting inherited prompt ids.
+            session.push_loop(seq, Some(prompt_id), turn_position);
             return;
         }
         match session.current {
@@ -1028,6 +1075,9 @@ impl ClaudeProjector {
             {
                 session.loops[index].prompt_id = Some(prompt_id.clone());
                 session.by_prompt.insert(prompt_id, index);
+                if let Some(turn_position) = turn_position {
+                    session.by_turn_position.insert(turn_position, index);
+                }
             }
             // A new prompt delivered while the outer Loop is still running is
             // steering. `promptId` identifies a submission, not the outer
@@ -1035,9 +1085,12 @@ impl ClaudeProjector {
             // second one.
             Some(index) if !session.loops[index].ended && !session.loops[index].aborted => {
                 session.by_prompt.insert(prompt_id, index);
+                if let Some(turn_position) = turn_position {
+                    session.by_turn_position.insert(turn_position, index);
+                }
             }
             _ => {
-                session.push_loop(seq, Some(prompt_id));
+                session.push_loop(seq, Some(prompt_id), turn_position);
             }
         }
     }
@@ -1050,7 +1103,7 @@ impl ClaudeProjector {
             .current
             .is_some_and(|index| session.loops[index].ended)
         {
-            session.push_loop(seq, None);
+            session.push_loop(seq, None, None);
         }
     }
 
@@ -1117,7 +1170,7 @@ impl ClaudeProjector {
         }
         let loop_index = match session.current {
             Some(index) => index,
-            None => session.push_loop(seq, None),
+            None => session.push_loop(seq, None, None),
         };
         let item_index = {
             let turn = &mut session.loops[loop_index];
@@ -1662,6 +1715,14 @@ fn joined_nonempty_strings(value: Option<&Value>, separator: &str) -> Option<Str
 /// column crosses compaction boundaries unaided.
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+fn turn_position(value: &Value) -> Option<TurnPosition> {
+    let position = value.get("turnPosition")?;
+    Some(TurnPosition {
+        prompt_index: position.get("promptIndex")?.as_u64()?,
+        turn_index: position.get("turnIndex")?.as_u64()?,
+    })
 }
 
 fn parse_timestamp_ms(text: &str) -> Option<i64> {
