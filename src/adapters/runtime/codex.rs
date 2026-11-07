@@ -1755,6 +1755,9 @@ fn upsert_command_execution(
 
 fn command_execution_facts(item: &Value) -> ToolOutputFacts {
     let exit_code = item.get("exit_code").and_then(Value::as_i64);
+    let persistence_truncated = string_at(item, "aggregated_output").is_some_and(|output| {
+        output.contains("\n... command output truncated for persistence ...\n")
+    });
     ToolOutputFacts {
         exit_code,
         nonzero_exit: exit_code
@@ -1765,6 +1768,7 @@ fn command_execution_facts(item: &Value) -> ToolOutputFacts {
                 _ => None,
             }),
         duration_ms: structured_duration_ms(item.get("duration")),
+        truncated: persistence_truncated.then_some(true),
         ..ToolOutputFacts::default()
     }
 }

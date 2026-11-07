@@ -393,6 +393,31 @@ fn codex_native_executions_publish_shell_and_result_without_guessing_script_call
 }
 
 #[test]
+fn codex_native_execution_reports_persistence_truncation() {
+    let traces = tempdir().expect("traces");
+    let trace = traces.path().join("codex-persistence-truncation.jsonl");
+    let mut completion =
+        command_completion("unified_exec_startup", &["/bin/zsh", "-lc", "seq 1 20000"]);
+    completion["payload"]["item"]["aggregated_output"] =
+        json!("head\n\n... command output truncated for persistence ...\n\ntail");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"session_meta","payload":{"id":"codex-persistence-truncation"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"one"}}),
+            json!({"type":"turn_context","payload":{"turn_id":"one","model":"model"}}),
+            completion,
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let output = semantics(store.connection())
+        .into_iter()
+        .find(|semantic| semantic["role"] == "tool.output")
+        .expect("output");
+    assert_eq!(output["value"]["runtime_truncated"], true);
+}
+
+#[test]
 fn codex_scripts_without_execution_evidence_are_not_shell_calls() {
     let traces = tempdir().expect("traces");
     let trace = traces.path().join("codex-script.jsonl");

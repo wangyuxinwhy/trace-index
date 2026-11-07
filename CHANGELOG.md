@@ -4,6 +4,12 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-07
+
+### Fixed
+
+- Codex native command outputs now publish `runtime_truncated: true` when the Runtime's durable trace contains its fixed command-output persistence truncation marker. This preserves the retained head and tail while making the omitted middle explicit.
+
 ## [0.3.2] - 2026-11-04
 
 ### Fixed
@@ -79,7 +85,8 @@ Initial public release.
 - Compact machine-readable output, explicit incomplete-result hints, bundled Agent documentation, and an Agent skill.
 - Storage Format 1. Databases created by non-public development builds must be rebuilt.
 
-[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/wangyuxinwhy/trace-index/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wangyuxinwhy/trace-index/compare/v0.2.2...v0.3.0
