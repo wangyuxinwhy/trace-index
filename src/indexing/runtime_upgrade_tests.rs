@@ -779,6 +779,43 @@ fn claude_usage_replaces_response_snapshots_across_blocks_and_late_replay() {
 }
 
 #[test]
+fn claude_virtual_tool_observations_keep_the_outer_loop_and_output() {
+    let traces = tempdir().unwrap();
+    let trace = traces.path().join("virtual-tools.jsonl");
+    write_jsonl(
+        &trace,
+        &[
+            json!({"type":"user","sessionId":"virtual-tools","promptId":"request","message":{"content":"run a command"}}),
+            json!({"type":"assistant","sessionId":"virtual-tools","message":{"id":"model-call","model":"model","stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":3},"content":[{"type":"tool_use","id":"script","name":"REPL","input":{"code":"await command()"}}]}}),
+            json!({"type":"user","sessionId":"virtual-tools","message":{"content":[{"type":"tool_result","tool_use_id":"script","content":"script result"}]}}),
+            json!({"type":"assistant","sessionId":"virtual-tools","isVirtual":true,"message":{"id":"observation","model":"<synthetic>","stop_reason":"stop_sequence","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"tool_use","id":"inner","name":"Bash","input":{"command":"printf hello"}}]}}),
+            json!({"type":"user","sessionId":"virtual-tools","isVirtual":true,"turnCompanion":true,"toolUseResult":{"stdout":"hello","stderr":"warning"},"message":{"content":[{"type":"tool_result","tool_use_id":"inner","content":"","is_error":false}]}}),
+            json!({"type":"assistant","sessionId":"virtual-tools","message":{"id":"answer","model":"model","stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":2},"content":[{"type":"text","text":"done"}]}}),
+        ],
+    );
+    let (_directory, store) = index_fixture(&trace);
+    let connection = store.connection();
+    assert_eq!(count(connection, "records"), 6);
+    assert_eq!(count(connection, "loops"), 1);
+    let (end_seq, usage): (i64, String) = connection.query_row(
+        "SELECT r.source_position, l.usage FROM loops l JOIN records r ON r.record_id=json_extract(l.end,'$.record_id')",
+        [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(end_seq, 5);
+    assert_eq!(
+        serde_json::from_str::<Value>(&usage).unwrap(),
+        json!({"input":22,"output":5})
+    );
+    let text: String = connection.query_row(
+        "SELECT b.text FROM items i JOIN blobs b ON b.blob_id=json_extract(i.semantic,'$.value.text.blob_id') WHERE json_extract(i.semantic,'$.role')='tool.output' ORDER BY i.item_id DESC LIMIT 1",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(text, "hello\nwarning");
+    let linked: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM items i JOIN items call ON call.item_id=json_extract(i.semantic,'$.value.call_item_id') WHERE json_extract(i.semantic,'$.role')='tool.output' AND i.loop_id=call.loop_id",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(linked, 2);
+}
+
+#[test]
 fn pi_usage_counts_a_persisted_message_once_and_keeps_distinct_equal_calls() {
     let traces = tempdir().expect("traces");
     let trace = traces.path().join("pi-usage.jsonl");

@@ -4,6 +4,15 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-16
+
+### Fixed
+
+- Claude Code synthetic tool observations no longer close the surrounding Loop. Code Mode's internal tool calls and results remain with the request and final answer, preserving combined model usage.
+- Empty virtual companion tool results preserve their structured stdout and stderr when one result block owns that output. Explicit message content keeps precedence.
+
+Existing indexes require `trace-index index sync --rebuild` for affected Claude Code Sources. Storage Format 2 is unchanged.
+
 ## [0.3.3] - 2026-11-07
 
 ### Fixed

@@ -648,10 +648,18 @@ impl ClaudeProjector {
         // The model itself declares the turn finished; the last text block of
         // that record is the answer.
         let stop_reason = string(message, "stop_reason");
-        let ends_turn = stop_reason == Some("end_turn");
-        let signals_end = matches!(stop_reason, Some("end_turn" | "stop_sequence"));
-
         let blocks = content_blocks(value);
+        // Virtual tool observations have synthetic stop reasons, not a model's
+        // decision to end the surrounding execution.
+        let model_response = !(string(message, "model") == Some("<synthetic>")
+            && value.get("isVirtual").and_then(Value::as_bool) == Some(true)
+            && blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
+        let ends_turn = model_response && stop_reason == Some("end_turn");
+        let signals_end =
+            model_response && matches!(stop_reason, Some("end_turn" | "stop_sequence"));
+
         // The answer is the closing text of the record that ended the turn.
         // A withheld-text block cannot be it.
         let last_text = blocks
@@ -1497,13 +1505,32 @@ fn content_blocks(value: &Value) -> Vec<ContentBlock> {
             }
             Some("tool_result") => Some(ContentBlock::ToolResult {
                 call_id: string(block, "tool_use_id").unwrap_or_default().to_owned(),
-                text: block_result_text(block),
+                text: block_result_text(block).or_else(|| virtual_tool_output_text(value, blocks)),
                 is_error: block.get("is_error").and_then(Value::as_bool),
             }),
             Some(_) => Some(ContentBlock::Other),
             None => None,
         })
         .collect()
+}
+
+/// Code Mode's virtual companion result can leave message content empty while
+/// retaining the executed tool's output in the enclosing result object. Only a
+/// single result block can unambiguously own those fields.
+fn virtual_tool_output_text(value: &Value, blocks: &[Value]) -> Option<String> {
+    if value.get("isVirtual").and_then(Value::as_bool) != Some(true)
+        || value.get("turnCompanion").and_then(Value::as_bool) != Some(true)
+        || blocks.len() != 1
+    {
+        return None;
+    }
+    let result = value.get("toolUseResult")?;
+    let text = ["stdout", "stderr"]
+        .iter()
+        .filter_map(|key| string(result, key).filter(|text| !text.is_empty()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 /// A tool result's payload is either a string or the same block list shape.
@@ -1729,4 +1756,33 @@ fn parse_timestamp_ms(text: &str) -> Option<i64> {
     super::codex::parse_timestamp_ms_public(text)
 }
 
-// tested at the public relation boundary in `indexer`.
+// Lifecycle behavior is tested at the public relation boundary in `indexer`.
+#[cfg(test)]
+mod virtual_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn structured_output_fallback_requires_an_unambiguous_virtual_companion() {
+        let block = json!({"type":"tool_result","tool_use_id":"call","content":"explicit"});
+        let mut value = json!({"isVirtual":true,"turnCompanion":true,"toolUseResult":{"stdout":"fallback"},"message":{"content":[block.clone()]}});
+        assert!(
+            matches!(&content_blocks(&value)[0], ContentBlock::ToolResult {text:Some(text), ..} if text == "explicit")
+        );
+        value["message"]["content"][0]["content"] = json!("");
+        assert!(
+            matches!(&content_blocks(&value)[0], ContentBlock::ToolResult {text:Some(text), ..} if text == "fallback")
+        );
+        value["isVirtual"] = json!(false);
+        assert!(matches!(
+            &content_blocks(&value)[0],
+            ContentBlock::ToolResult { text: None, .. }
+        ));
+        value["isVirtual"] = json!(true);
+        value["message"]["content"] = json!([value["message"]["content"][0].clone(), block]);
+        assert!(matches!(
+            &content_blocks(&value)[0],
+            ContentBlock::ToolResult { text: None, .. }
+        ));
+    }
+}
