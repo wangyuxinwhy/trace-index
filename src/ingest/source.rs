@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -17,6 +17,14 @@ pub(crate) fn discover_jsonl_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = BTreeSet::new();
     for path in paths {
         collect_jsonl_files(path, &mut files)?;
+    }
+    let shadowed: Vec<_> = files
+        .iter()
+        .filter(|path| is_compressed(path) && files.contains(&path.with_extension("")))
+        .cloned()
+        .collect();
+    for path in shadowed {
+        files.remove(&path);
     }
     prefer_antigravity_transcripts(&mut files);
     Ok(files.into_iter().collect())
@@ -51,10 +59,7 @@ fn collect_jsonl_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
         return Ok(());
     }
     if metadata.is_file() {
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-        {
+        if is_trace_file(path) {
             files.insert(path.canonicalize()?);
         }
         return Ok(());
@@ -83,6 +88,66 @@ fn collect_jsonl_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
         collect_jsonl_files(&entry.path(), files)?;
     }
     Ok(())
+}
+
+pub(crate) fn is_trace_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+        || is_compressed(path)
+}
+
+pub(crate) fn is_compressed(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "zst")
+        && path
+            .with_extension("")
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+}
+
+pub(crate) fn alternate_encoding(path: &Path) -> PathBuf {
+    if is_compressed(path) {
+        path.with_extension("")
+    } else {
+        path.with_extension("jsonl.zst")
+    }
+}
+
+/// Replay needs a seekable snapshot to find the last complete Record and
+/// compare a published prefix. Decode into an anonymous temporary file so
+/// disk holds the snapshot even for an archive larger than memory.
+pub(crate) fn open_for_indexing(path: &Path) -> Result<File> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    if !is_compressed(path) {
+        return Ok(file);
+    }
+    let mut decoded = tempfile::tempfile().context("failed to create a decompression snapshot")?;
+    let mut archive = zstd::stream::read::Decoder::new(file)?;
+    std::io::copy(&mut archive, &mut decoded)
+        .with_context(|| format!("failed to decompress {}", path.display()))?;
+    decoded.rewind()?;
+    Ok(decoded)
+}
+
+/// Opens a reader at a decoded byte offset. Plain Sources seek directly.
+/// Compressed Sources only need to decode as far as the requested Record.
+pub(crate) fn read_at(file: File, path: &Path, offset: u64) -> Result<Option<Box<dyn Read>>> {
+    if is_compressed(path) {
+        let decoded = zstd::stream::read::Decoder::new(file)?;
+        let mut archive = BufReader::with_capacity(READ_BUFFER_BYTES, decoded);
+        if std::io::copy(&mut archive.by_ref().take(offset), &mut std::io::sink())? != offset
+            || archive.fill_buf()?.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(archive)))
+    } else {
+        let mut file = file;
+        if offset >= file.metadata()?.len() {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Some(Box::new(file)))
+    }
 }
 
 #[derive(Debug)]
@@ -165,37 +230,14 @@ pub(crate) fn prefix_hasher(length: u64) -> blake3::Hasher {
     hasher
 }
 
-pub(crate) fn fingerprint_prefix_into(
-    file: &mut File,
-    length: u64,
-    destination: &mut blake3::Hasher,
-) -> Result<String> {
-    let mut validation = prefix_hasher(length);
+pub(crate) fn fingerprint_prefix(file: &mut File, length: u64) -> Result<String> {
+    let mut hash = prefix_hasher(length);
     file.seek(SeekFrom::Start(0))?;
-    hash_exact(file, length, &mut validation, Some(destination))?;
-    Ok(validation.finalize().to_hex().to_string())
-}
-
-fn hash_exact(
-    file: &mut File,
-    mut remaining: u64,
-    hasher: &mut blake3::Hasher,
-    mut destination: Option<&mut blake3::Hasher>,
-) -> Result<()> {
-    let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
-    while remaining > 0 {
-        let requested = usize::try_from(remaining.min(buffer.len() as u64))?;
-        let count = file.read(&mut buffer[..requested])?;
-        if count == 0 {
-            bail!("file ended while fingerprinting an indexed prefix");
-        }
-        hasher.update(&buffer[..count]);
-        if let Some(destination) = destination.as_deref_mut() {
-            destination.update(&buffer[..count]);
-        }
-        remaining -= u64::try_from(count)?;
+    let mut prefix = BufReader::with_capacity(READ_BUFFER_BYTES, file.take(length));
+    if std::io::copy(&mut prefix, &mut hash)? != length {
+        bail!("file ended while fingerprinting an indexed prefix");
     }
-    Ok(())
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 pub(crate) fn complete_prefix_length(file: &mut File, file_size: u64) -> Result<u64> {

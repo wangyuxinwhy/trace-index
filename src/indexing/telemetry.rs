@@ -365,7 +365,7 @@ impl ProgressObserver for StderrProgress {
             ProgressMode::Human => {
                 let _ = write!(
                     stderr,
-                    "\rphase={:?} files={}/{} bytes={}/{} records={} items={}",
+                    "\rphase={:?} files={}/{} processed_bytes={} source_bytes={} records={} items={}",
                     update.phase,
                     update.completed_files,
                     update.total_files,

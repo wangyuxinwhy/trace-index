@@ -15,7 +15,7 @@ Process and stream behavior:
 - A command-shape or Clap argument error exits 2 and writes usage to stderr.
 - A runtime error normally exits 1, writes a diagnostic to stderr, and leaves stdout empty.
 - `config check` returns its complete read-only findings on stdout. Error issues make `valid=false` and exit 1; Warning-only reports exit 0 even when `configured_sync_ready=false` because positional `index sync PATHS...` remains valid.
-- `index sync` returns the complete synchronization report on stdout and exits 1 when some recognized Sources fail, so callers can inspect both the successful and failed Source results.
+- `index sync` returns the complete synchronization report on stdout and exits 1 when some Sources fail to read, decode, or index, so callers can inspect both the successful and failed Source results.
 
 Only `index sync` emits progress. Progress is written to stderr and never mixed into the final stdout JSON. `--progress auto|human|ndjson|off` selects the rendering.
 
@@ -36,6 +36,8 @@ Large Record values and inline media appear as structured references. An Asset r
 ## Synchronization reports
 
 `index sync` reports the database-wide `indexing_policy` used to publish facts and physical and domain writes under `metrics.writes`: `records`, `sessions`, `loops`, and `items`. `index status` returns the stored policy when one has been established. A changed Source can cause its domain projection to be replaced in full even when only a small physical suffix was appended, so domain write counts need not match `indexed_records`.
+
+`source_bytes` and per-Source `file_size` count bytes on disk. `processed_bytes`, `fingerprint_bytes`, and per-Source `indexed_bytes` count bytes in the decoded JSONL stream. The decoded counts can exceed the on-disk size of a compressed Source.
 
 `metrics.phases_ms` partitions elapsed time across discovery, preparation, clearing, reading, projection, persistence, fingerprinting, commit, secondary-index work, and an unattributed residual. `metrics.persist_ms` is operational telemetry for current write sites. The names below describe implementation work; they do not add domain objects.
 

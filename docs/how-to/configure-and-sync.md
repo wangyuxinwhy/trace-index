@@ -99,8 +99,8 @@ Use `--include-sources` only when the result must include every discovered Sourc
 
 One Source does not stop the remaining roots from being processed.
 
-- `skipped` means a discovered `.jsonl` is not a supported trace, or its first Record is not complete yet. It contributes to `skipped_files`, and the command may still exit with status 0.
-- `failed` means a supported trace could not be read or projected. It contributes to `failed_files`, includes an error, and makes the command exit non-zero after the other Sources have been processed.
+- `skipped` covers files without a complete, recognizable trace header and Sources excluded by Runtime evidence or sibling selection. The per-Source result explains the reason. Skips contribute to `skipped_files`, and the command may still exit with status 0.
+- `failed` means a Source could not be read, decoded, or projected. Failures contribute to `failed_files`, include an error, and make the command exit non-zero after the other Sources have been processed.
 
 Each Source is committed in one transaction. SQLite WAL mode lets read commands observe a consistent snapshot while synchronization continues; a reader never sees half of one Source update.
 

@@ -113,7 +113,7 @@ public_view! {
         source_id: i64 = "r.source_id",
         /// Zero-based physical position inside the Source.
         source_position: i64 = "r.seq",
-        /// JSON half-open byte range `{start, end}` in the Source.
+        /// JSON half-open byte range `{start, end}` in the decoded Source stream.
         content_range: String = "json_object('start', r.byte_offset, 'end', r.byte_offset + r.byte_length)",
         /// BLAKE3 fingerprint of the original content bytes.
         fingerprint: String = "r.raw_hash",

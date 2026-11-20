@@ -35,7 +35,7 @@ Fields:
 - `metadata_database`: optional path to independent persistent caller-owned Session metadata. It is not derived from `database` or `--db`.
 - `indexing.max_indexed_record_bytes`: maximum bytes retained and parsed for one JSONL Record. The built-in value is `16777216`.
 - `indexing.max_published_text_bytes`: maximum UTF-8 bytes published for one Semantic text value. The built-in value is `65536`.
-- `roots`: zero or more files or directories recursively searched for `.jsonl` Sources.
+- `roots`: zero or more Source files or directories recursively searched for `.jsonl` and Codex `.jsonl.zst` Sources.
 - `roots[].label`: optional diagnostic label. It does not select the Runtime Adapter.
 - `roots[].path`: Source file or directory path.
 

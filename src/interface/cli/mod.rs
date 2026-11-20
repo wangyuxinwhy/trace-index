@@ -445,7 +445,7 @@ enum IndexCommand {
 #[derive(Debug, Args)]
 #[command(after_help = INDEX_SYNC_AFTER_HELP)]
 struct IndexSyncArgs {
-    /// Trace JSONL files or directories to index recursively.
+    /// Trace JSONL files, compressed Codex .jsonl.zst files, or directories to index recursively.
     paths: Vec<PathBuf>,
 
     /// Rebuild matching sources even when their indexed prefix is unchanged.

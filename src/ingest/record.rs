@@ -1,7 +1,7 @@
 //! Explicit raw Record inspection and Asset extraction commands.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +9,7 @@ use base64::Engine as _;
 use rusqlite::params;
 use serde_json::{Value, json};
 
+use super::source::read_at;
 use crate::interface::output::{
     AssetDescriptor, AssetExtractReport, Record, RecordExportReport, RecordParse, RecordResponse,
     RecordSource, RecordVerification,
@@ -34,7 +35,9 @@ pub fn inspect_record(
     max_output_bytes: usize,
 ) -> Result<RecordResponse> {
     let record = load_record(store, record_id)?;
-    let verification = verify_loaded_record(&record)?;
+    let mut bytes = Vec::new();
+    let capture = (record.byte_length <= max_record_bytes).then_some(&mut bytes);
+    let verification = verify_loaded_record(&record, capture)?;
     let verified = verification.status == "verified";
     let mut externalized_values = 0;
     let mut representation = if !verified {
@@ -56,26 +59,23 @@ pub fn inspect_record(
                 "max_record_bytes": max_record_bytes
             })),
         )
+    } else if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        externalize_value(
+            &value,
+            record.id,
+            "",
+            max_value_bytes,
+            &mut externalized_values,
+        )
     } else {
-        let bytes = read_record_bytes(&record)?;
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            externalize_value(
-                &value,
-                record.id,
-                "",
-                max_value_bytes,
-                &mut externalized_values,
-            )
-        } else {
-            let text = String::from_utf8_lossy(&bytes);
-            externalize_string(
-                &text,
-                record.id,
-                "",
-                max_value_bytes,
-                &mut externalized_values,
-            )
-        }
+        let text = String::from_utf8_lossy(&bytes);
+        externalize_string(
+            &text,
+            record.id,
+            "",
+            max_value_bytes,
+            &mut externalized_values,
+        )
     };
 
     let mut representation_bytes = serde_json::to_vec(&representation)?.len();
@@ -111,7 +111,7 @@ pub fn inspect_record(
 /// or read.
 pub fn verify_record(store: &Store, record_id: i64) -> Result<RecordVerification> {
     let record = load_record(store, record_id)?;
-    verify_loaded_record(&record)
+    verify_loaded_record(&record, None)
 }
 
 /// Writes one verified, byte-exact Record to a local file.
@@ -233,28 +233,40 @@ fn sql_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     })
 }
 
-fn verify_loaded_record(record: &Record) -> Result<RecordVerification> {
-    let mut file = match File::open(&record.source.uri) {
+fn verify_loaded_record(
+    record: &Record,
+    capture: Option<&mut Vec<u8>>,
+) -> Result<RecordVerification> {
+    let file = match File::open(&record.source.uri) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RecordVerification {
-                record_id: record.id,
-                status: "source_missing".to_owned(),
-                expected_hash: record.raw_hash.clone(),
-                actual_hash: None,
-                expected_bytes: record.byte_length,
-                actual_bytes: 0,
-            });
+            return Ok(unavailable_record(record, "source_missing"));
         }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to open {}", record.source.uri));
         }
     };
-    file.seek(SeekFrom::Start(record.byte_offset))?;
-    let mut limited = file.take(record.byte_length);
-    let mut hasher = blake3::Hasher::new();
-    let actual_bytes = std::io::copy(&mut limited, &mut hasher)?;
-    let actual_hash = hasher.finalize().to_hex().to_string();
+    let context = || {
+        format!(
+            "failed to read Record {} from {}",
+            record.id, record.source.uri
+        )
+    };
+    let Some(reader) =
+        read_at(file, Path::new(&record.source.uri), record.byte_offset).with_context(context)?
+    else {
+        return Ok(unavailable_record(record, "source_short"));
+    };
+    let mut limited = reader.take(record.byte_length);
+    let (actual_bytes, hash) = if let Some(capture) = capture {
+        let count = std::io::copy(&mut limited, capture).with_context(context)?;
+        (count, blake3::hash(capture))
+    } else {
+        let mut hasher = blake3::Hasher::new();
+        let count = std::io::copy(&mut limited, &mut hasher).with_context(context)?;
+        (count, hasher.finalize())
+    };
+    let actual_hash = hash.to_hex().to_string();
     let status = if actual_bytes != record.byte_length {
         "source_short"
     } else if actual_hash == record.raw_hash {
@@ -272,12 +284,33 @@ fn verify_loaded_record(record: &Record) -> Result<RecordVerification> {
     })
 }
 
+fn unavailable_record(record: &Record, status: &str) -> RecordVerification {
+    RecordVerification {
+        record_id: record.id,
+        status: status.to_owned(),
+        expected_hash: record.raw_hash.clone(),
+        actual_hash: None,
+        expected_bytes: record.byte_length,
+        actual_bytes: 0,
+    }
+}
+
 fn read_record_bytes(record: &Record) -> Result<Vec<u8>> {
-    let mut file = File::open(&record.source.uri)
+    let file = File::open(&record.source.uri)
         .with_context(|| format!("failed to open {}", record.source.uri))?;
-    file.seek(SeekFrom::Start(record.byte_offset))?;
     let mut bytes = vec![0_u8; usize::try_from(record.byte_length)?];
-    file.read_exact(&mut bytes)?;
+    let context = || {
+        format!(
+            "failed to read Record {} from {}",
+            record.id, record.source.uri
+        )
+    };
+    read_at(file, Path::new(&record.source.uri), record.byte_offset)
+        .with_context(context)?
+        .context("Source ended before the indexed Record")
+        .with_context(context)?
+        .read_exact(&mut bytes)
+        .with_context(context)?;
     Ok(bytes)
 }
 
