@@ -13,14 +13,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::telemetry::{IndexPhase, IndexTelemetry, PersistTable, ProgressObserver};
 #[cfg(test)]
 use super::telemetry::{NoopProgress, database_storage_bytes};
-use crate::adapters::adapter::{AdapterKind, Projector, detect, record_facts};
+use crate::adapters::adapter::{AdapterKind, Projector, detect_at, record_facts};
 use crate::adapters::projection::{RecordFacts, SessionProjection};
+use crate::adapters::runtime::antigravity;
 use crate::ingest::source::{
     READ_BUFFER_BYTES, RecordRead, complete_prefix_length, discover_jsonl_files,
     fingerprint_prefix_into, modified_ns, prefix_hasher, read_bounded_record,
@@ -281,6 +282,7 @@ fn index_source(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start index transaction")?;
 
+    let replaced_transcript = antigravity_replacement(&transaction, adapter, &canonical)?;
     let source_id = ensure_source_row(&transaction, state.as_ref(), adapter, &path_string)?;
 
     // A changed Source republishes its complete domain projection. Physical
@@ -315,7 +317,7 @@ fn index_source(
     let mut hasher = prefix_hasher(indexed_limit);
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file.take(indexed_limit));
 
-    let mut projector = Projector::new(adapter, options.max_text_bytes);
+    let mut projector = Projector::new(adapter, options.max_text_bytes, &canonical)?;
     let mut projected_sessions = Vec::new();
     let mut counts = ScanCounts::default();
     let mut byte_offset = 0_u64;
@@ -393,6 +395,12 @@ fn index_source(
         ))));
     }
     syntax::parse_declared_commands(&mut session, options.max_text_bytes);
+    if let Some(previous) = replaced_transcript {
+        // Replace the old projection only after establishing the new Source.
+        // Failure rolls both operations back together.
+        clear_projection(&transaction, previous)?;
+        transaction.execute("DELETE FROM trace_sources WHERE id = ?1", [previous])?;
+    }
     counts.items += write_projected_session(
         &transaction,
         source_id,
@@ -444,6 +452,42 @@ fn index_source(
         oversized_records: counts.oversized,
         incomplete_tail,
     })
+}
+
+fn antigravity_replacement(
+    transaction: &Transaction<'_>,
+    adapter: AdapterKind,
+    path: &Path,
+) -> Result<Option<i64>> {
+    if adapter != AdapterKind::Antigravity {
+        return Ok(None);
+    }
+    let (uuid, full) = antigravity::transcript(path).context("invalid Antigravity locator")?;
+    let previous = transaction
+        .query_row(
+            "SELECT src.id, src.path
+               FROM domain_sessions s
+               JOIN session_sources ss ON ss.session_id = s.id
+               JOIN trace_sources src ON src.id = ss.source_id
+              WHERE s.runtime = ?1 AND s.native_id = ?2",
+            params![adapter.name(), uuid],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((source_id, previous)) = previous else {
+        return Ok(None);
+    };
+    let previous = Path::new(&previous);
+    if previous == path {
+        return Ok(None);
+    }
+    if full && antigravity::transcript(previous).is_some_and(|(_, full)| !full) {
+        return Ok(Some(source_id));
+    }
+    Err(anyhow::Error::new(UnrecognizedSource(format!(
+        "Antigravity conversation {uuid} is already indexed from {}",
+        previous.display()
+    ))))
 }
 
 fn write_projected_session(
@@ -608,7 +652,7 @@ fn detect_adapter(path: &Path, max_record_bytes: usize) -> Result<AdapterKind> {
     match read_bounded_record(&mut reader, max_record_bytes)? {
         RecordRead::Complete(record) => {
             let bytes = record.bytes.as_deref().unwrap_or_default();
-            detect(bytes).map_err(|error| {
+            detect_at(bytes, Some(path)).map_err(|error| {
                 anyhow::Error::new(UnrecognizedSource(format!("{}: {error:#}", path.display())))
             })
         }

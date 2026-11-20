@@ -1,11 +1,11 @@
 ---
 title: Supported Trace Formats
-description: Recognized Codex, Pi, and Claude Code JSONL Sources and edge-case behavior.
+description: Recognized Codex, Pi, Claude Code, and Antigravity CLI JSONL Sources and edge-case behavior.
 ---
 
 # Supported Trace Formats
 
-Trace Index recognizes JSONL Sources written by Codex, Pi, and Claude Code. Each Source is detected independently and must contain enough Runtime structure to establish one logical Session identity before domain facts are published.
+Trace Index recognizes JSONL Sources written by Codex, Pi, Claude Code, and Antigravity CLI. A Source must provide enough Runtime evidence to establish one logical Session identity before domain facts are published.
 
 ## Common ingestion behavior
 
@@ -34,6 +34,14 @@ Pi records parent identities and Runtime-specific message types in its entry str
 Claude Code Sources carry a Session identity in their records. A subagent Source names its own agent identity and projects to a separate Session with `delegated_from` pointing to the launching Session. Runtime prompt and completion structures provide Loop boundaries and outcomes when present.
 
 Claude Code Records can form a parent-linked tree when a conversation is rewound. That Runtime topology remains in the Records and Adapter logic; it does not add another cross-Runtime domain entity. Subagent tasks, activity, and reports are published through their Semantic Item shapes and Session references.
+
+## Antigravity CLI
+
+Pass the local `~/.gemini/antigravity-cli/brain` root explicitly, or pass a CLI transcript file with its original `brain/<conversation-uuid>/.system_generated/logs/` layout. The UUID comes from that [producer-defined path](https://antigravity.google/docs/hooks). The Runtime key is `antigravity`. The Adapter accepts the CLI transcript shape observed in version 1.5.13. It reads the consolidated `transcript_full.jsonl` or `transcript.jsonl`; recursive discovery ignores chunk copies in the logs directory. If both variants are supplied, it selects the full transcript. If the selected full transcript could not be indexed and no full transcript has been indexed for that Session, pass the short file on its own until the full file is ready. A full transcript with an indexed complete prefix retains precedence even when its last line is incomplete. A later successful sync of the full transcript replaces an indexed short transcript atomically. Record IDs and locators refer to the selected Source.
+
+Explicit user inputs start heuristic Loop groupings for navigation. Planner text is searchable as heuristic commentary. Loop counts measure those groupings, whose end and outcome stay absent. Model names, reasoning text and tool-call arguments come from planner steps. A declared `run_command` with `CommandLine` supplies the planned Shell syntax and any working directory declared in the call. Execution and its actual working directory require separate evidence. Generic steps and checkpoints remain Records. Session creation time, Session working directory, output-to-call links, exit codes and usage are absent from the projection. Use `items.occurred_at` for event-time filters. A short transcript may already contain producer-truncated text or arguments. Blob byte counts describe the text actually retained in the selected Source.
+
+This input scope covers local CLI transcript files. The desktop and IDE use the same path suffix, so establish that an explicitly supplied or relocated transcript came from the CLI before indexing it. Conversation databases, desktop and IDE stores, and headless stdout event streams are outside the supported input contract.
 
 ## Runtime evolution
 

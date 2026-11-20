@@ -8,7 +8,6 @@ use anyhow::Result;
 use crate::domain::SEMANTIC_ROLES;
 use crate::interface::output::{ObservedRole, StatusReport};
 use crate::storage::db::{Store, display_database_path};
-use crate::storage::schema::STORAGE_FORMAT;
 
 /// Summarizes the current index without scanning trace files.
 ///
@@ -28,7 +27,7 @@ pub fn status(store: &Store, database_path: &Path) -> Result<StatusReport> {
 
     Ok(StatusReport {
         database: display_database_path(database_path),
-        storage_format: STORAGE_FORMAT,
+        storage_format: store.storage_format()?,
         indexing_policy: store.indexing_policy()?,
         sources: usize::try_from(source_count)?,
         source_bytes: u64::try_from(source_bytes)?,

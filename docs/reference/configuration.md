@@ -36,7 +36,7 @@ Fields:
 - `indexing.max_indexed_record_bytes`: maximum bytes retained and parsed for one JSONL Record. The built-in value is `16777216`.
 - `indexing.max_published_text_bytes`: maximum UTF-8 bytes published for one Semantic text value. The built-in value is `65536`.
 - `roots`: zero or more files or directories recursively searched for `.jsonl` Sources.
-- `roots[].label`: optional diagnostic label. It does not select Codex, Pi, or Claude Code.
+- `roots[].label`: optional diagnostic label. It does not select the Runtime Adapter.
 - `roots[].path`: Source file or directory path.
 
 `roots[].name` from configuration files created by Trace Index 0.1.0 remains accepted as an alias for `label`; new files write `label`.

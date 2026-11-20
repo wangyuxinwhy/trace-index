@@ -4,6 +4,13 @@ All notable public changes to Trace Index are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-20
+
+### Added
+
+- Explicit local Antigravity CLI JSONL input, with conversation and Shell call queries and byte-level Record evidence.
+- Storage Format 3 adds the `antigravity` Runtime. Format 2 indexes remain readable. Create a separate index and synchronize your available Sources for new writes. Keep Format 2 indexes that contain history no longer present in supported Source files.
+
 ## [0.3.4] - 2026-11-16
 
 ### Fixed

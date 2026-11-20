@@ -74,7 +74,7 @@ Use `semantic.role`, `semantic.value`, and `semantic.evidence_strength` for inde
 
 ## Restore one Loop
 
-A Loop is one outer execution lifecycle inside a Session. Items structurally assigned to it have a zero-based `loop_position`:
+Items associated with a Loop have a zero-based `loop_position`. Some Runtimes only support heuristic grouping. Check [Supported Traces](../reference/supported-traces.md) before interpreting a Loop as an observed execution boundary.
 
 ```sql
 SELECT loop_position,
@@ -177,7 +177,7 @@ ORDER BY session.session_id, source.source_id;
 
 `working_directory` describes the Runtime context, while each Source `locator` identifies a physical trace input supporting the Session. These are queryable facts, not an automatic relevance decision. Read a small number of Items relevant to the question from each candidate when the answer depends on what work the Session actually performed.
 
-`session_id` is an opaque Trace Index-local key intended for joins. `native_id` is the identity assigned by the Runtime. When the requested deliverable is a list of Codex, Pi, or Claude Code Sessions, report `runtime` and `native_id`; include `session_id` only when it helps continue SQL investigation.
+`session_id` is an opaque Trace Index-local key intended for joins. `native_id` is the identity assigned by the Runtime. When reporting a list of Sessions, include `runtime` and `native_id`. Include `session_id` when it helps continue SQL investigation.
 
 ## Scope by project and time
 
@@ -211,6 +211,8 @@ LIMIT 50;
 ```
 
 Times are epoch milliseconds. Use half-open intervals for complete dates. `sessions.created_at` and `items.occurred_at` describe domain time; Source synchronization metadata does not prove when an interaction happened.
+
+Check [Supported Traces](../reference/supported-traces.md) for Runtime coverage before choosing filters. A Session with an absent `working_directory` cannot be scoped by that column. Event time remains queryable when `items.occurred_at` is present, even if Session creation time is absent.
 
 Every stored time is a UTC instant: the Adapters convert each Runtime timestamp's offset before storing it, and query results return the same milliseconds regardless of the machine that runs the query. A calendar date in a person's time zone is a different boundary from the same date in UTC, so write the boundary with its offset instead of assuming `Z`:
 

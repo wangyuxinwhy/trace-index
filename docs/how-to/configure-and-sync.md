@@ -1,6 +1,6 @@
 ---
 title: Configure and Synchronize Traces
-description: Configure Codex, Pi, and Claude Code roots, synchronize them, and inspect coverage.
+description: Configure Runtime trace roots, synchronize them, and inspect coverage.
 ---
 
 # Configure and Synchronize Traces
@@ -46,7 +46,7 @@ trace-index config check
 
 Relative paths are resolved against the configuration file's directory. `~` expands to the current user's home directory.
 
-The root label is diagnostic only. Trace Index detects the Codex, Pi, or Claude Code Adapter from each Source's contents.
+The root label is diagnostic only. Trace Index detects each Source using Runtime evidence. Antigravity CLI detection also uses its native transcript path.
 
 ## Synchronize configured or one-off paths
 
@@ -61,6 +61,8 @@ To index only particular files or directories, pass them explicitly. Positional 
 ```bash
 trace-index index sync /path/to/one.jsonl /path/to/session-directory
 ```
+
+To opt in to Antigravity CLI history, pass `~/.gemini/antigravity-cli/brain` as a positional root or add it to the configuration. Format 2 is readable but cannot be synchronized by this release. Select a new Format 3 database with `--db` and supply the available roots you want to index. Keep the existing Format 2 database if it contains history whose original Sources are unavailable.
 
 Synchronization is the only operation that updates the index. `schema`, `query`, `record`, and `asset` commands never refresh it implicitly.
 
