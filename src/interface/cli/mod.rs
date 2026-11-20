@@ -90,8 +90,8 @@ Public SQL surface:
 
 Session identity:
   sessions.session_id is a Trace Index-local join key. sessions.native_id is the
-  Runtime-native identity. When a user asks for a Codex, Pi, or Claude Code
-  Session id, report native_id together with runtime; keep session_id for SQL joins.
+  Runtime-native identity. Report native_id together with runtime; keep
+  session_id for SQL joins.
 
 Query correctly:
   1. Start from items and select facts with semantic.role.
@@ -693,7 +693,7 @@ enum SessionCommand {
 
 #[derive(Debug, Args)]
 struct MetadataTarget {
-    /// Runtime owning the native identity: codex, pi or claude
+    /// Runtime owning the native identity: codex, pi, claude or antigravity
     #[arg(long)]
     runtime: String,
     /// Stable Runtime-native Session id; not the index-local integer `session_id`

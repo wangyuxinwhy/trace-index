@@ -327,12 +327,17 @@ impl Store {
         Ok(())
     }
 
-    fn validate_schema(&self) -> Result<()> {
-        let version: u32 = self
-            .connection
+    pub(crate) fn storage_format(&self) -> Result<u32> {
+        self.connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .context("failed to read storage format")?;
-        if version != STORAGE_FORMAT {
+            .context("failed to read storage format")
+    }
+
+    fn validate_schema(&self) -> Result<()> {
+        let version = self.storage_format()?;
+        // Format 3 expands the writable Runtime set. Format 2 still exposes
+        // the same public relations and can be queried in place.
+        if !matches!(version, 2 | STORAGE_FORMAT) {
             bail!(
                 "storage format {version} does not match current format {STORAGE_FORMAT}; \
                 create a new index database and reindex the source JSONL files"

@@ -102,8 +102,8 @@ pub(crate) fn get(path: &Path, runtime: &str, native_id: &str) -> Result<Documen
 
 fn validate_target(runtime: &str, native_id: &str) -> Result<()> {
     ensure!(
-        matches!(runtime, "codex" | "pi" | "claude"),
-        "unknown Runtime {runtime:?}; expected codex, pi or claude"
+        matches!(runtime, "codex" | "pi" | "claude" | "antigravity"),
+        "unknown Runtime {runtime:?}; expected codex, pi, claude or antigravity"
     );
     ensure!(!native_id.is_empty(), "native_id must not be empty");
     Ok(())

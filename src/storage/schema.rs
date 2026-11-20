@@ -1,5 +1,5 @@
 //! Active on-disk schema.
 
-pub(crate) use super::schema_v2::{
+pub(crate) use super::schema_v3::{
     CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, DROP_SECONDARY_INDEXES, STORAGE_FORMAT,
 };

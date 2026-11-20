@@ -33,7 +33,7 @@ One independently queryable fact in the Agent program. An Item belongs to a Sess
 
 ## Loop
 
-One outer Agent execution lifecycle inside a Session. A Loop starts from a structurally recognized beginning. Optional `loops.end` contains the ending Record and, when stated by the Runtime, the outcome; the observed trace can stop before either appears.
+An outer Agent execution lifecycle inside a Session. A Loop starts from the Adapter's recognized beginning, which can be heuristic when the Runtime does not expose a confirmed boundary. Optional `loops.end` contains the ending Record and, when stated by the Runtime, the outcome; the observed trace can stop before either appears.
 
 ## Public Relation
 
@@ -49,7 +49,7 @@ One complete framed record in a Source. For the supported JSONL formats this is 
 
 ## Runtime
 
-An external Agent application and trace protocol. Codex, Pi, and Claude Code are the currently supported Runtimes.
+An external Agent application and trace protocol. See [supported trace formats](./supported-traces.md) for the current Runtime inputs.
 
 ## Semantic
 

@@ -1,6 +1,6 @@
 # Trace Index
 
-Trace Index is a local, bounded-memory query plane for Agent trace files. It indexes Codex, Pi, and Claude Code JSONL traces into a source-traceable, read-only SQL surface while preserving the path back to the original Records.
+Trace Index is a local, bounded-memory query plane for Agent trace files. It indexes Codex, Pi, Claude Code, and Antigravity CLI JSONL traces into a source-traceable, read-only SQL surface while preserving the path back to the original Records.
 
 [Documentation](https://wangyuxinwhy.github.io/trace-index/) · [Start here](https://wangyuxinwhy.github.io/trace-index/start-here) · [Install](https://wangyuxinwhy.github.io/trace-index/how-to/install)
 

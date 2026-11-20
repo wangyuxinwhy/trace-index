@@ -1,9 +1,9 @@
-//! Storage format 2, shaped around the five public domain objects.
+//! Storage format 3, shaped around the five public domain objects.
 //!
 //! The storage schema follows the five public objects. Private tables only
 //! represent nested or sparse attributes of those objects.
 
-pub(crate) const STORAGE_FORMAT: u32 = 2;
+pub(crate) const STORAGE_FORMAT: u32 = 3;
 
 pub(crate) const CREATE_SCHEMA: &str = r"
 PRAGMA foreign_keys = ON;
@@ -32,7 +32,7 @@ CREATE TABLE trace_sources (
     status              TEXT    NOT NULL DEFAULT 'new',
     last_error          TEXT,
     updated_at          TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (adapter IN ('codex', 'claude', 'pi'))
+    CHECK (adapter IN ('codex', 'claude', 'pi', 'antigravity'))
 );
 
 CREATE TABLE trace_records (
@@ -57,7 +57,7 @@ CREATE TABLE domain_sessions (
     runtime             TEXT    NOT NULL,
     native_id           TEXT    NOT NULL,
     UNIQUE(runtime, native_id),
-    CHECK (runtime IN ('codex', 'claude', 'pi'))
+    CHECK (runtime IN ('codex', 'claude', 'pi', 'antigravity'))
 );
 
 -- Relational storage for Session.source_ids and the Session facts contributed
@@ -155,7 +155,7 @@ CREATE TABLE item_session_links (
     target_runtime   TEXT NOT NULL,
     target_native_id TEXT NOT NULL,
     json_member      TEXT NOT NULL,
-    CHECK (target_runtime IN ('codex', 'claude', 'pi')),
+    CHECK (target_runtime IN ('codex', 'claude', 'pi', 'antigravity')),
     CHECK (json_member IN ('child_session_id', 'subagent_session_id', 'source_session_id'))
 );
 
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn creates_the_minimal_v2_schema() {
-        assert_eq!(STORAGE_FORMAT, 2);
+        assert_eq!(STORAGE_FORMAT, 3);
         let connection = Connection::open_in_memory().expect("open database");
         connection
             .execute_batch(CREATE_SCHEMA)

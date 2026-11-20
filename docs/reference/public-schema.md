@@ -21,7 +21,7 @@ trace-index schema get items --compact
 - `sources`: Physical Runtime Trace inputs currently published by Trace Index.
 - `records`: Boundary-complete physical Records. Raw bytes remain in the Source and can be read with `record inspect`.
 - `sessions`: Runtime-maintained logical Agent contexts. Arrays and nested optional attributes are JSON values belonging to the Session object.
-- `loops`: Outer Agent execution lifecycles. A missing `end` means no ending has been observed; an `end` without outcome means the boundary is known but the Runtime did not state a result.
+- `loops`: Outer Agent execution lifecycles. Some Adapters group Items by input when the Runtime does not expose confirmed boundaries. A missing `end` means no ending has been observed. An `end` without outcome means the boundary is known and the Runtime did not state a result.
 - `items`: Individually queryable Agent program facts. `semantic` is the typed Trace Index meaning; `record_ids` identifies its physical evidence.
 - `blobs`: Bounded Semantic text addressable through Item BlobRef values. Blob rows are access data, not independent trace facts.
 - `item_search`: Trigram candidate index over explicitly documented Item semantic text. `rowid` is the matching `items.item_id`; exact-check candidate text.
@@ -35,13 +35,13 @@ trace-index schema get items --compact
 
 `records` locates every complete framed Record within its Source. `content_range` is a JSON half-open byte range `{start, end}`; together with `fingerprint`, it provides the physical locator needed for verification.
 
-`sessions` identifies a continuing Runtime context. `session_id` is an opaque Trace Index-local join key; `native_id` is the identity assigned by the named Runtime and is the value normally reported when a user asks for a Codex, Pi, or Claude Code Session id. `source_ids` is a JSON array because resume and lineage can make several Sources support one Session. `forked_from` and `delegated_from` are optional Session attributes encoded as JSON objects; a sparse private table used to store them does not create another domain object.
+`sessions` identifies a continuing Runtime context. `session_id` is an opaque Trace Index-local join key; `native_id` is the identity assigned by the named Runtime and is the value normally reported to users. `identity_record_id` anchors that identity. Some Runtimes encode the identity in the supporting Source's locator. `source_ids` is a JSON array because resume and lineage can make several Sources support one Session. `forked_from` and `delegated_from` are optional Session attributes encoded as JSON objects; a sparse private table used to store them does not create another domain object.
 
-`loops` identifies an outer execution lifecycle inside a Session. `session_position` is its zero-based order inside the Session. `start_record_id` is required. Optional `end` is a JSON object containing the ending `record_id` and, when the Runtime stated a result, `outcome`. The outcome vocabulary is `completed`, `interrupted`, and `failed`.
+`loops` represents outer execution lifecycles inside a Session. Some Adapters use user input to group Items heuristically when the Runtime does not expose confirmed boundaries. `session_position` is the Loop's zero-based order inside the Session. `start_record_id` is required. Optional `end` is a JSON object containing the ending `record_id` and, when the Runtime stated a result, `outcome`. The outcome vocabulary is `completed`, `interrupted`, and `failed`.
 
-`items` is the central fact stream. `session_id` is always present. `loop_id` and `loop_position` are present only when Loop membership is structurally known. Order a Loop by `loop_position`; Session-scoped Items with no Loop stay queryable with both fields null.
+`items` is the central fact stream. `session_id` is always present. When an Adapter associates an Item with a Loop, `loop_id` and `loop_position` are present. Order a Loop by `loop_position`. Session-scoped Items with no Loop stay queryable with both fields null. See [Supported Traces](supported-traces.md) for the evidence each Runtime provides for Loop boundaries.
 
-Every Item has directly stored `semantic = {role, value, evidence_strength}` JSON. This is the stable SQL encoding of Trace Index's typed domain Semantic. `role` selects the valid `value` shape. `structural` and `heuristic` state how the classification was established.
+Every Item has directly stored `semantic = {role, value, evidence_strength}` JSON. This is the stable SQL encoding of Trace Index's typed domain Semantic. `role` selects the valid `value` shape. `structural` and `heuristic` describe the Item's classification independently of its Loop membership.
 
 `record_ids` is the non-empty JSON array of physical witnesses supporting the Item. Use `json_each(record_ids)` when each witness must be joined to `records`.
 

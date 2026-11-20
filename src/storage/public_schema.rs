@@ -127,16 +127,16 @@ public_view! {
     /// Runtime-maintained logical Agent contexts. Arrays and nested optional
     /// attributes are JSON values belonging to the Session object.
     pub(crate) const SESSIONS = "sessions" {
-        /// Trace Index-local opaque join key. This is not the Runtime-native
-        /// Session identity; use `native_id` when reporting the Codex, Pi, or
-        /// Claude Code Session id to a user.
+        /// Trace Index-local opaque join key. Use `native_id` when reporting
+        /// the Runtime's Session id to a user.
         session_id: i64 = "s.id",
         /// Runtime that owns the native Session identity.
         runtime: String = "s.runtime",
         /// Runtime-native identity of the continuing context. This is the
         /// externally recognizable Session id within the named `runtime`.
         native_id: String = "s.native_id",
-        /// Record that directly states the Session identity.
+        /// Record supporting the Session identity, together with its Source
+        /// locator when the Runtime encodes identity in the path.
         identity_record_id: i64 = "(SELECT identity_record_id FROM session_sources WHERE session_id = s.id ORDER BY source_id LIMIT 1)",
         /// Runtime-provided context creation time in epoch milliseconds.
         created_at: Option<i64> = "(SELECT MIN(created_at) FROM session_sources WHERE session_id = s.id)",
@@ -155,9 +155,10 @@ public_view! {
 }
 
 public_view! {
-    /// Outer Agent execution lifecycles. A missing `end` means no ending has
-    /// been observed; an `end` without outcome means the boundary is known but
-    /// the Runtime did not state a result.
+    /// Outer Agent execution lifecycles. Some Adapters group Items by input
+    /// when the Runtime does not expose confirmed boundaries. A missing `end`
+    /// means no ending has been observed. An `end` without outcome means the
+    /// boundary is known and the Runtime did not state a result.
     pub(crate) const LOOPS = "loops" {
         /// Opaque Loop reference in this index.
         loop_id: i64 = "l.id",
@@ -191,7 +192,7 @@ public_view! {
         item_id: i64 = "i.id",
         /// Session containing the Item.
         session_id: i64 = "i.session_id",
-        /// Loop containing the Item when structurally known.
+        /// Loop associated with the Item by the Runtime Adapter.
         loop_id: Option<i64> = "i.loop_id",
         /// Zero-based observation position inside the Loop.
         loop_position: Option<i64> = "i.loop_position",

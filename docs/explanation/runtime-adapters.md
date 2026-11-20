@@ -5,13 +5,13 @@ description: Why supported Runtimes share a domain model without one universal M
 
 # Runtime Adapters
 
-Codex, Pi, and Claude Code record similar kinds of work through different protocols. An Adapter translates each protocol into Source, Record, Session, Loop, and Item while keeping the original Runtime representation reachable through Record evidence.
+Agent runtimes record similar kinds of work through different protocols. An Adapter translates each protocol into Source, Record, Session, Loop, and Item while keeping the original Runtime representation reachable through Record evidence.
 
 ## One Semantic fact from Runtime evidence
 
 For every published Item, the Adapter produces Semantic JSON `{role, value, evidence_strength}`: a Trace Index role, the role's typed value, and the strength of the evidence used to classify it. The Item separately cites the physical Records from which the Adapter derived that fact.
 
-This lets queries depend on a stable Semantic contract without pretending that three Runtime payloads have one body schema. Runtime-specific fields stay in their Source Records. They become Semantic fields only after a real query demonstrates a stable meaning worth supporting.
+This lets queries depend on a stable Semantic contract across different Runtime payloads. Runtime-specific fields stay in their Source Records. They become Semantic fields only after a real query demonstrates a stable meaning worth supporting.
 
 ## Projection needs surrounding Records
 

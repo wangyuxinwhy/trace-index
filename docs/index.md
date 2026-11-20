@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Trace Index
   text: Query Agent histories as evidence
-  tagline: A bounded, source-traceable fact plane for Codex, Pi, and Claude Code traces.
+  tagline: A bounded, source-traceable fact plane for agent traces.
   actions:
     - theme: brand
       text: Start Here
@@ -26,9 +26,9 @@ features:
 
 # Trace Index
 
-Agent Runtimes persist detailed traces so work can continue, but those files are difficult to investigate later. A question may cross many Sources and three different Runtime formats, while a useful answer still needs to show where every fact came from.
+Agent Runtimes persist detailed traces so work can continue, but those files are difficult to investigate later. A question may cross many Sources and Runtime formats, while a useful answer still needs to show where every fact came from.
 
-Trace Index builds a local, rebuildable SQLite derivative from Codex, Pi, and Claude Code JSONL Sources. It exposes five domain objects through bounded read-only SQL and keeps a path from projected facts back to their physical Records.
+Trace Index builds a local, rebuildable SQLite derivative from supported JSONL Sources. It exposes five domain objects through bounded read-only SQL and keeps a path from projected facts back to their physical Records.
 
 Trace Index provides facts and provenance. The investigating Agent still chooses the scope, compares evidence, handles uncertainty, and forms the conclusion. For one known file and one literal, `rg` can be simpler; the index is most useful when an investigation crosses Sources, Sessions, Runtimes, or time ranges.
 

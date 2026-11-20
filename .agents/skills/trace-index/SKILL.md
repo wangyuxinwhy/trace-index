@@ -1,11 +1,11 @@
 ---
 name: trace-index
-description: Query indexed Codex, Pi, and Claude Code traces with trace-index when investigating sessions, agent work, tool use, or physical source evidence.
+description: Query indexed agent traces with trace-index when investigating sessions, agent work, tool use, or physical source evidence.
 ---
 
 # Trace Index
 
-Use `trace-index` as the read-only, source-traceable SQL query plane for Codex, Pi, and Claude Code traces. Trace Index returns facts and provenance; interpret them and form the conclusion yourself.
+Use `trace-index` as the read-only, source-traceable SQL query plane for agent traces. Trace Index returns facts and provenance; interpret them and form the conclusion yourself. Read `trace-index docs get reference/supported-traces` for Runtime coverage and its limits.
 
 At the start of each trace-analysis task, run `trace-index --help` once. Its help, bundled documentation, and Schema match the installed binary. Follow the discovery path instead of guessing relation names, columns, JSON shapes, or flags:
 
@@ -56,7 +56,7 @@ Run bounded projections, filters, counts, groups, and joins with `query run`. St
 
 For broad text recall, use search only to generate candidates instead of fetching whole conversations. Derive several literal anchors from the user's wording, measure candidate density, and initially return only identities, scope, role, and short snippets. Compare candidates against the Runtime, time, project, actor, and provenance constraints that the request actually supplies before expanding any conversation. If the evidence does not identify one Session, preserve that ambiguity or ask for the missing discriminator. The bundled `how-to/search-literals` document gives the complete workflow and SQL patterns.
 
-In `sessions`, `session_id` is the Trace Index-local join key and `native_id` is the Runtime-native identity. Report `runtime` plus `native_id` when the user asks for a Codex, Pi, or Claude Code Session id.
+In `sessions`, `session_id` is the Trace Index-local join key and `native_id` is the Runtime-native identity. Report `runtime` plus `native_id` when the user asks for a native Session id.
 
 Use `item_search` only to generate broad literal candidates. Its contentless `text` column is a MATCH operand and reads as NULL; candidate output is `rowid`. Join that id to `items.item_id`, select the `blob_id` defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()` or an equally explicit comparison. Trigram matching is case-folded and broader than exact matching. For literals shorter than three Unicode characters, narrow Items structurally first and join only their referenced Blobs.
 

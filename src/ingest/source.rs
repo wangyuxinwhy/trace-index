@@ -1,12 +1,15 @@
 //! Source discovery and boundary-complete Record reading.
 
-use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
+
+use crate::adapters::runtime::antigravity;
 
 pub(crate) const READ_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -15,7 +18,30 @@ pub(crate) fn discover_jsonl_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     for path in paths {
         collect_jsonl_files(path, &mut files)?;
     }
+    prefer_antigravity_transcripts(&mut files);
     Ok(files.into_iter().collect())
+}
+
+fn prefer_antigravity_transcripts(files: &mut BTreeSet<PathBuf>) {
+    let mut preferred = HashMap::new();
+    let mut shadowed = Vec::new();
+    for path in files.iter() {
+        let Some((id, full)) = antigravity::transcript(path) else {
+            continue;
+        };
+        match preferred.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert((path, full));
+            }
+            Entry::Occupied(mut entry) if full && !entry.get().1 => {
+                shadowed.push(entry.insert((path, full)).0.clone());
+            }
+            Entry::Occupied(_) => shadowed.push(path.clone()),
+        }
+    }
+    for path in shadowed {
+        files.remove(&path);
+    }
 }
 
 fn collect_jsonl_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
@@ -34,6 +60,19 @@ fn collect_jsonl_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
         return Ok(());
     }
     if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    // Antigravity's logs directory also contains chunk copies of its two
+    // transcript projections. Only the producer's consolidated files are
+    // index inputs.
+    let short_transcript = path.join("transcript.jsonl");
+    if antigravity::transcript(&short_transcript).is_some() {
+        for candidate in [short_transcript, path.join("transcript_full.jsonl")] {
+            if candidate.is_file() {
+                collect_jsonl_files(&candidate, files)?;
+            }
+        }
         return Ok(());
     }
 

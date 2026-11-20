@@ -1,9 +1,12 @@
 //! Detects the source runtime and dispatches records to its projector.
 
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
 use super::projection::{RecordFacts, SessionProjection};
+use super::runtime::antigravity::{self, AntigravityProjector};
 use super::runtime::claude::ClaudeProjector;
 use super::runtime::codex::CodexProjector;
 use super::runtime::pi::PiProjector;
@@ -13,6 +16,7 @@ pub(crate) enum AdapterKind {
     Codex,
     Pi,
     Claude,
+    Antigravity,
 }
 
 impl AdapterKind {
@@ -21,15 +25,27 @@ impl AdapterKind {
             Self::Codex => "codex",
             Self::Pi => "pi",
             Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn detect(bytes: &[u8]) -> Result<AdapterKind> {
+    detect_at(bytes, None)
+}
+
+pub(crate) fn detect_at(bytes: &[u8], path: Option<&Path>) -> Result<AdapterKind> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         anyhow::anyhow!("cannot detect trace adapter from malformed JSON: {error}")
     })?;
     let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if path.and_then(antigravity::transcript).is_some() {
+        if antigravity::is_step(&value) {
+            return Ok(AdapterKind::Antigravity);
+        }
+        bail!("unsupported Antigravity trace: the first record is not a transcript step");
+    }
     if record_type == "session"
         && value.get("id").and_then(Value::as_str).is_some()
         && value.get("cwd").and_then(Value::as_str).is_some()
@@ -73,6 +89,7 @@ pub(crate) fn record_facts(adapter: AdapterKind, value: &Value) -> RecordFacts {
         AdapterKind::Codex => super::runtime::codex::record_facts(value),
         AdapterKind::Pi => super::runtime::pi::record_facts(value),
         AdapterKind::Claude => super::runtime::claude::record_facts(value),
+        AdapterKind::Antigravity => antigravity::record_facts(value),
     }
 }
 
@@ -88,15 +105,22 @@ pub(crate) enum Projector {
     Codex(Box<CodexProjector>),
     Pi(Box<PiProjector>),
     Claude(Box<ClaudeProjector>),
+    Antigravity(Box<AntigravityProjector>),
 }
 
 impl Projector {
-    pub(crate) fn new(adapter: AdapterKind, max_text_bytes: usize) -> Self {
-        match adapter {
+    pub(crate) fn new(adapter: AdapterKind, max_text_bytes: usize, path: &Path) -> Result<Self> {
+        Ok(match adapter {
             AdapterKind::Codex => Self::Codex(Box::new(CodexProjector::new(max_text_bytes))),
             AdapterKind::Pi => Self::Pi(Box::new(PiProjector::new(max_text_bytes))),
             AdapterKind::Claude => Self::Claude(Box::new(ClaudeProjector::new(max_text_bytes))),
-        }
+            AdapterKind::Antigravity => {
+                let Some((id, _)) = antigravity::transcript(path) else {
+                    bail!("Antigravity transcript locator has no conversation UUID");
+                };
+                Self::Antigravity(Box::new(AntigravityProjector::new(id, max_text_bytes)))
+            }
+        })
     }
 
     pub(crate) fn push(&mut self, seq: u64, value: &Value) {
@@ -104,6 +128,7 @@ impl Projector {
             Self::Codex(projector) => projector.push(seq, value),
             Self::Pi(projector) => projector.push(seq, value),
             Self::Claude(projector) => projector.push(seq, value),
+            Self::Antigravity(projector) => projector.push(seq, value),
         }
     }
 
@@ -114,6 +139,7 @@ impl Projector {
             Self::Codex(projector) => projector.drain_completed(),
             Self::Pi(projector) => projector.drain_completed(),
             Self::Claude(projector) => projector.drain_completed(),
+            Self::Antigravity(_) => Vec::new(),
         }
     }
 
@@ -122,6 +148,7 @@ impl Projector {
             Self::Codex(projector) => projector.finish(),
             Self::Pi(projector) => projector.finish(),
             Self::Claude(projector) => projector.finish(),
+            Self::Antigravity(projector) => vec![projector.finish()],
         }
     }
 }
