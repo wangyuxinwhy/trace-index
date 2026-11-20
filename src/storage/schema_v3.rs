@@ -218,6 +218,8 @@ CREATE INDEX IF NOT EXISTS session_parents_record ON session_parents(record_id);
 CREATE INDEX IF NOT EXISTS loops_start_record ON domain_loops(start_record_id);
 CREATE INDEX IF NOT EXISTS loops_end_record ON domain_loops(end_record_id);
 CREATE INDEX IF NOT EXISTS items_session ON domain_items(session_id, occurred_at, id);
+-- Within a Session the implicit rowid orders items by their public item_id.
+CREATE INDEX IF NOT EXISTS items_session_item_order ON domain_items(session_id);
 CREATE INDEX IF NOT EXISTS items_source ON domain_items(source_id, id);
 CREATE INDEX IF NOT EXISTS items_loop ON domain_items(loop_id, loop_position, id);
 CREATE INDEX IF NOT EXISTS items_role ON domain_items(json_extract(semantic, '$.role'), id);
@@ -234,6 +236,7 @@ DROP INDEX IF EXISTS session_parents_record;
 DROP INDEX IF EXISTS loops_start_record;
 DROP INDEX IF EXISTS loops_end_record;
 DROP INDEX IF EXISTS items_session;
+DROP INDEX IF EXISTS items_session_item_order;
 DROP INDEX IF EXISTS items_source;
 DROP INDEX IF EXISTS items_loop;
 DROP INDEX IF EXISTS items_role;

@@ -33,7 +33,7 @@ trace-index schema get items --compact
 
 `sources` has exactly three fields: the opaque `source_id`, canonical `locator`, and `runtime` that defines the Source's native structure. Framing, synchronization checkpoints, and publication state are implementation concerns rather than public Source attributes.
 
-`records` locates every complete framed Record within its Source. `content_range` is a JSON half-open byte range `{start, end}`; together with `fingerprint`, it provides the physical locator needed for verification.
+`records` locates every complete framed Record within its Source. `content_range` is a JSON half-open byte range `{start, end}` in the decoded Source stream. For a plain JSONL input these offsets are file offsets. For a compressed input they refer to the uncompressed JSONL bytes. Together with the Source locator and `fingerprint`, the range locates the original Record for verification.
 
 `sessions` identifies a continuing Runtime context. `session_id` is an opaque Trace Index-local join key; `native_id` is the identity assigned by the named Runtime and is the value normally reported to users. `identity_record_id` anchors that identity. Some Runtimes encode the identity in the supporting Source's locator. `source_ids` is a JSON array because resume and lineage can make several Sources support one Session. `forked_from` and `delegated_from` are optional Session attributes encoded as JSON objects; a sparse private table used to store them does not create another domain object.
 

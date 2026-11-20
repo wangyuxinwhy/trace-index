@@ -51,6 +51,7 @@ pub(crate) struct SourceState {
     pub indexed_bytes: u64,
     pub indexed_lines: u64,
     pub indexed_fingerprint: String,
+    pub complete: bool,
 }
 
 /// Database-wide policy that determines which Source bytes become indexed
@@ -392,7 +393,7 @@ pub(crate) fn source_state(connection: &Connection, path: &str) -> Result<Option
     connection
         .query_row(
             "SELECT id, adapter, file_size, modified_ns, indexed_bytes, indexed_lines,
-                    indexed_fingerprint
+                    indexed_fingerprint, status = 'complete'
                FROM trace_sources
               WHERE path = ?1",
             [path],
@@ -405,6 +406,7 @@ pub(crate) fn source_state(connection: &Connection, path: &str) -> Result<Option
                     indexed_bytes: from_sql_u64(row.get(4)?)?,
                     indexed_lines: from_sql_u64(row.get(5)?)?,
                     indexed_fingerprint: row.get(6)?,
+                    complete: row.get(7)?,
                 })
             },
         )

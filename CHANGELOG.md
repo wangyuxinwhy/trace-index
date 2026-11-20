@@ -2,7 +2,16 @@
 
 All notable public changes to Trace Index are documented here.
 
-## [Unreleased]
+## [0.4.1] - 2026-11-21
+
+### Added
+
+- Index Codex `.jsonl.zst` rollouts directly and verify or export Records from the decoded stream. Sibling plain and compressed rollouts share one Source across an encoding switch.
+
+### Changed
+
+- Preserve existing projections when a Source's indexed bytes are unchanged after a metadata or encoding change.
+- Add an index for reading the first or last Items of a Session in Item ID order. Storage Format 3 is unchanged; existing Format 3 indexes gain the new index automatically on the next synchronization.
 
 ## [0.4.0] - 2026-11-20
 

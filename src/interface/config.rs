@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::ingest::source::is_trace_file;
+
 const CONFIG_ENV: &str = "TRACE_INDEX_CONFIG";
 const DATABASE_ENV: &str = "TRACE_INDEX_DB";
 const METADATA_ENV: &str = "TRACE_INDEX_METADATA_DB";
@@ -494,16 +496,12 @@ pub(crate) fn check_selected(
     for root in &loaded.effective.roots {
         match fs::metadata(&root.path) {
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(metadata)
-                if metadata.is_file()
-                    && root
-                        .path
-                        .extension()
-                        .is_some_and(|extension| extension == "jsonl") => {}
+            Ok(metadata) if metadata.is_file() && is_trace_file(&root.path) => {}
             Ok(_) => issues.push(ConfigCheckIssue {
                 level: ConfigCheckLevel::Error,
                 code: "unsupported_root_type",
-                message: "a root must be a directory or a .jsonl file".to_owned(),
+                message: "a root must be a directory, a .jsonl file, or a Codex .jsonl.zst file"
+                    .to_owned(),
                 path: Some(root.path.clone()),
             }),
             Err(error) => {

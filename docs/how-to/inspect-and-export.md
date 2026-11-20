@@ -52,7 +52,7 @@ Record ids are opaque references in the currently published index. The durable e
 trace-index record inspect 12345
 ```
 
-Inspection reads the saved byte range from the original Source and verifies its BLAKE3 fingerprint. The returned representation preserves JSON structure while replacing inline media and large scalar values with `$trace_ref` objects so normal stdout stays bounded.
+Inspection reads the saved byte range from the original Source and verifies its BLAKE3 fingerprint. For compressed Sources the range addresses the decoded JSONL stream. The returned representation preserves JSON structure while replacing inline media and large scalar values with `$trace_ref` objects so normal stdout stays bounded.
 
 This command depends on the original Source still being present. Trace Index is a rebuildable derivative, not an archive.
 
@@ -64,7 +64,7 @@ trace-index record verify 12345
 
 Verification compares the current source bytes with the indexed byte length and fingerprint without returning the Record representation. Use it when the question is whether the physical witness has changed.
 
-The result is data rather than an I/O-shaped failure: `verified` means the current bytes still match, `source_missing` means the locator no longer exists, `source_short` means it no longer reaches the indexed range, and `hash_mismatch` means bytes exist at that range but have changed. The latter three results do not invalidate the already indexed Item; they state that the original physical witness can no longer be reverified from its recorded locator.
+`verified` means the current bytes match. `source_missing` means the locator no longer exists. `source_short` means the Source stream stops before the indexed Record can be read in full. `hash_mismatch` means bytes exist at the range and have changed. Read or decompression failures are command errors. A verification failure leaves the indexed Item available and reports the state of its witness at the recorded locator.
 
 ## Export byte-exact Record bytes
 

@@ -23,14 +23,16 @@ use crate::adapters::adapter::{AdapterKind, Projector, detect_at, record_facts};
 use crate::adapters::projection::{RecordFacts, SessionProjection};
 use crate::adapters::runtime::antigravity;
 use crate::ingest::source::{
-    READ_BUFFER_BYTES, RecordRead, complete_prefix_length, discover_jsonl_files,
-    fingerprint_prefix_into, modified_ns, prefix_hasher, read_bounded_record,
-    read_bounded_record_hashed,
+    READ_BUFFER_BYTES, RecordRead, alternate_encoding, complete_prefix_length,
+    discover_jsonl_files, fingerprint_prefix, is_compressed, modified_ns, open_for_indexing,
+    prefix_hasher, read_bounded_record, read_bounded_record_hashed,
 };
 use crate::interface::output::{IndexMetrics, IndexReport, SourceIndexResult};
 use crate::shell::syntax;
 use crate::storage::blob::BlobCache;
-use crate::storage::db::{IndexingPolicy, SourceState, Store, display_database_path, to_sql_i64};
+use crate::storage::db::{
+    IndexingPolicy, SourceState, Store, display_database_path, source_state, to_sql_i64,
+};
 use crate::storage::persist::{clear_projection, write_session};
 
 const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
@@ -103,7 +105,7 @@ fn index_paths_internal(
     telemetry.set_corpus(files.len(), source_bytes);
     progress.update(telemetry.progress(IndexPhase::Prepare, None), true);
     if files.is_empty() {
-        bail!("no .jsonl files found in the supplied paths");
+        bail!("no trace files found in the supplied paths");
     }
     let mut report = IndexReport {
         adapters: Vec::new(),
@@ -216,7 +218,6 @@ fn index_source(
         .with_context(|| format!("failed to stat {}", canonical.display()))?;
     let file_size = metadata.len();
     let file_modified_ns = modified_ns(&metadata);
-    let state = store.source_state(&path_string)?;
 
     // Decided before the file is opened. An unchanged Source needs nothing out
     // of it, and detecting the adapter costs one open and one record read per
@@ -225,38 +226,41 @@ fn index_source(
     // whether anything happened; the format cannot have changed if the bytes
     // did not. `--rebuild` re-reads and re-detects, which is what to use after
     // a change to detection itself.
-    if let Some(existing) = &state
+    if let Some(existing) = store.source_state(&path_string)?
         && !options.rebuild
         && existing.file_size == file_size
-        && existing.indexed_bytes == file_size
+        && existing.complete
         && existing.modified_ns == file_modified_ns
     {
         telemetry.record_duration(IndexPhase::Prepare, prepare_started.elapsed());
-        return Ok(SourceIndexResult {
-            error: None,
-            path: path_string,
-            adapter: existing.adapter.clone(),
-            action: "unchanged".to_owned(),
-            indexed_records: 0,
-            indexed_items: 0,
-            indexed_bytes: existing.indexed_bytes,
-            file_size,
-            malformed_records: 0,
-            oversized_records: 0,
-            incomplete_tail: false,
-        });
+        return Ok(unchanged_result(path_string, &existing, file_size, false));
     }
 
+    let mut file = open_for_indexing(&canonical)?;
     let adapter = detect_adapter(
+        &mut file,
         &canonical,
         options.max_record_bytes.max(MAX_ADAPTER_DETECTION_BYTES),
     )?;
+    if is_compressed(&canonical) && adapter != AdapterKind::Codex {
+        return Err(UnrecognizedSource(format!(
+            "{}: Zstandard input is supported for Codex traces",
+            canonical.display()
+        ))
+        .into());
+    }
 
-    let mut file = File::open(&canonical)
-        .with_context(|| format!("failed to open {}", canonical.display()))?;
-    let indexed_limit = complete_prefix_length(&mut file, file_size)?;
-    let incomplete_tail = indexed_limit < file_size;
+    let logical_size = file.metadata()?.len();
+    let indexed_limit = complete_prefix_length(&mut file, logical_size)?;
+    let incomplete_tail = indexed_limit < logical_size;
     telemetry.record_duration(IndexPhase::Prepare, prepare_started.elapsed());
+
+    let transaction = store
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start index transaction")?;
+    let (state, encoding_changed) =
+        encoding_source_state(&transaction, adapter, &canonical, &path_string)?;
 
     let reset = decide_reset(
         &mut file,
@@ -266,6 +270,41 @@ fn index_source(
         options,
         telemetry,
     )?;
+    if encoding_changed && reset && !options.rebuild {
+        return Err(UnrecognizedSource(format!(
+            "{} does not preserve the indexed prefix of its sibling encoding; pass --rebuild to replace it",
+            canonical.display()
+        )).into());
+    }
+    let replaced_transcript = antigravity_replacement(&transaction, adapter, &canonical)?;
+    if let Some(existing) = state.as_ref()
+        && !reset
+        && replaced_transcript.is_none()
+        && indexed_limit == existing.indexed_bytes
+    {
+        // A metadata change or encoding switch can leave every published byte
+        // identical. Update the physical locator without rebuilding evidence.
+        transaction.execute(
+            "UPDATE trace_sources
+                SET path = ?2, file_size = ?3, modified_ns = ?4, status = ?5,
+                    last_error = NULL, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?1",
+            params![
+                existing.id,
+                path_string,
+                to_sql_i64(file_size, "file size")?,
+                file_modified_ns,
+                source_status(incomplete_tail),
+            ],
+        )?;
+        transaction.commit()?;
+        return Ok(unchanged_result(
+            path_string,
+            existing,
+            file_size,
+            incomplete_tail,
+        ));
+    }
     let resume_line = match (&state, reset) {
         (Some(existing), false) => existing.indexed_lines,
         _ => 0,
@@ -277,12 +316,6 @@ fn index_source(
     }
     .to_owned();
 
-    let transaction = store
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("failed to start index transaction")?;
-
-    let replaced_transcript = antigravity_replacement(&transaction, adapter, &canonical)?;
     let source_id = ensure_source_row(&transaction, state.as_ref(), adapter, &path_string)?;
 
     // A changed Source republishes its complete domain projection. Physical
@@ -426,11 +459,7 @@ fn index_source(
                 to_sql_i64(indexed_limit, "indexed bytes")?,
                 to_sql_i64(seq, "indexed lines")?,
                 fingerprint,
-                if incomplete_tail {
-                    "partial"
-                } else {
-                    "complete"
-                },
+                source_status(incomplete_tail),
             ],
         )
         .context("failed to update source state")?;
@@ -452,6 +481,31 @@ fn index_source(
         oversized_records: counts.oversized,
         incomplete_tail,
     })
+}
+
+fn unchanged_result(
+    path: String,
+    existing: &SourceState,
+    file_size: u64,
+    incomplete_tail: bool,
+) -> SourceIndexResult {
+    SourceIndexResult {
+        path,
+        adapter: existing.adapter.clone(),
+        action: "unchanged".to_owned(),
+        indexed_bytes: existing.indexed_bytes,
+        file_size,
+        incomplete_tail,
+        ..SourceIndexResult::default()
+    }
+}
+
+fn source_status(incomplete_tail: bool) -> &'static str {
+    if incomplete_tail {
+        "partial"
+    } else {
+        "complete"
+    }
 }
 
 fn antigravity_replacement(
@@ -537,11 +591,26 @@ fn decide_reset(
     }
 
     let fingerprint_started = Instant::now();
-    let mut scratch = prefix_hasher(existing.indexed_bytes);
-    let current = fingerprint_prefix_into(file, existing.indexed_bytes, &mut scratch)?;
+    let current = fingerprint_prefix(file, existing.indexed_bytes)?;
     telemetry.record_duration(IndexPhase::Fingerprint, fingerprint_started.elapsed());
     telemetry.add_fingerprint_bytes(existing.indexed_bytes);
     Ok(current != existing.indexed_fingerprint)
+}
+
+fn encoding_source_state(
+    transaction: &Transaction<'_>,
+    adapter: AdapterKind,
+    path: &Path,
+    locator: &str,
+) -> Result<(Option<SourceState>, bool)> {
+    let state = source_state(transaction, locator)?;
+    if state.is_some() || adapter != AdapterKind::Codex {
+        return Ok((state, false));
+    }
+    let alternate = source_state(transaction, &alternate_encoding(path).to_string_lossy())?
+        .filter(|existing| existing.adapter == adapter.name());
+    let encoding_changed = alternate.is_some();
+    Ok((alternate, encoding_changed))
 }
 
 fn ensure_source_row(
@@ -553,9 +622,9 @@ fn ensure_source_row(
     if let Some(existing) = state {
         transaction
             .execute(
-                "UPDATE trace_sources SET adapter = ?2, status = 'indexing', last_error = NULL
+                "UPDATE trace_sources SET adapter = ?2, path = ?3, status = 'indexing', last_error = NULL
                   WHERE id = ?1",
-                params![existing.id, adapter.name()],
+                params![existing.id, adapter.name(), path],
             )
             .context("failed to mark source as indexing")?;
         return Ok(existing.id);
@@ -644,10 +713,9 @@ pub(crate) fn is_unrecognized_source(error: &anyhow::Error) -> bool {
         .any(<dyn std::error::Error>::is::<UnrecognizedSource>)
 }
 
-fn detect_adapter(path: &Path, max_record_bytes: usize) -> Result<AdapterKind> {
+fn detect_adapter(file: &mut File, path: &Path, max_record_bytes: usize) -> Result<AdapterKind> {
     // An I/O failure here is a real failure: the file may well be a trace we
     // simply could not read. Only the format verdict decides "not ours".
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
     match read_bounded_record(&mut reader, max_record_bytes)? {
         RecordRead::Complete(record) => {
