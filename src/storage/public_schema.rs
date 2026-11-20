@@ -95,7 +95,7 @@ public_view! {
     pub(crate) const SOURCES = "sources" {
         /// Opaque Source reference in this index.
         source_id: i64 = "s.id",
-        /// Canonical absolute locator of the original JSONL file.
+        /// Canonical absolute locator of the original Source file.
         locator: String = "s.path",
         /// Runtime that defines the Source's native structure.
         runtime: String = "s.adapter",

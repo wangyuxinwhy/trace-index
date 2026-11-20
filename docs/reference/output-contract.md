@@ -31,13 +31,13 @@ Public values preserve their declared representation. `records.content_range`, n
 
 Large Record values and inline media appear as structured references. An Asset reference is `<record-id>#<json-pointer>`, where the Record id is `records.record_id`. Byte-exact Record bytes and decoded Assets are written only by explicit export or extraction commands. Those commands refuse to overwrite an existing destination unless `--force` is supplied.
 
-`record verify` reports `verified`, `source_missing`, `source_short`, or `hash_mismatch` in its result. A verification finding is returned as data: a missing or changed Source does not erase already indexed facts. Export and Asset access still require the underlying Record bytes to be present and match their indexed fingerprint.
+`record verify` reports `verified`, `source_missing`, `source_short`, or `hash_mismatch` in its result. A verification finding is returned as data: a missing or changed Source does not erase already indexed facts. Read or decompression failures are command errors. Export and Asset access still require the underlying Record bytes to be present and match their indexed fingerprint.
 
 ## Synchronization reports
 
 `index sync` reports the database-wide `indexing_policy` used to publish facts and physical and domain writes under `metrics.writes`: `records`, `sessions`, `loops`, and `items`. `index status` returns the stored policy when one has been established. A changed Source can cause its domain projection to be replaced in full even when only a small physical suffix was appended, so domain write counts need not match `indexed_records`.
 
-`source_bytes` and per-Source `file_size` count bytes on disk. `processed_bytes`, `fingerprint_bytes`, and per-Source `indexed_bytes` count bytes in the decoded JSONL stream. The decoded counts can exceed the on-disk size of a compressed Source.
+`source_bytes` and per-Source `file_size` count bytes on disk. `processed_bytes`, `fingerprint_bytes`, and `indexed_bytes` (both top-level and per-Source) count bytes in the decoded JSONL stream. The decoded counts can exceed the on-disk size of a compressed Source.
 
 `metrics.phases_ms` partitions elapsed time across discovery, preparation, clearing, reading, projection, persistence, fingerprinting, commit, secondary-index work, and an unattributed residual. `metrics.persist_ms` is operational telemetry for current write sites. The names below describe implementation work; they do not add domain objects.
 
