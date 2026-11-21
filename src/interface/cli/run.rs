@@ -66,7 +66,7 @@ fn run_operational(command: Command, loaded: &LoadedConfig) -> Result<()> {
             )
         })
     } else {
-        Store::open_read_only(database)
+        Store::open_read_only_without_metadata(database)
             .with_context(|| format!("failed to open index {}", database.display()))
     }?;
 

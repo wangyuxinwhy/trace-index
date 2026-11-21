@@ -223,6 +223,8 @@ CREATE INDEX IF NOT EXISTS items_session_item_order ON domain_items(session_id);
 CREATE INDEX IF NOT EXISTS items_source ON domain_items(source_id, id);
 CREATE INDEX IF NOT EXISTS items_loop ON domain_items(loop_id, loop_position, id);
 CREATE INDEX IF NOT EXISTS items_role ON domain_items(json_extract(semantic, '$.role'), id);
+CREATE INDEX IF NOT EXISTS items_role_occurred ON domain_items(json_extract(semantic, '$.role'), occurred_at, source_id);
+CREATE INDEX IF NOT EXISTS items_occurred ON domain_items(occurred_at, id);
 CREATE INDEX IF NOT EXISTS item_records_record ON item_records(record_id);
 ";
 
@@ -240,6 +242,8 @@ DROP INDEX IF EXISTS items_session_item_order;
 DROP INDEX IF EXISTS items_source;
 DROP INDEX IF EXISTS items_loop;
 DROP INDEX IF EXISTS items_role;
+DROP INDEX IF EXISTS items_role_occurred;
+DROP INDEX IF EXISTS items_occurred;
 DROP INDEX IF EXISTS item_records_record;
 ";
 
@@ -423,5 +427,87 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read Item Session link")
+    }
+
+    #[test]
+    fn role_and_time_ordered_item_queries_use_indexes_without_temp_sort() {
+        let connection = Connection::open_in_memory().expect("open database");
+        connection
+            .execute_batch(CREATE_SCHEMA)
+            .expect("create schema");
+        connection
+            .execute_batch(CREATE_SECONDARY_INDEXES)
+            .expect("create indexes");
+
+        let role_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, occurred_at
+                   FROM domain_items
+                  WHERE json_extract(semantic, '$.role') = 'agent.tool_call.shell'
+                    AND occurred_at >= 1000
+                  ORDER BY occurred_at DESC
+                  LIMIT 50",
+            )
+            .expect("prepare role plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query role plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect role plan");
+        assert!(
+            role_plan
+                .iter()
+                .any(|step| step.contains("items_role_occurred")),
+            "expected items_role_occurred in plan: {role_plan:?}"
+        );
+        assert!(
+            !role_plan
+                .iter()
+                .any(|step| step.contains("USE TEMP B-TREE")),
+            "unexpected temp B-tree sort in role plan: {role_plan:?}"
+        );
+
+        let time_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, occurred_at
+                   FROM domain_items
+                  WHERE occurred_at >= 1000
+                  ORDER BY occurred_at DESC
+                  LIMIT 50",
+            )
+            .expect("prepare time plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query time plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect time plan");
+        assert!(
+            time_plan.iter().any(|step| step.contains("items_occurred")),
+            "expected items_occurred in plan: {time_plan:?}"
+        );
+        assert!(
+            !time_plan
+                .iter()
+                .any(|step| step.contains("USE TEMP B-TREE")),
+            "unexpected temp B-tree sort in time plan: {time_plan:?}"
+        );
+
+        let status_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT json_extract(semantic, '$.role'), source_id
+                   FROM domain_items",
+            )
+            .expect("prepare status role plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query status role plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect status role plan");
+        assert!(
+            status_plan
+                .iter()
+                .any(|step| step.contains("items_role_occurred")),
+            "expected items_role_occurred covering scan for status: {status_plan:?}"
+        );
     }
 }

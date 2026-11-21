@@ -139,7 +139,19 @@ impl Store {
     ///
     /// Returns an error when the database cannot be opened read-only, its
     /// configuration cannot be applied, or its storage format does not match.
+    #[cfg(test)]
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        let store = Self::open_read_only_without_metadata(path)?;
+        super::metadata::attach_query(store.connection(), None)?;
+        Ok(store)
+    }
+
+    /// Opens an existing index read-only without attaching `session_metadata`.
+    ///
+    /// Callers that execute user SQL attach the configured metadata database
+    /// immediately afterward so metadata failures keep their own error context
+    /// and non-SQL commands skip temp-view DDL.
+    pub(crate) fn open_read_only_without_metadata(path: &Path) -> Result<Self> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to canonicalize database {}", path.display()))?;
@@ -168,7 +180,6 @@ impl Store {
         };
         store.validate_schema()?;
         store.connect_public_virtual_tables()?;
-        super::metadata::attach_query(store.connection(), None)?;
         Ok(store)
     }
 

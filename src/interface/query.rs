@@ -51,6 +51,9 @@ pub fn query_sql(
                 "SQL contains a literal `\\n`; pass real newlines with `--stdin` and a quoted heredoc, or use `--file`",
             ))
         }
+        Err(error) if is_fts5_phrase_query_error(&error) => Err(error.context(
+            "item_search is a contentless trigram index with detail=none; pass literal strings through item_search(trigram_query('...')) instead of an FTS5 phrase query",
+        )),
         result => result,
     }
 }
@@ -77,6 +80,14 @@ fn is_unrecognized_token(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("unrecognized token"))
+}
+
+fn is_fts5_phrase_query_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("fts5: phrase queries are not supported")
+    })
 }
 
 fn run_query(
@@ -762,6 +773,28 @@ mod tests {
         assert!(
             format!("{short:#}").contains("narrow by source, project, actor, or time"),
             "{short:#}"
+        );
+    }
+
+    #[test]
+    fn hints_trigram_query_on_fts5_phrase_query_error() {
+        let directory = tempdir().expect("temp directory");
+        let database = directory.path().join("index.sqlite");
+        let store = Store::open(&database).expect("open store");
+        insert_search_fixture(&store);
+
+        let error = query_sql(
+            &store,
+            "SELECT rowid FROM item_search WHERE item_search MATCH '\"agent friendly\"'",
+            10,
+            1024,
+            64 * 1024,
+            Duration::from_secs(1),
+        )
+        .expect_err("reject FTS5 phrase query on detail=none index");
+        assert!(
+            format!("{error:#}").contains("item_search(trigram_query('...'))"),
+            "{error:#}"
         );
     }
 }
