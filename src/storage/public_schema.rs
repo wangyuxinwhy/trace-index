@@ -1,9 +1,10 @@
 //! Agent-facing SQL contract for the five domain objects plus text search.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension as _};
+use rusqlite::Connection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicRelationKind {
@@ -317,25 +318,28 @@ pub(crate) fn recreate_public_views(connection: &Connection) -> Result<()> {
 }
 
 pub(crate) fn validate_public_relations(connection: &Connection) -> Result<()> {
+    let existing = connection
+        .prepare("SELECT name, type FROM main.sqlite_schema WHERE type IN ('view', 'table')")
+        .context("failed to inspect public relations")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to inspect public relations")?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
+        .context("failed to inspect public relations")?;
+
     for relation in PUBLIC_RELATIONS {
         let expected_kind = match relation.kind {
             PublicRelationKind::View { .. } => "view",
             PublicRelationKind::VirtualTable => "table",
             PublicRelationKind::ConnectionView => continue,
         };
-        let actual_kind = connection
-            .query_row(
-                "SELECT type FROM main.sqlite_schema WHERE name = ?1",
-                [relation.name],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .with_context(|| format!("failed to inspect public relation {}", relation.name))?;
-        if actual_kind.as_deref() != Some(expected_kind) {
+        let actual_kind = existing.get(relation.name).map(String::as_str);
+        if actual_kind != Some(expected_kind) {
             bail!(
                 "public relation {} must be a {expected_kind}, found {}",
                 relation.name,
-                actual_kind.as_deref().unwrap_or("nothing")
+                actual_kind.unwrap_or("nothing")
             );
         }
         let actual_columns = connection
