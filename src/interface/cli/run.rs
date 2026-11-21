@@ -16,7 +16,7 @@ use crate::ingest::record::{export_record, extract_asset, inspect_record, verify
 use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
 use crate::interface::output::ResponseEnvelope;
-use crate::interface::query::{public_schema, query_sql};
+use crate::interface::query::{QueryBudget, public_schema, query_sql};
 use crate::storage::db::{IndexingPolicy, Store};
 
 pub(crate) fn run() -> Result<()> {
@@ -291,10 +291,12 @@ fn run_query(store: &Store, command: QueryCommand) -> Result<()> {
     print_envelope(&query_sql(
         store,
         &sql,
-        args.limit,
-        args.max_cell_bytes,
-        args.max_output_bytes,
-        Duration::from_secs(u64::try_from(args.timeout_seconds)?),
+        QueryBudget {
+            limit: args.limit,
+            max_cell_bytes: args.max_cell_bytes,
+            max_output_bytes: args.max_output_bytes,
+            timeout: Duration::from_secs(u64::try_from(args.timeout_seconds)?),
+        },
     )?)
 }
 

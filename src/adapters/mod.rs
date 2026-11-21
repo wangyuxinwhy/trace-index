@@ -4,3 +4,4 @@ pub(crate) mod adapter;
 pub(crate) mod projection;
 pub(crate) mod runtime;
 pub(crate) mod semantic;
+pub(crate) mod timestamp;

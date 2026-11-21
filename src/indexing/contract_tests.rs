@@ -285,7 +285,7 @@ fn codex_message_pairing_uses_the_primary_response_timestamp() {
         .expect("query paired messages")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect paired messages");
-    let timestamp = crate::adapters::runtime::codex::parse_timestamp_ms_public;
+    let timestamp = crate::adapters::timestamp::parse_timestamp_ms;
     assert_eq!(
         rows,
         [
@@ -364,7 +364,7 @@ fn codex_item_completed_user_message_is_human_input() {
     assert_eq!(role, "human.request");
     assert_eq!(
         occurred_at,
-        crate::adapters::runtime::codex::parse_timestamp_ms_public("2026-08-25T08:43:05.429Z")
+        crate::adapters::timestamp::parse_timestamp_ms("2026-08-25T08:43:05.429Z")
             .expect("response timestamp")
     );
     assert_eq!(evidence_records, 2);
