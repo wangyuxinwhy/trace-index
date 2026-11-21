@@ -54,8 +54,11 @@ pub fn query_sql(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQue
                 "SQL contains a literal `\\n`; pass real newlines with `--stdin` and a quoted heredoc, or use `--file`",
             ))
         }
-        Err(error) if is_fts5_phrase_query_error(&error) => Err(error.context(
-            "item_search is a contentless trigram index with detail=none; pass literal strings through item_search(trigram_query('...')) instead of an FTS5 phrase query",
+        Err(error) if is_fts5_query_error(&error) => Err(error.context(
+            "item_search is a contentless trigram index with detail=none; pass literal strings through item_search(trigram_query('...')) and see 'trace-index docs get how-to/search-literals'",
+        )),
+        Err(error) if is_missing_schema_object_error(&error) => Err(error.context(
+            "inspect the current public relations and columns with 'trace-index schema list' or 'trace-index schema get <RELATION> --compact'",
         )),
         result => result,
     }
@@ -85,11 +88,16 @@ fn is_unrecognized_token(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("unrecognized token"))
 }
 
-fn is_fts5_phrase_query_error(error: &anyhow::Error) -> bool {
+fn is_fts5_query_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("fts5:"))
+}
+
+fn is_missing_schema_object_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("fts5: phrase queries are not supported")
+        let message = cause.to_string();
+        message.contains("no such column:") || message.contains("no such table:")
     })
 }
 

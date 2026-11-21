@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser as _;
+use clap::error::{ContextKind, ErrorKind};
 
 use super::{
     AssetCommand, Cli, Command, ConfigCommand, DocsCommand, DocsOutput, IndexCommand,
@@ -25,7 +26,7 @@ pub(crate) fn run() -> Result<()> {
         db: database,
         metadata_db,
         command,
-    } = Cli::parse();
+    } = parse_cli();
     match command {
         Command::Docs { command } => run_docs(command),
         Command::Schema { command } => run_declared_schema(command),
@@ -116,6 +117,41 @@ fn explicit_roots(paths: Vec<PathBuf>, loaded: &LoadedConfig) -> Result<Vec<Sync
             path,
         })
         .collect())
+}
+
+fn parse_cli() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let hint = cli_error_hint(&error);
+            let _ = error.print();
+            if let Some(hint) = hint {
+                let _ = writeln!(std::io::stderr(), "\nhint: {hint}");
+            }
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+fn cli_error_hint(error: &clap::Error) -> Option<&'static str> {
+    match error.kind() {
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            let usage = error
+                .get(ContextKind::Usage)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if usage.contains("trace-index query run") {
+                Some(
+                    "pass SQL as a positional argument, '--stdin', or '--file <PATH>' (stdout is always compact JSON; run 'trace-index query run --help' for exact flags).",
+                )
+            } else {
+                Some(
+                    "run 'trace-index --help', 'trace-index <noun> --help', or 'trace-index <noun> <verb> --help' to inspect exact subcommands and flags.",
+                )
+            }
+        }
+        _ => None,
+    }
 }
 
 fn run_docs(command: DocsCommand) -> Result<()> {
