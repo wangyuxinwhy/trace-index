@@ -2,6 +2,13 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.4.3] - 2026-11-21
+
+### Added
+
+- Add Format-3-compatible partial indexes on `tool.output` `call_item_id` links and tool-call `tool_name` + `occurred_at` to accelerate tool-call-to-output joins and tool-name queries. Storage Format 3 is unchanged; existing Format 3 indexes gain both indexes automatically on the next synchronization.
+- Add contract-grounded error recovery hints for all `fts5:` errors on `item_search`, missing SQLite tables or columns (`schema list` / `schema get <RELATION> --compact`), and unknown CLI flags or subcommands (while preserving empty stdout and exit codes).
+
 ## [0.4.2] - 2026-11-21
 
 ### Added
