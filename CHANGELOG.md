@@ -2,6 +2,18 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.0] - 2026-11-22
+
+### Added
+
+- Storage Format 4 adds the `item_search_terms` FTS5 access relation and `search_query()` SQL helper alongside `item_search`. Pre-tokenizing Semantic text into CJK bigrams, lowercased words, and split code identifiers (`camelCase`, `PascalCase`, `snake_case`, preserving `_`) enables 2+ character CJK recall, exact-adjacency 3+ character CJK phrase queries, multi-word mixed queries, and native `bm25(item_search_terms)` ranking while keeping `item_search(trigram_query('...'))` for 3+ character literal substrings and symbols.
+- Compress deduplicated Semantic Blobs (`>= 128` bytes when smaller) with per-blob `zstd` in Storage Format 4 and decode them transparently through the public `blobs` view, and store `item_records` `WITHOUT ROWID`.
+- Unwrap common POSIX command wrappers (`nice`, `timeout`, `env`, `nohup`, `command`) into inner `ShellStatement.invocations` and extract bounded static nested `sh`/`bash`/`zsh -c` scripts into additional `ShellFragment` entries while preserving outer invocations.
+
+### Changed
+
+- Format 2 and Format 3 indexes remain readable in place without reindexing, with Format-aware query error hints. Create a separate Format 4 database with `--db` and synchronize your available Sources for new writes. Keep existing Format 2 or Format 3 databases that contain history whose original Sources are no longer available.
+
 ## [0.4.3] - 2026-11-21
 
 ### Added
