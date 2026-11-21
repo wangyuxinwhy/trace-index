@@ -264,7 +264,12 @@ impl Step<'_> {
                     .filter(|_| name == "run_command")
                     .and_then(|args| string(args, "Cwd"))
                     .map(str::to_owned),
-                args: args.map(|args| BoundedText::bounded(&args.to_string(), self.max_text_bytes)),
+                args: args.and_then(|args| {
+                    crate::adapters::projection::complete_arguments(
+                        &args.to_string(),
+                        self.max_text_bytes,
+                    )
+                }),
                 syntax: None,
             },
         )

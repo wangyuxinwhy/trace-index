@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::adapters::runtime::antigravity;
 
 pub(crate) const READ_BUFFER_BYTES: usize = 64 * 1024;
+const DECOMPRESS_BUFFER_BYTES: usize = 256 * 1024;
 
 pub(crate) fn discover_jsonl_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = BTreeSet::new();
@@ -122,8 +123,21 @@ pub(crate) fn open_for_indexing(path: &Path) -> Result<File> {
     }
     let mut decoded = tempfile::tempfile().context("failed to create a decompression snapshot")?;
     let mut archive = zstd::stream::read::Decoder::new(file)?;
-    std::io::copy(&mut archive, &mut decoded)
-        .with_context(|| format!("failed to decompress {}", path.display()))?;
+    let mut buffer = vec![0_u8; DECOMPRESS_BUFFER_BYTES].into_boxed_slice();
+    loop {
+        let count = archive
+            .read(&mut buffer)
+            .with_context(|| format!("failed to decompress {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        decoded.write_all(&buffer[..count]).with_context(|| {
+            format!(
+                "failed to write decompression snapshot for {}",
+                path.display()
+            )
+        })?;
+    }
     decoded.rewind()?;
     Ok(decoded)
 }
@@ -152,57 +166,79 @@ pub(crate) fn read_at(file: File, path: &Path, offset: u64) -> Result<Option<Box
 
 #[derive(Debug)]
 pub(crate) enum RecordRead {
-    Complete(BoundedRecord),
+    Complete(Option<Vec<u8>>),
     Incomplete,
     End,
-}
-
-#[derive(Debug)]
-pub(crate) struct BoundedRecord {
-    pub bytes: Option<Vec<u8>>,
-    pub byte_length: u64,
-    pub consumed_bytes: u64,
-    pub raw_hash: String,
 }
 
 pub(crate) fn read_bounded_record(
     reader: &mut impl BufRead,
     max_record_bytes: usize,
 ) -> Result<RecordRead> {
-    read_bounded_record_hashed(reader, max_record_bytes, None)
+    let mut scratch = Vec::new();
+    match read_bounded_record_into(reader, max_record_bytes, None, false, &mut scratch)? {
+        RecordReadInto::Complete { oversized, .. } => {
+            Ok(RecordRead::Complete((!oversized).then_some(scratch)))
+        }
+        RecordReadInto::Incomplete => Ok(RecordRead::Incomplete),
+        RecordReadInto::End => Ok(RecordRead::End),
+    }
 }
 
-pub(crate) fn read_bounded_record_hashed(
+#[derive(Debug)]
+pub(crate) enum RecordReadInto {
+    Complete {
+        oversized: bool,
+        byte_length: u64,
+        consumed_bytes: u64,
+        raw_hash: String,
+    },
+    Incomplete,
+    End,
+}
+
+/// Reads one newline-terminated Record into a caller-reused byte buffer.
+///
+/// Skipping `compute_record_hash` avoids hashing already-persisted prefix lines
+/// during an incremental append where only the projection and whole-prefix
+/// fingerprint are needed.
+pub(crate) fn read_bounded_record_into(
     reader: &mut impl BufRead,
     max_record_bytes: usize,
     mut prefix_hasher: Option<&mut blake3::Hasher>,
-) -> Result<RecordRead> {
-    let mut bytes = Some(Vec::new());
+    compute_record_hash: bool,
+    buffer: &mut Vec<u8>,
+) -> Result<RecordReadInto> {
+    buffer.clear();
+    let mut oversized = false;
     let mut byte_length = 0_u64;
     let mut consumed_bytes = 0_u64;
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = compute_record_hash.then(blake3::Hasher::new);
 
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return if consumed_bytes == 0 {
-                Ok(RecordRead::End)
+                Ok(RecordReadInto::End)
             } else {
-                Ok(RecordRead::Incomplete)
+                Ok(RecordReadInto::Incomplete)
             };
         }
 
         let newline = available.iter().position(|byte| *byte == b'\n');
         let data_len = newline.unwrap_or(available.len());
         let data = &available[..data_len];
-        hasher.update(data);
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(data);
+        }
         byte_length += u64::try_from(data.len())?;
 
-        if let Some(buffer) = &mut bytes {
+        if !oversized {
             if buffer.len().saturating_add(data.len()) <= max_record_bytes {
                 buffer.extend_from_slice(data);
             } else {
-                bytes = None;
+                buffer.clear();
+                oversized = true;
             }
         }
 
@@ -214,12 +250,15 @@ pub(crate) fn read_bounded_record_hashed(
         consumed_bytes += u64::try_from(consume)?;
 
         if newline.is_some() {
-            return Ok(RecordRead::Complete(BoundedRecord {
-                bytes,
+            let raw_hash = hasher
+                .map(|hasher| hasher.finalize().to_hex().to_string())
+                .unwrap_or_default();
+            return Ok(RecordReadInto::Complete {
+                oversized,
                 byte_length,
                 consumed_bytes,
-                raw_hash: hasher.finalize().to_hex().to_string(),
-            }));
+                raw_hash,
+            });
         }
     }
 }
@@ -233,9 +272,16 @@ pub(crate) fn prefix_hasher(length: u64) -> blake3::Hasher {
 pub(crate) fn fingerprint_prefix(file: &mut File, length: u64) -> Result<String> {
     let mut hash = prefix_hasher(length);
     file.seek(SeekFrom::Start(0))?;
-    let mut prefix = BufReader::with_capacity(READ_BUFFER_BYTES, file.take(length));
-    if std::io::copy(&mut prefix, &mut hash)? != length {
-        bail!("file ended while fingerprinting an indexed prefix");
+    let mut remaining = length;
+    let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64))?;
+        let count = file.read(&mut buffer[..want])?;
+        if count == 0 {
+            bail!("file ended while fingerprinting an indexed prefix");
+        }
+        hash.update(&buffer[..count]);
+        remaining -= u64::try_from(count)?;
     }
     Ok(hash.finalize().to_hex().to_string())
 }

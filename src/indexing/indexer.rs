@@ -23,9 +23,9 @@ use crate::adapters::adapter::{AdapterKind, Projector, detect_at, record_facts};
 use crate::adapters::projection::{RecordFacts, SessionProjection};
 use crate::adapters::runtime::antigravity;
 use crate::ingest::source::{
-    READ_BUFFER_BYTES, RecordRead, alternate_encoding, complete_prefix_length,
+    READ_BUFFER_BYTES, RecordRead, RecordReadInto, alternate_encoding, complete_prefix_length,
     discover_jsonl_files, fingerprint_prefix, is_compressed, modified_ns, open_for_indexing,
-    prefix_hasher, read_bounded_record, read_bounded_record_hashed,
+    prefix_hasher, read_bounded_record, read_bounded_record_into,
 };
 use crate::interface::output::{IndexMetrics, IndexReport, SourceIndexResult};
 use crate::shell::syntax;
@@ -129,20 +129,20 @@ fn index_paths_internal(
     };
 
     let mut adapters = BTreeSet::new();
-    let mut blobs = BlobCache::for_connection(store.connection())?;
+    let mut scratch = SyncScratch::new(store)?;
     for file in &files {
         // One unreadable file must not decide the fate of the other 1,528. A
         // stray or truncated JSONL under a trace root is a local fact; aborting
         // here left every later file unindexed while the database still looked
         // complete. Record-level tolerance already exists one layer down.
-        blobs.begin_source();
-        let result = match index_source(store, file, options, &mut blobs, telemetry, progress) {
+        scratch.blobs.begin_source();
+        let result = match index_source(store, file, options, &mut scratch, telemetry, progress) {
             Ok(result) => {
-                blobs.commit_source();
+                scratch.blobs.commit_source();
                 result
             }
             Err(error) => {
-                blobs.rollback_source();
+                scratch.blobs.rollback_source();
                 let action = if is_unrecognized_source(&error) {
                     report.skipped_files += 1;
                     "skipped"
@@ -186,6 +186,23 @@ fn index_paths_internal(
     Ok(report)
 }
 
+/// Run-scoped reusable state shared across Sources in one sync.
+struct SyncScratch {
+    blobs: BlobCache,
+    shell_parser: syntax::ShellParser,
+    record_buffer: Vec<u8>,
+}
+
+impl SyncScratch {
+    fn new(store: &Store) -> Result<Self> {
+        Ok(Self {
+            blobs: BlobCache::for_connection(store.connection())?,
+            shell_parser: syntax::ShellParser::new(),
+            record_buffer: Vec::with_capacity(READ_BUFFER_BYTES),
+        })
+    }
+}
+
 /// Per-source scan outcome, kept separate from the reporting struct so the
 /// scan loop stays readable.
 #[derive(Default)]
@@ -204,7 +221,7 @@ fn index_source(
     store: &mut Store,
     path: &Path,
     options: &IndexOptions,
-    blobs: &mut BlobCache,
+    scratch: &mut SyncScratch,
     telemetry: &mut IndexTelemetry,
     progress: &mut dyn ProgressObserver,
 ) -> Result<SourceIndexResult> {
@@ -357,35 +374,63 @@ fn index_source(
     let mut seq = 0_u64;
 
     loop {
+        let persist_record = seq >= resume_line;
         let read_started = Instant::now();
-        let read =
-            read_bounded_record_hashed(&mut reader, options.max_record_bytes, Some(&mut hasher))?;
+        let read = read_bounded_record_into(
+            &mut reader,
+            options.max_record_bytes,
+            Some(&mut hasher),
+            persist_record,
+            &mut scratch.record_buffer,
+        )?;
         telemetry.record_duration(IndexPhase::Read, read_started.elapsed());
-        let record = match read {
-            RecordRead::Complete(record) => record,
-            RecordRead::Incomplete | RecordRead::End => break,
+        let (oversized, byte_length, consumed_bytes, raw_hash) = match read {
+            RecordReadInto::Complete {
+                oversized,
+                byte_length,
+                consumed_bytes,
+                raw_hash,
+            } => (oversized, byte_length, consumed_bytes, raw_hash),
+            RecordReadInto::Incomplete | RecordReadInto::End => break,
         };
 
         let project_started = Instant::now();
-        let parsed = record.bytes.as_deref().map(serde_json::from_slice::<Value>);
-        let facts = match &parsed {
-            None => {
-                counts.oversized += 1;
-                RecordFacts::oversized()
+        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(&scratch.record_buffer));
+        let facts = if persist_record {
+            Some(match &parsed {
+                None => {
+                    counts.oversized += 1;
+                    RecordFacts::oversized()
+                }
+                Some(Err(error)) => {
+                    counts.malformed += 1;
+                    RecordFacts::malformed(error.to_string())
+                }
+                Some(Ok(value)) => record_facts(adapter, value),
+            })
+        } else {
+            match &parsed {
+                None => counts.oversized += 1,
+                Some(Err(_)) => counts.malformed += 1,
+                Some(Ok(_)) => {}
             }
-            Some(Err(error)) => {
-                counts.malformed += 1;
-                RecordFacts::malformed(error.to_string())
-            }
-            Some(Ok(value)) => record_facts(adapter, value),
+            None
         };
         telemetry.record_duration(IndexPhase::Project, project_started.elapsed());
 
         let persist_started = Instant::now();
-        if seq >= resume_line {
+        if let Some(facts) = facts.as_ref() {
             let started = Instant::now();
-            let record_id =
-                insert_record(&transaction, source_id, seq, byte_offset, &record, &facts)?;
+            let record_id = insert_record(
+                &transaction,
+                source_id,
+                seq,
+                byte_offset,
+                byte_length,
+                &raw_hash,
+                oversized,
+                facts,
+            )?;
             telemetry.record_persist(PersistTable::TraceRecords, started.elapsed());
             record_ids.insert(seq, record_id);
             counts.new_records += 1;
@@ -401,8 +446,8 @@ fn index_source(
             projected_sessions.extend(projector.drain_completed());
         }
 
-        telemetry.add_processed_bytes(record.consumed_bytes);
-        byte_offset += record.consumed_bytes;
+        telemetry.add_processed_bytes(consumed_bytes);
+        byte_offset += consumed_bytes;
         seq += 1;
         if seq.is_multiple_of(2048) {
             progress.update(
@@ -427,7 +472,9 @@ fn index_source(
             canonical.display(),
         ))));
     }
-    syntax::parse_declared_commands(&mut session, options.max_text_bytes);
+    scratch
+        .shell_parser
+        .parse_declared_commands(&mut session, options.max_text_bytes);
     if let Some(previous) = replaced_transcript {
         // Replace the old projection only after establishing the new Source.
         // Failure rolls both operations back together.
@@ -439,7 +486,7 @@ fn index_source(
         source_id,
         &session,
         &record_ids,
-        blobs,
+        &mut scratch.blobs,
         telemetry,
     )?;
 
@@ -658,12 +705,18 @@ fn load_record_ids(transaction: &Transaction<'_>, source_id: i64) -> Result<Hash
     Ok(ids)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "physical Record columns map one-to-one to the insert statement"
+)]
 fn insert_record(
     transaction: &Transaction<'_>,
     source_id: i64,
     seq: u64,
     byte_offset: u64,
-    record: &crate::ingest::source::BoundedRecord,
+    byte_length: u64,
+    raw_hash: &str,
+    oversized: bool,
     facts: &RecordFacts,
 ) -> Result<i64> {
     transaction
@@ -678,13 +731,13 @@ fn insert_record(
             source_id,
             to_sql_i64(seq, "record sequence")?,
             to_sql_i64(byte_offset, "record byte offset")?,
-            to_sql_i64(record.byte_length, "record byte length")?,
-            record.raw_hash,
+            to_sql_i64(byte_length, "record byte length")?,
+            raw_hash,
             facts.ts_ms,
             facts.native_type,
             facts.parse_status,
             facts.parse_error,
-            i64::from(record.bytes.is_none()),
+            i64::from(oversized),
         ])
         .context("failed to store record")?;
     Ok(transaction.last_insert_rowid())
@@ -718,8 +771,8 @@ fn detect_adapter(file: &mut File, path: &Path, max_record_bytes: usize) -> Resu
     // simply could not read. Only the format verdict decides "not ours".
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
     match read_bounded_record(&mut reader, max_record_bytes)? {
-        RecordRead::Complete(record) => {
-            let bytes = record.bytes.as_deref().unwrap_or_default();
+        RecordRead::Complete(bytes) => {
+            let bytes = bytes.as_deref().unwrap_or_default();
             detect_at(bytes, Some(path)).map_err(|error| {
                 anyhow::Error::new(UnrecognizedSource(format!("{}: {error:#}", path.display())))
             })

@@ -109,6 +109,7 @@ impl Store {
                  PRAGMA foreign_keys = ON;
                  PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
+                 PRAGMA temp_store = MEMORY;
                  PRAGMA cache_size = -{PAGE_CACHE_KIB};"
             ))
             .context("failed to configure SQLite")?;
