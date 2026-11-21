@@ -34,6 +34,31 @@ jobs:
       - name: Verify crates.io package
         run: cargo package --locked
 
+  linux-musl:
+    name: Linux static release binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build static musl binary and test installer
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          ./scripts/test-installer.sh --target x86_64-unknown-linux-musl
+          binary="target/x86_64-unknown-linux-musl/release/trace-index"
+          if readelf -d "$binary" | grep -q '(NEEDED)'; then
+            readelf -d "$binary" >&2
+            echo "musl release binary unexpectedly requires shared libraries" >&2
+            exit 1
+          fi
+          "$binary" docs list >/dev/null
+
   docs:
     name: Public documentation
     runs-on: ubuntu-latest

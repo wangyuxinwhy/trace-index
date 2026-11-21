@@ -14,6 +14,7 @@ Install a prebuilt trace-index binary without Cargo.
 Options:
   --version VERSION   Version to install (default: latest)
   --bin-dir DIR       Destination directory (default: ~/.local/bin)
+  --target TARGET     Override the detected release target triple
   --base-url URL      GitHub Releases root; overrides the published default
   --dry-run           Print the resolved download without changing anything
   --allow-http        Permit plain HTTP (intended only for local testing)
@@ -59,6 +60,7 @@ fetch() {
 VERSION="latest"
 BASE_URL="${TRACE_INDEX_DIST_BASE_URL:-$TRACE_INDEX_DIST_BASE_URL_DEFAULT}"
 BIN_DIR="${TRACE_INDEX_BIN_DIR:-${HOME:?HOME is not set}/.local/bin}"
+TARGET="${TRACE_INDEX_TARGET:-}"
 DRY_RUN=0
 ALLOW_HTTP=0
 
@@ -72,6 +74,11 @@ while [ "$#" -gt 0 ]; do
         --bin-dir)
             [ "$#" -ge 2 ] || fail "--bin-dir requires a value"
             BIN_DIR="$2"
+            shift 2
+            ;;
+        --target)
+            [ "$#" -ge 2 ] || fail "--target requires a value"
+            TARGET="$2"
             shift 2
             ;;
         --base-url)
@@ -111,13 +118,19 @@ case "$BIN_DIR" in
     *) fail "--bin-dir must be an absolute path" ;;
 esac
 
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-case "$OS:$ARCH" in
-    Darwin:arm64|Darwin:aarch64) TARGET="aarch64-apple-darwin" ;;
-    Darwin:x86_64) TARGET="x86_64-apple-darwin" ;;
-    Linux:x86_64|Linux:amd64) TARGET="x86_64-unknown-linux-gnu" ;;
-    *) fail "unsupported platform: $OS $ARCH" ;;
+if [ -z "$TARGET" ]; then
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+    case "$OS:$ARCH" in
+        Darwin:arm64|Darwin:aarch64) TARGET="aarch64-apple-darwin" ;;
+        Darwin:x86_64) TARGET="x86_64-apple-darwin" ;;
+        Linux:x86_64|Linux:amd64) TARGET="x86_64-unknown-linux-musl" ;;
+        *) fail "unsupported platform: $OS $ARCH" ;;
+    esac
+fi
+
+case "$TARGET" in
+    *[!A-Za-z0-9._-]*|'') fail "invalid target: $TARGET" ;;
 esac
 
 if [ "$DRY_RUN" -eq 1 ]; then

@@ -24,8 +24,38 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+TARGET=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --target)
+            [ "$#" -ge 2 ] || fail "--target requires a value"
+            TARGET="$2"
+            shift 2
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+if [ -z "$TARGET" ]; then
+    TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+fi
 [ -n "$TARGET" ] || fail "could not determine the host target"
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+case "$OS:$ARCH" in
+    Darwin:arm64|Darwin:aarch64) DEFAULT_INSTALL_TARGET="aarch64-apple-darwin" ;;
+    Darwin:x86_64) DEFAULT_INSTALL_TARGET="x86_64-apple-darwin" ;;
+    Linux:x86_64|Linux:amd64) DEFAULT_INSTALL_TARGET="x86_64-unknown-linux-musl" ;;
+    *) DEFAULT_INSTALL_TARGET="$TARGET" ;;
+esac
+
+INSTALLER_TARGET_ARGS=()
+if [ "$TARGET" != "$DEFAULT_INSTALL_TARGET" ]; then
+    INSTALLER_TARGET_ARGS=(--target "$TARGET")
+fi
 
 if "$REPO_ROOT/scripts/build-release-artifact.sh" \
     --target "$TARGET" --version 999.0.0 --output-root "$WORK/tag-mismatch" \
@@ -103,13 +133,22 @@ curl --fail --silent --show-error \
 chmod +x "$WORK/downloaded-install.sh"
 
 DRY_RUN_OUTPUT="$("$WORK/downloaded-install.sh" --allow-http \
+    ${INSTALLER_TARGET_ARGS[@]+"${INSTALLER_TARGET_ARGS[@]}"} \
     --version "$VERSION" --bin-dir "$WORK/dry-run-bin" --dry-run)"
 printf '%s\n' "$DRY_RUN_OUTPUT" | grep -q \
     "releases/download/v$VERSION/trace-index-v$VERSION-$TARGET.tar.gz" ||
     fail "dry-run did not resolve the expected GitHub Release asset"
 [ ! -e "$WORK/dry-run-bin" ] || fail "dry-run changed the filesystem"
 
+OVERRIDE_DRY_RUN="$("$WORK/downloaded-install.sh" --allow-http \
+    --target x86_64-unknown-linux-gnu \
+    --version "$VERSION" --bin-dir "$WORK/dry-run-bin" --dry-run)"
+printf '%s\n' "$OVERRIDE_DRY_RUN" | grep -q \
+    "releases/download/v$VERSION/trace-index-v$VERSION-x86_64-unknown-linux-gnu.tar.gz" ||
+    fail "dry-run did not honor --target override"
+
 INSTALL_OUTPUT="$("$WORK/downloaded-install.sh" --allow-http \
+    ${INSTALLER_TARGET_ARGS[@]+"${INSTALLER_TARGET_ARGS[@]}"} \
     --bin-dir "$WORK/bin")"
 printf '%s\n' "$INSTALL_OUTPUT" | grep -q "installed trace-index $VERSION" ||
     fail "installer did not report success"
@@ -119,7 +158,7 @@ printf '%s\n' "$INSTALL_OUTPUT" | grep -q "installed trace-index $VERSION" ||
 
 CHECKSUM="$WORK/server/releases/download/v$VERSION/trace-index-v$VERSION-$TARGET.tar.gz.sha256"
 printf '%064d  trace-index-v%s-%s.tar.gz\n' 0 "$VERSION" "$TARGET" > "$CHECKSUM"
-if "$WORK/downloaded-install.sh" --allow-http --bin-dir "$WORK/corrupt-bin" \
+if "$WORK/downloaded-install.sh" --allow-http ${INSTALLER_TARGET_ARGS[@]+"${INSTALLER_TARGET_ARGS[@]}"} --bin-dir "$WORK/corrupt-bin" \
     >"$WORK/corrupt.stdout" 2>"$WORK/corrupt.stderr"; then
     fail "installer accepted a corrupt checksum"
 fi
@@ -135,6 +174,7 @@ mkdir -p "$WORK/release-fixture"
 tar -xzf "$ARCHIVE" -C "$WORK/release-fixture" trace-index
 for release_target in \
     x86_64-unknown-linux-gnu \
+    x86_64-unknown-linux-musl \
     x86_64-apple-darwin \
     aarch64-apple-darwin; do
     "$REPO_ROOT/scripts/package-release.sh" \
@@ -148,6 +188,7 @@ done
     --dist-root "$WORK/release-dist" \
     --version "$VERSION" \
     --require-target x86_64-unknown-linux-gnu \
+    --require-target x86_64-unknown-linux-musl \
     --require-target x86_64-apple-darwin \
     --require-target aarch64-apple-darwin >/dev/null
 

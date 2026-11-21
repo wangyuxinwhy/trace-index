@@ -27,6 +27,7 @@ Publishing source, creating a Git tag, publishing a crate, publishing a GitHub R
 Push an annotated `vVERSION` tag only after the release candidate passes. The Release workflow verifies that the tag matches `Cargo.toml`, builds these native artifacts, checks their reported version, and creates a draft GitHub Release:
 
 ```text
+trace-index-vVERSION-x86_64-unknown-linux-musl.tar.gz
 trace-index-vVERSION-x86_64-unknown-linux-gnu.tar.gz
 trace-index-vVERSION-x86_64-apple-darwin.tar.gz
 trace-index-vVERSION-aarch64-apple-darwin.tar.gz
