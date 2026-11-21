@@ -2,6 +2,21 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.4.2] - 2026-11-21
+
+### Added
+
+- Publish a statically linked `x86_64-unknown-linux-musl` release archive and select it by default on x86-64 Linux in `install.sh` so prebuilt binaries run across older glibc distributions (such as Debian 10 / GLIBC 2.28) as well as musl environments. Add `--target` to `install.sh`; `x86_64-unknown-linux-gnu` remains published.
+- Add covering indexes on Items by `(semantic_role, occurred_at)` and `(occurred_at)` to accelerate role- and time-ordered queries. Storage Format 3 is unchanged; existing Format 3 indexes gain the new indexes automatically on the next synchronization.
+- Return a targeted hint pointing to `item_search(trigram_query('...'))` when an FTS5 phrase query is rejected by the `detail=none` trigram index.
+
+### Changed
+
+- Accelerate `index status` with a single read-only WAL snapshot and indexed role aggregation, and reduce read-only open and schema-validation overhead.
+- Speed up indexing persistence and Blob interning by serializing `Semantic<BlobRef>` directly without intermediate JSON trees, linking `tool.output` items inline, skipping no-op Loop position rewrites, and reducing redundant Blob lookups on cold builds and appends.
+- Lower indexing peak memory and I/O overhead by removing duplicate text previews and unused fields in Runtime adapters, reusing one shell parser and record buffer across synchronization, skipping pre-resume Record hashing on incremental appends, buffering `.zst` decompression at 256 KiB, and keeping temporary SQLite B-trees in memory on write connections.
+- Unify and tighten RFC 3339 timestamp validation across all Runtime adapters.
+
 ## [0.4.1] - 2026-11-21
 
 ### Added
