@@ -70,7 +70,6 @@ pub(crate) struct SyntaxProjection {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentProjection {
-    pub parent: Option<usize>,
     pub content: BoundedText,
     pub parse_status: &'static str,
 }

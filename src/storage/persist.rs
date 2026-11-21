@@ -1011,14 +1011,13 @@ fn shell_fragments(syntax: Option<&SyntaxProjection>) -> Result<Vec<ShellFragmen
     };
     let mut fragments = Vec::new();
     for (fragment_index, fragment) in syntax.fragments.iter().enumerate() {
-        if fragment.parent.is_some() {
-            continue;
-        }
         let mut statements = Vec::new();
+        let mut fragment_base = None;
         for (statement_index, statement) in syntax.statements.iter().enumerate() {
             if statement.fragment != fragment_index {
                 continue;
             }
+            let base = *fragment_base.get_or_insert(statement_index);
             let invocations = syntax
                 .invocations
                 .iter()
@@ -1049,6 +1048,7 @@ fn shell_fragments(syntax: Option<&SyntaxProjection>) -> Result<Vec<ShellFragmen
                 },
                 parent_position: statement
                     .parent
+                    .and_then(|value| value.checked_sub(base))
                     .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
                 connector: statement.shell.as_ref().and_then(|value| {
                     (value.connector != "first").then(|| value.connector.to_owned())

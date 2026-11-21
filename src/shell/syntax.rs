@@ -39,13 +39,15 @@ pub(crate) mod parse_status {
     pub(crate) const UNSUPPORTED: &str = "unsupported";
 }
 
-/// Per-fragment bound. When it fires, the Fragment is marked partial so a
-/// bounded parse cannot be mistaken for complete structure.
-///
-/// Only one bound exists while a fragment is a whole command: nesting adds a
-/// depth and a fragment-count bound with it, and they arrive together with the
-/// code that can exceed them.
+/// Per-fragment statement bound. When it fires, the Fragment is marked partial
+/// so a bounded parse cannot be mistaken for complete structure.
 const MAX_STATEMENTS: usize = 512;
+
+/// Maximum nested shell fragments (including the root) extracted from one tool call.
+const MAX_FRAGMENTS: usize = 16;
+
+/// Maximum nesting depth for wrapper unwrapping and static `sh`/`bash`/`zsh -c` fragments.
+const MAX_NESTING_DEPTH: usize = 4;
 
 /// Statement kinds that carry a fact worth a row.
 fn is_semantic_statement(kind: &str) -> bool {
@@ -162,6 +164,16 @@ impl ShellParser {
     }
 
     fn extract_shell(&mut self, text: &str, max_text_bytes: usize, out: &mut SyntaxProjection) {
+        self.parse_shell_fragment(text, 0, max_text_bytes, out);
+    }
+
+    fn parse_shell_fragment(
+        &mut self,
+        text: &str,
+        depth: usize,
+        max_text_bytes: usize,
+        out: &mut SyntaxProjection,
+    ) {
         let Some(parser) = self.bash.as_mut() else {
             out.fragments.push(root_fragment(
                 text,
@@ -183,9 +195,17 @@ impl ShellParser {
         } else {
             parse_status::PARSED
         };
+        let fragment_index = out.fragments.len();
         out.fragments
             .push(root_fragment(text, max_text_bytes, status));
-        collect(tree.root_node(), text, 0, out);
+        let nested_scripts = collect(tree.root_node(), text, fragment_index, out);
+        for script in nested_scripts {
+            if depth >= MAX_NESTING_DEPTH || out.fragments.len() >= MAX_FRAGMENTS {
+                out.fragments[fragment_index].parse_status = parse_status::PARTIAL;
+                break;
+            }
+            self.parse_shell_fragment(&script, depth + 1, max_text_bytes, out);
+        }
     }
 }
 
@@ -196,14 +216,15 @@ pub(crate) fn extract(text: &str, lang: &'static str, max_text_bytes: usize) -> 
 
 fn root_fragment(text: &str, max_text_bytes: usize, status: &'static str) -> FragmentProjection {
     FragmentProjection {
-        parent: None,
         content: BoundedText::bounded(text, max_text_bytes),
         parse_status: status,
     }
 }
 
 /// Walk one fragment's tree, emitting statements and their per-kind detail.
-fn collect(root: Node, text: &str, fragment: usize, out: &mut SyntaxProjection) {
+/// Returns any statically quoted inner shell scripts (`sh`/`bash`/`zsh -c ...`)
+/// discovered inside this fragment.
+fn collect(root: Node, text: &str, fragment: usize, out: &mut SyntaxProjection) -> Vec<String> {
     let mut found: Vec<Node> = Vec::new();
     let mut cursor = root.walk();
     let mut stack = vec![root];
@@ -246,13 +267,15 @@ fn collect(root: Node, text: &str, fragment: usize, out: &mut SyntaxProjection) 
         });
     }
 
+    let mut nested_scripts = Vec::new();
     for (index, node) in found.iter().enumerate() {
         let statement = base + index;
         if node.kind() == "command" {
-            emit_command(*node, text, statement, out);
+            emit_command(*node, text, statement, out, &mut nested_scripts);
         }
         emit_redirects(*node, text, statement, out);
     }
+    nested_scripts
 }
 
 /// This statement's place in the pipeline that contains it, if any.
@@ -483,7 +506,13 @@ fn normalize_program(raw: &str) -> String {
     }
 }
 
-fn emit_command(node: Node, text: &str, statement: usize, out: &mut SyntaxProjection) {
+fn emit_command(
+    node: Node,
+    text: &str,
+    statement: usize,
+    out: &mut SyntaxProjection,
+    nested_scripts: &mut Vec<String>,
+) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
@@ -491,21 +520,264 @@ fn emit_command(node: Node, text: &str, statement: usize, out: &mut SyntaxProjec
     let basis = basis_of(name_node, text);
     // Normalizing a word the shell has not finished with would invent a value:
     // taking the basename of `./bin/*` yields `*`, which names nothing.
-    let program = if basis == "dynamic" {
+    let mut current_program = if basis == "dynamic" {
         raw.to_owned()
     } else {
         normalize_program(raw)
     };
     let mut cursor = node.walk();
-    let argv: Vec<String> = node
+    let arg_nodes: Vec<Node> = node
         .children_by_field_name("argument", &mut cursor)
-        .map(|argument| text_of(argument, text).to_owned())
+        .collect();
+    let argv: Vec<String> = arg_nodes
+        .iter()
+        .map(|argument| text_of(*argument, text).to_owned())
         .collect();
     out.invocations.push(InvocationProjection {
         statement,
-        program,
+        program: current_program.clone(),
         argv,
     });
+
+    if basis == "dynamic" {
+        return;
+    }
+
+    let mut slice = arg_nodes.as_slice();
+    for _ in 0..MAX_NESTING_DEPTH {
+        if let Some(script) = static_subshell_script(&current_program, slice, text) {
+            nested_scripts.push(script);
+            break;
+        }
+        let Some(next_idx) = unwrap_command_index(&current_program, slice, text) else {
+            break;
+        };
+        let cmd_node = slice[next_idx];
+        let cmd_raw = text_of(cmd_node, text);
+        let cmd_basis = basis_of(cmd_node, text);
+        let next_program = if cmd_basis == "dynamic" {
+            cmd_raw.to_owned()
+        } else {
+            normalize_program(cmd_raw)
+        };
+        let next_slice = &slice[next_idx + 1..];
+        out.invocations.push(InvocationProjection {
+            statement,
+            program: next_program.clone(),
+            argv: next_slice
+                .iter()
+                .map(|argument| text_of(*argument, text).to_owned())
+                .collect(),
+        });
+        if cmd_basis == "dynamic" {
+            break;
+        }
+        current_program = next_program;
+        slice = next_slice;
+    }
+}
+
+/// Returns the argument index of the wrapped command for well-defined POSIX
+/// command wrappers (`nice`, `timeout`, `env`, `nohup`, `command`).
+fn unwrap_command_index(program: &str, args: &[Node], text: &str) -> Option<usize> {
+    match program {
+        "nice" => unwrap_nice(args, text),
+        "timeout" => unwrap_timeout(args, text),
+        "env" => unwrap_env(args, text),
+        "nohup" => unwrap_nohup(args, text),
+        "command" => unwrap_command(args, text),
+        _ => None,
+    }
+}
+
+fn unwrap_nice(args: &[Node], text: &str) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let word = static_word(args[idx], text)?;
+        if word == "--" {
+            idx += 1;
+            break;
+        }
+        if word == "-n" || word == "--adjustment" {
+            idx += 2;
+            continue;
+        }
+        if word.starts_with("-n")
+            || word.starts_with("--adjustment=")
+            || (word.starts_with('-')
+                && word.len() > 1
+                && word[1..].bytes().all(|b| b.is_ascii_digit()))
+        {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        break;
+    }
+    (idx < args.len()).then_some(idx)
+}
+
+fn unwrap_timeout(args: &[Node], text: &str) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let word = static_word(args[idx], text)?;
+        if word == "--" {
+            idx += 1;
+            break;
+        }
+        if matches!(word, "-s" | "--signal" | "-k" | "--kill-after") {
+            idx += 2;
+            continue;
+        }
+        if word.starts_with("--signal=")
+            || word.starts_with("--kill-after=")
+            || matches!(
+                word,
+                "--preserve-status" | "--foreground" | "-v" | "--verbose"
+            )
+        {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        break;
+    }
+    let cmd_idx = idx + 1;
+    (cmd_idx < args.len()).then_some(cmd_idx)
+}
+
+fn unwrap_env(args: &[Node], text: &str) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let word = static_word(args[idx], text)?;
+        if word == "--" {
+            idx += 1;
+            break;
+        }
+        if matches!(word, "-u" | "--unset" | "-C" | "--chdir") {
+            idx += 2;
+            continue;
+        }
+        if word == "-S" || word.starts_with("-S") || word.starts_with("--split-string") {
+            return None;
+        }
+        if word == "-"
+            || matches!(
+                word,
+                "-i" | "--ignore-environment" | "-0" | "--null" | "-v" | "--debug"
+            )
+            || word.starts_with("--unset=")
+            || word.starts_with("--chdir=")
+        {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        if is_env_assignment(word) {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    (idx < args.len()).then_some(idx)
+}
+
+fn unwrap_nohup(args: &[Node], text: &str) -> Option<usize> {
+    let first = static_word(*args.first()?, text)?;
+    if first == "--" {
+        (args.len() > 1).then_some(1)
+    } else if first.starts_with('-') {
+        None
+    } else {
+        Some(0)
+    }
+}
+
+fn unwrap_command(args: &[Node], text: &str) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let word = static_word(args[idx], text)?;
+        if word == "--" {
+            idx += 1;
+            break;
+        }
+        if word == "-p" {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        break;
+    }
+    (idx < args.len()).then_some(idx)
+}
+
+/// Extracts a statically written inner script from `sh`/`bash`/`zsh -c <script>`.
+fn static_subshell_script(program: &str, args: &[Node], text: &str) -> Option<String> {
+    if !matches!(program, "sh" | "bash" | "zsh") {
+        return None;
+    }
+    let mut idx = 0;
+    let mut saw_c = false;
+    while idx < args.len() {
+        let word = static_word(args[idx], text)?;
+        if word == "--" {
+            idx += 1;
+            break;
+        }
+        if matches!(word, "-o" | "+o") {
+            idx += 2;
+            continue;
+        }
+        if word.starts_with("--") {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') && word.len() > 1 {
+            let flags = &word[1..];
+            if flags.bytes().all(|b| b.is_ascii_alphabetic()) {
+                if flags.contains('c') {
+                    saw_c = true;
+                }
+                idx += 1;
+                continue;
+            }
+            return None;
+        }
+        break;
+    }
+    if !saw_c || idx >= args.len() {
+        return None;
+    }
+    let script_node = args[idx];
+    let script_basis = basis_of(script_node, text);
+    if script_basis == "dynamic" {
+        return None;
+    }
+    let script = strip_quotes(text_of(script_node, text));
+    (!script.trim().is_empty()).then(|| script.to_owned())
+}
+
+fn static_word<'a>(node: Node, text: &'a str) -> Option<&'a str> {
+    (basis_of(node, text) != "dynamic").then(|| strip_quotes(text_of(node, text)))
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Redirections attached to a statement.

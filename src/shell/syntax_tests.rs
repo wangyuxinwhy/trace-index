@@ -120,3 +120,49 @@ fn exceeding_the_statement_bound_marks_the_fragment_partial() {
     assert_eq!(parsed.fragments[0].parse_status, parse_status::PARTIAL);
     assert_eq!(parsed.statements.len(), MAX_STATEMENTS);
 }
+
+#[test]
+fn unwraps_posix_command_wrappers_while_keeping_outer_invocation() {
+    let parsed = extract(
+        "nice -n 10 timeout -s KILL 30 env RUST_LOG=debug cargo test --locked",
+        lang::SHELL,
+        MAX_TEXT,
+    );
+    let programs = parsed
+        .invocations
+        .iter()
+        .map(|invocation| invocation.program.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(programs, ["nice", "timeout", "env", "cargo"]);
+    assert_eq!(parsed.invocations[3].argv, ["test", "--locked"]);
+
+    // `command -v` is a resolution check, not an execution wrapper.
+    let lookup = extract("command -v cargo", lang::SHELL, MAX_TEXT);
+    assert_eq!(lookup.invocations.len(), 1);
+    assert_eq!(lookup.invocations[0].program, "command");
+}
+
+#[test]
+fn parses_static_nested_subshell_scripts_and_skips_dynamic_ones() {
+    let parsed = extract(
+        "timeout 30 bash -lc 'git status && cargo test'",
+        lang::SHELL,
+        MAX_TEXT,
+    );
+    assert_eq!(parsed.fragments.len(), 2);
+    assert_eq!(
+        parsed.fragments[1].content.text.as_deref(),
+        Some("git status && cargo test")
+    );
+    let programs = parsed
+        .invocations
+        .iter()
+        .map(|invocation| invocation.program.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(programs, ["timeout", "bash", "git", "cargo"]);
+
+    // Dynamic expansion inside double quotes must not be speculated into a nested fragment.
+    let dynamic = extract("bash -lc \"echo $HOME\"", lang::SHELL, MAX_TEXT);
+    assert_eq!(dynamic.fragments.len(), 1);
+    assert_eq!(dynamic.invocations.len(), 1);
+}
