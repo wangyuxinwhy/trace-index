@@ -225,6 +225,12 @@ CREATE INDEX IF NOT EXISTS items_loop ON domain_items(loop_id, loop_position, id
 CREATE INDEX IF NOT EXISTS items_role ON domain_items(json_extract(semantic, '$.role'), id);
 CREATE INDEX IF NOT EXISTS items_role_occurred ON domain_items(json_extract(semantic, '$.role'), occurred_at, source_id);
 CREATE INDEX IF NOT EXISTS items_occurred ON domain_items(occurred_at, id);
+CREATE INDEX IF NOT EXISTS items_call_item_id
+    ON domain_items(json_extract(semantic, '$.value.call_item_id'))
+    WHERE json_extract(semantic, '$.value.call_item_id') IS NOT NULL;
+CREATE INDEX IF NOT EXISTS items_tool_name
+    ON domain_items(json_extract(semantic, '$.value.tool_name'), occurred_at, id)
+    WHERE json_extract(semantic, '$.value.tool_name') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS item_records_record ON item_records(record_id);
 ";
 
@@ -244,6 +250,8 @@ DROP INDEX IF EXISTS items_loop;
 DROP INDEX IF EXISTS items_role;
 DROP INDEX IF EXISTS items_role_occurred;
 DROP INDEX IF EXISTS items_occurred;
+DROP INDEX IF EXISTS items_call_item_id;
+DROP INDEX IF EXISTS items_tool_name;
 DROP INDEX IF EXISTS item_records_record;
 ";
 
@@ -508,6 +516,68 @@ mod tests {
                 .iter()
                 .any(|step| step.contains("items_role_occurred")),
             "expected items_role_occurred covering scan for status: {status_plan:?}"
+        );
+    }
+
+    #[test]
+    fn tool_call_name_and_output_link_queries_use_partial_indexes() {
+        let connection = Connection::open_in_memory().expect("open database");
+        connection
+            .execute_batch(CREATE_SCHEMA)
+            .expect("create schema");
+        connection
+            .execute_batch(CREATE_SECONDARY_INDEXES)
+            .expect("create indexes");
+
+        for sql in [
+            "EXPLAIN QUERY PLAN
+             SELECT id
+               FROM domain_items
+              WHERE json_extract(semantic, '$.value.call_item_id') = 42",
+            "EXPLAIN QUERY PLAN
+             SELECT id
+               FROM domain_items
+              WHERE json_extract(semantic, '$.role') = 'tool.output'
+                AND json_extract(semantic, '$.value.call_item_id') = 42",
+        ] {
+            let plan = connection
+                .prepare(sql)
+                .expect("prepare call_item_id plan")
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("query call_item_id plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect call_item_id plan");
+            assert!(
+                plan.iter().any(|step| step.contains("items_call_item_id")),
+                "expected items_call_item_id in plan for `{sql}`: {plan:?}"
+            );
+        }
+
+        let tool_name_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, occurred_at
+                   FROM domain_items
+                  WHERE json_extract(semantic, '$.value.tool_name') = 'exec'
+                  ORDER BY occurred_at DESC
+                  LIMIT 50",
+            )
+            .expect("prepare tool_name plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query tool_name plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect tool_name plan");
+        assert!(
+            tool_name_plan
+                .iter()
+                .any(|step| step.contains("items_tool_name")),
+            "expected items_tool_name in plan: {tool_name_plan:?}"
+        );
+        assert!(
+            !tool_name_plan
+                .iter()
+                .any(|step| step.contains("USE TEMP B-TREE")),
+            "unexpected temp B-tree sort in tool_name plan: {tool_name_plan:?}"
         );
     }
 }
