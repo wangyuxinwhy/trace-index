@@ -847,3 +847,63 @@ fn removed_flat_commands_and_legacy_relations_are_not_resurrected() {
         assert!(output.stdout.is_empty());
     }
 }
+
+#[test]
+fn error_recovery_hints_point_to_public_contract_discovery() {
+    let directory = tempdir().expect("temporary directory");
+    let (database, _, _) = index_fixture(directory.path(), "hello world");
+
+    let unknown_flag = run(&[
+        "--db",
+        path_text(&database),
+        "query",
+        "run",
+        "--sql",
+        "SELECT 1",
+    ]);
+    assert_eq!(unknown_flag.status.code(), Some(2));
+    assert!(unknown_flag.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&unknown_flag.stderr);
+    assert!(stderr.contains("positional argument, '--stdin', or '--file <PATH>'"));
+    assert!(stderr.contains("trace-index query run --help"));
+
+    for bad_cli in [
+        vec!["docs", "list", "--bad"],
+        vec!["--badflag", "query", "run", "SELECT 1"],
+    ] {
+        let output = run(&bad_cli);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("trace-index <noun> --help"));
+        assert!(!stderr.contains("pass SQL as a positional argument"));
+    }
+
+    for missing_sql in [
+        "SELECT nonexistent_col FROM sessions",
+        "SELECT * FROM nonexistent_relation",
+    ] {
+        let output = run(&["--db", path_text(&database), "query", "run", missing_sql]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("trace-index schema list"));
+        assert!(stderr.contains("trace-index schema get <RELATION> --compact"));
+    }
+
+    for fts_sql in [
+        "SELECT rowid FROM item_search WHERE text MATCH '\"hello world\"'",
+        "SELECT rowid FROM item_search WHERE text MATCH 'text:hello'",
+        "SELECT rowid FROM item_search WHERE text MATCH 'hello-world'",
+    ] {
+        let output = run(&["--db", path_text(&database), "query", "run", fts_sql]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("item_search(trigram_query('...'))"),
+            "missing trigram_query hint for `{fts_sql}`: {stderr}"
+        );
+        assert!(stderr.contains("how-to/search-literals"));
+    }
+}
