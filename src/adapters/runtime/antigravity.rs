@@ -4,12 +4,12 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::codex::parse_timestamp_ms_public;
 use crate::adapters::projection::{
     BoundedText, ItemDetail, ItemProjection, LoopProjection, RecordFacts, SessionProjection,
     native_type,
 };
 use crate::adapters::semantic::{self, basis};
+use crate::adapters::timestamp::parse_timestamp_ms;
 use crate::domain::{Model, ReasoningRepresentation};
 use crate::shell::syntax::lang;
 
@@ -70,7 +70,7 @@ fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn timestamp(value: &Value) -> Option<i64> {
-    string(value, "created_at").and_then(parse_timestamp_ms_public)
+    string(value, "created_at").and_then(parse_timestamp_ms)
 }
 
 #[derive(Debug)]

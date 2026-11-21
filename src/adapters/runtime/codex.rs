@@ -26,6 +26,7 @@ use crate::adapters::projection::{
     ToolOutputFacts,
 };
 use crate::adapters::semantic::{self, basis};
+use crate::adapters::timestamp::parse_timestamp_ms;
 use crate::shell::syntax::lang;
 
 /// How far apart a `response_item` and its `event_msg` twin may sit while
@@ -2287,67 +2288,6 @@ fn string_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-/// Shared with the Pi adapter, which uses the same timestamp encoding.
-pub(crate) fn parse_timestamp_ms_public(text: &str) -> Option<i64> {
-    parse_timestamp_ms(text)
-}
-
-/// Parses RFC 3339 timestamps to epoch milliseconds.
-///
-/// Hand-rolled to avoid a date dependency: the input shape is fixed by the
-/// rollout format, and only the offset needs real handling.
-fn parse_timestamp_ms(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' {
-        return None;
-    }
-    let year: i64 = text.get(0..4)?.parse().ok()?;
-    let month: i64 = text.get(5..7)?.parse().ok()?;
-    let day: i64 = text.get(8..10)?.parse().ok()?;
-    let hour: i64 = text.get(11..13)?.parse().ok()?;
-    let minute: i64 = text.get(14..16)?.parse().ok()?;
-    let second: i64 = text.get(17..19)?.parse().ok()?;
-
-    let rest = text.get(19..).unwrap_or("");
-    let (fraction, zone) = rest.strip_prefix('.').map_or(("", rest), |digits| {
-        let end = digits
-            .find(|character: char| !character.is_ascii_digit())
-            .unwrap_or(digits.len());
-        (&digits[..end], &digits[end..])
-    });
-    let millis = match fraction.len() {
-        0 => 0,
-        length @ 1..=3 => {
-            fraction.parse::<i64>().ok()? * 10_i64.pow(3 - u32::try_from(length).ok()?)
-        }
-        _ => fraction.get(0..3)?.parse().ok()?,
-    };
-
-    let offset_seconds = match zone.as_bytes().first() {
-        None | Some(b'Z' | b'z') => 0,
-        Some(sign @ (b'+' | b'-')) => {
-            let hours: i64 = zone.get(1..3)?.parse().ok()?;
-            let minutes: i64 = zone.get(4..6).unwrap_or("0").parse().unwrap_or(0);
-            let magnitude = hours * 3600 + minutes * 60;
-            if *sign == b'-' { -magnitude } else { magnitude }
-        }
-        Some(_) => return None,
-    };
-
-    let days = days_from_civil(year, month, day);
-    Some((days * 86_400 + hour * 3600 + minute * 60 + second - offset_seconds) * 1000 + millis)
-}
-
-/// Days since the Unix epoch, using Howard Hinnant's civil-date algorithm.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
 /// Whether a tool call can receive a separate output record.
 ///
 /// The Responses API defines output items only for function, MCP, custom and
@@ -2441,74 +2381,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CodexProjector, classify_message, linked_session_from_tagged_text, parse_timestamp_ms,
-        runtime_arguments, shell_command, structured_tool_end_facts, tool_output_facts,
+        CodexProjector, classify_message, linked_session_from_tagged_text, runtime_arguments,
+        shell_command, structured_tool_end_facts, tool_output_facts,
     };
     use crate::adapters::{projection::ItemDetail, semantic};
-
-    /// 2026-09-07T13:40:00Z as epoch milliseconds, computed independently of
-    /// the parser under test: days since 1970-01-01 times 86 400 seconds.
-    const SEPT_7_2026_13_40_UTC_MS: i64 = (20_703 * 86_400 + 13 * 3_600 + 40 * 60) * 1_000;
-
-    #[test]
-    fn timestamp_offsets_resolve_to_the_same_utc_instant() {
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T13:40:00Z"),
-            Some(SEPT_7_2026_13_40_UTC_MS)
-        );
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T21:40:00+08:00"),
-            Some(SEPT_7_2026_13_40_UTC_MS)
-        );
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T08:10:00-05:30"),
-            Some(SEPT_7_2026_13_40_UTC_MS)
-        );
-    }
-
-    #[test]
-    fn timestamp_offset_crossing_midnight_keeps_the_utc_day() {
-        let sixteen_utc = parse_timestamp_ms("2026-09-07T16:00:00Z");
-        assert_eq!(
-            parse_timestamp_ms("2026-09-08T00:00:00+08:00"),
-            sixteen_utc,
-            "next-day midnight in UTC+8 is the same instant as 16:00Z"
-        );
-        assert_eq!(
-            sixteen_utc,
-            Some(SEPT_7_2026_13_40_UTC_MS + (2 * 3_600 + 20 * 60) * 1_000)
-        );
-    }
-
-    #[test]
-    fn timestamp_without_zone_is_read_as_utc() {
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T13:40:00"),
-            parse_timestamp_ms("2026-09-07T13:40:00Z"),
-            "a bare timestamp is not shifted by any host time zone"
-        );
-    }
-
-    #[test]
-    fn timestamp_fraction_is_truncated_to_milliseconds() {
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T13:40:00.5Z"),
-            Some(SEPT_7_2026_13_40_UTC_MS + 500)
-        );
-        assert_eq!(
-            parse_timestamp_ms("2026-09-07T13:40:00.123456+08:00"),
-            Some(SEPT_7_2026_13_40_UTC_MS - 8 * 3_600 * 1_000 + 123)
-        );
-    }
-
-    #[test]
-    fn malformed_timestamp_is_absent_not_zero() {
-        assert_eq!(parse_timestamp_ms(""), None);
-        assert_eq!(parse_timestamp_ms("2026-09-07"), None);
-        assert_eq!(parse_timestamp_ms("2026/09/07T13:40:00Z"), None);
-        assert_eq!(parse_timestamp_ms("2026-09-07T13:40:00 UTC"), None);
-        assert_eq!(parse_timestamp_ms("2026-09-07T13:40:00+xx:00"), None);
-    }
 
     #[test]
     fn nested_tool_metadata_does_not_invent_zero_duration() {

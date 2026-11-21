@@ -32,6 +32,7 @@ use crate::adapters::projection::{
     ToolOutputFacts,
 };
 use crate::adapters::semantic::{self, basis};
+use crate::adapters::timestamp::parse_timestamp_ms;
 
 /// `StopReason` from `packages/ai/src/types.ts`: `stop | length | toolUse |
 /// error | aborted`.
@@ -942,10 +943,6 @@ fn reasoning_text(message: &Value) -> Option<String> {
 
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
-}
-
-fn parse_timestamp_ms(text: &str) -> Option<i64> {
-    super::codex::parse_timestamp_ms_public(text)
 }
 
 #[cfg(test)]

@@ -15,29 +15,32 @@ use crate::storage::public_schema::{
     PUBLIC_RELATIONS, find_public_relation, validate_public_relations,
 };
 
+/// Execution and output limits enforced on one read-only SQL query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudget {
+    pub limit: usize,
+    pub max_cell_bytes: usize,
+    pub max_output_bytes: usize,
+    pub timeout: Duration,
+}
+
 /// Executes one read-only SQL statement with bounded rows, cell size, and time.
 ///
 /// # Errors
 ///
 /// Returns an error for non-read-only or multi-statement SQL, duplicate output
 /// column names, timeout, or `SQLite` decoding failures.
-pub fn query_sql(
-    store: &Store,
-    sql: &str,
-    limit: usize,
-    max_cell_bytes: usize,
-    max_output_bytes: usize,
-    timeout: Duration,
-) -> Result<SqlQueryReport> {
+pub fn query_sql(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryReport> {
     if sql.trim().is_empty() {
         bail!("SQL must not be empty");
     }
 
     let started = Instant::now();
+    let timeout = budget.timeout;
     store
         .connection()
         .progress_handler(10_000, Some(move || started.elapsed() >= timeout))?;
-    let result = run_query(store, sql, limit, max_cell_bytes, max_output_bytes);
+    let result = run_query(store, sql, budget);
     store
         .connection()
         .progress_handler(0, None::<fn() -> bool>)?;
@@ -90,13 +93,7 @@ fn is_fts5_phrase_query_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn run_query(
-    store: &Store,
-    sql: &str,
-    limit: usize,
-    max_cell_bytes: usize,
-    max_output_bytes: usize,
-) -> Result<SqlQueryReport> {
+fn run_query(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryReport> {
     let executing = Arc::new(AtomicBool::new(false));
     let authorizer_executing = Arc::clone(&executing);
     store
@@ -104,14 +101,7 @@ fn run_query(
         .authorizer(Some(move |context: AuthContext<'_>| {
             authorize_read_only_query(context, authorizer_executing.load(Ordering::Relaxed))
         }))?;
-    let result = run_authorized_query(
-        store,
-        sql,
-        limit,
-        max_cell_bytes,
-        max_output_bytes,
-        &executing,
-    );
+    let result = run_authorized_query(store, sql, budget, &executing);
     store
         .connection()
         .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
@@ -121,9 +111,7 @@ fn run_query(
 fn run_authorized_query(
     store: &Store,
     sql: &str,
-    limit: usize,
-    max_cell_bytes: usize,
-    max_output_bytes: usize,
+    budget: QueryBudget,
     executing: &AtomicBool,
 ) -> Result<SqlQueryReport> {
     let mut statement = store.connection().prepare(sql)?;
@@ -144,23 +132,23 @@ fn run_authorized_query(
     executing.store(true, Ordering::Relaxed);
     let result = (|| {
         let mut query = statement.query([])?;
-        let mut output = Vec::with_capacity(limit);
+        let mut output = Vec::with_capacity(budget.limit);
         let mut cells_truncated = 0;
         let mut output_bytes = 0_usize;
         let mut incomplete_reason = None;
-        while output.len() < limit {
+        while output.len() < budget.limit {
             let Some(row) = query.next()? else {
                 break;
             };
             let mut object = BTreeMap::new();
             let mut row_cells_truncated = 0;
             for (index, name) in columns.iter().enumerate() {
-                let (value, truncated) = value_to_json(row.get_ref(index)?, max_cell_bytes);
+                let (value, truncated) = value_to_json(row.get_ref(index)?, budget.max_cell_bytes);
                 row_cells_truncated += usize::from(truncated);
                 object.insert(name.clone(), value);
             }
             let row_bytes = serde_json::to_vec(&object)?.len() + usize::from(!output.is_empty());
-            if output_bytes.saturating_add(row_bytes) > max_output_bytes {
+            if output_bytes.saturating_add(row_bytes) > budget.max_output_bytes {
                 incomplete_reason = Some("output_budget".to_owned());
                 break;
             }
@@ -343,8 +331,15 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{public_schema, query_sql};
+    use super::{QueryBudget, public_schema, query_sql};
     use crate::storage::db::Store;
+
+    const TEST_BUDGET: QueryBudget = QueryBudget {
+        limit: 10,
+        max_cell_bytes: 1024,
+        max_output_bytes: 64 * 1024,
+        timeout: Duration::from_secs(1),
+    };
 
     fn insert_search_fixture(store: &Store) {
         store
@@ -401,10 +396,11 @@ mod tests {
         let report = query_sql(
             &store,
             "SELECT '中文abc' AS text UNION ALL SELECT 'second'",
-            1,
-            4,
-            64 * 1024,
-            Duration::from_secs(1),
+            QueryBudget {
+                limit: 1,
+                max_cell_bytes: 4,
+                ..TEST_BUDGET
+            },
         )
         .expect("query");
         assert!(!report.complete);
@@ -429,10 +425,10 @@ mod tests {
         let report = query_sql(
             &store,
             "SELECT 'abcdefghijklmnopqrstuvwxyz' AS text",
-            10,
-            1024,
-            16,
-            Duration::from_secs(1),
+            QueryBudget {
+                max_output_bytes: 16,
+                ..TEST_BUDGET
+            },
         )
         .expect("query");
         assert!(!report.complete);
@@ -456,10 +452,10 @@ mod tests {
         let report = query_sql(
             &store,
             "SELECT 'abcdefghijklmnopqrstuvwxyz' AS text",
-            10,
-            8,
-            64 * 1024,
-            Duration::from_secs(1),
+            QueryBudget {
+                max_cell_bytes: 8,
+                ..TEST_BUDGET
+            },
         )
         .expect("query");
         assert!(report.complete);
@@ -479,49 +475,15 @@ mod tests {
         let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
 
-        assert!(
-            query_sql(
-                &store,
-                "DELETE FROM items",
-                10,
-                1024,
-                64 * 1024,
-                Duration::from_secs(1),
-            )
-            .is_err()
-        );
-        assert!(
-            query_sql(
-                &store,
-                "SELECT 1 AS value, 2 AS value",
-                10,
-                1024,
-                64 * 1024,
-                Duration::from_secs(1),
-            )
-            .is_err()
-        );
+        assert!(query_sql(&store, "DELETE FROM items", TEST_BUDGET).is_err());
+        assert!(query_sql(&store, "SELECT 1 AS value, 2 AS value", TEST_BUDGET).is_err());
 
-        let syntax_error = query_sql(
-            &store,
-            "SELECT \\",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
-        )
-        .expect_err("reject malformed SQL");
+        let syntax_error =
+            query_sql(&store, "SELECT \\", TEST_BUDGET).expect_err("reject malformed SQL");
         assert!(!format!("{syntax_error:#}").contains("exactly one statement"));
 
-        let escaped_newline = query_sql(
-            &store,
-            "SELECT 1\\nSELECT 2",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
-        )
-        .expect_err("reject literal newline escape");
+        let escaped_newline = query_sql(&store, "SELECT 1\\nSELECT 2", TEST_BUDGET)
+            .expect_err("reject literal newline escape");
         let message = format!("{escaped_newline:#}");
         assert!(message.contains("literal `\\n`"), "{message}");
         assert!(message.contains("--stdin"), "{message}");
@@ -535,7 +497,7 @@ mod tests {
         let store = Store::open(&database).expect("open store");
         insert_search_fixture(&store);
 
-        let run = |sql: &str| query_sql(&store, sql, 10, 1024, 64 * 1024, Duration::from_secs(1));
+        let run = |sql: &str| query_sql(&store, sql, TEST_BUDGET);
 
         // Storage tables are readable: they hold the caller's own Trace data,
         // and the public Relations are a contract rather than an access wall.
@@ -579,10 +541,10 @@ mod tests {
                  SELECT value + 1 FROM counter WHERE value < 1000000
              )
              SELECT SUM(value) FROM counter",
-            10,
-            1024,
-            64 * 1024,
-            Duration::ZERO,
+            QueryBudget {
+                timeout: Duration::ZERO,
+                ..TEST_BUDGET
+            },
         )
         .expect_err("interrupt long query");
         let message = format!("{timeout:#}");
@@ -601,7 +563,11 @@ mod tests {
             let error = query_sql(
                 &store,
                 "WITH RECURSIVE counter(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM counter) SELECT SUM(n) FROM counter",
-                10, 1024, 4096, limit,
+                QueryBudget {
+                    max_output_bytes: 4096,
+                    timeout: limit,
+                    ..TEST_BUDGET
+                },
             ).expect_err("interrupt unbounded recursion");
             let message = format!("{error:#}");
             assert!(
@@ -612,10 +578,10 @@ mod tests {
             let recovered = query_sql(
                 &store,
                 "SELECT 1 AS n",
-                10,
-                1024,
-                4096,
-                Duration::from_secs(1),
+                QueryBudget {
+                    max_output_bytes: 4096,
+                    ..TEST_BUDGET
+                },
             )
             .expect("connection recovered after interruption");
             assert_eq!(recovered.rows[0]["n"], 1);
@@ -689,10 +655,7 @@ mod tests {
         let operand = query_sql(
             &store,
             "SELECT rowid, text FROM item_search(trigram_query('智能体使用'))",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
+            TEST_BUDGET,
         )
         .expect("read contentless search operand");
         assert_eq!(operand.returned, 1);
@@ -710,10 +673,7 @@ mod tests {
                JOIN blobs b
                  ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')
               WHERE instr(b.text, '智能体使用') > 0",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
+            TEST_BUDGET,
         )
         .expect("query indexed candidates");
         assert_eq!(report.returned, 1);
@@ -730,10 +690,7 @@ mod tests {
         let candidates = query_sql(
             &store,
             "SELECT rowid FROM item_search(trigram_query('agentfriendly'))",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
+            TEST_BUDGET,
         )
         .expect("query case-folded candidates");
         assert_eq!(candidates.returned, 1);
@@ -746,10 +703,7 @@ mod tests {
                JOIN blobs b
                  ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')
               WHERE instr(b.text, 'agentfriendly') > 0",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
+            TEST_BUDGET,
         )
         .expect("post-check exact text");
         assert_eq!(exact.returned, 0);
@@ -761,15 +715,8 @@ mod tests {
         let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
 
-        let short = query_sql(
-            &store,
-            "SELECT trigram_query('中文') AS query",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
-        )
-        .expect_err("reject short trigram query");
+        let short = query_sql(&store, "SELECT trigram_query('中文') AS query", TEST_BUDGET)
+            .expect_err("reject short trigram query");
         assert!(
             format!("{short:#}").contains("narrow by source, project, actor, or time"),
             "{short:#}"
@@ -786,10 +733,7 @@ mod tests {
         let error = query_sql(
             &store,
             "SELECT rowid FROM item_search WHERE item_search MATCH '\"agent friendly\"'",
-            10,
-            1024,
-            64 * 1024,
-            Duration::from_secs(1),
+            TEST_BUDGET,
         )
         .expect_err("reject FTS5 phrase query on detail=none index");
         assert!(

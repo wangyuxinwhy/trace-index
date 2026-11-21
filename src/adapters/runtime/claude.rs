@@ -28,6 +28,7 @@ use crate::adapters::projection::{
     ToolOutputFacts,
 };
 use crate::adapters::semantic::{self, basis};
+use crate::adapters::timestamp::parse_timestamp_ms;
 use crate::shell::syntax::lang;
 
 /// Marks an interrupted turn without depending on the message text, which is
@@ -1748,10 +1749,6 @@ fn turn_position(value: &Value) -> Option<TurnPosition> {
         prompt_index: position.get("promptIndex")?.as_u64()?,
         turn_index: position.get("turnIndex")?.as_u64()?,
     })
-}
-
-fn parse_timestamp_ms(text: &str) -> Option<i64> {
-    super::codex::parse_timestamp_ms_public(text)
 }
 
 // Lifecycle behavior is tested at the public relation boundary in `indexer`.
