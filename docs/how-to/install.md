@@ -37,9 +37,12 @@ The script supports:
 ```text
 --version VERSION   install an explicit version instead of latest
 --bin-dir DIR       install somewhere other than ~/.local/bin
+--target TARGET     override the detected release target triple
 --base-url URL      override the GitHub Releases root
 --dry-run           resolve the target without downloading or changing files
 ```
+
+On x86-64 Linux, the installer selects the statically linked `x86_64-unknown-linux-musl` binary by default so it runs across older glibc distributions as well as musl environments. `x86_64-unknown-linux-gnu` is also published and can be selected explicitly with `--target`.
 
 It requires an absolute destination and HTTPS. Plain HTTP is accepted only with explicit `--allow-http` for the repository's local end-to-end test.
 

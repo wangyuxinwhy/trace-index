@@ -52,6 +52,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-15
@@ -61,13 +63,29 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.validate.outputs.tag }}
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
       - name: Build release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Verify native binary and package
         run: |
           binary="target/${{ matrix.target }}/release/trace-index"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            if readelf -d "$binary" | grep -q '(NEEDED)'; then
+              readelf -d "$binary" >&2
+              echo "musl release binary unexpectedly requires shared libraries" >&2
+              exit 1
+            fi
+          fi
           test "$("$binary" --version)" = "trace-index ${{ needs.validate.outputs.version }}"
           scripts/package-release.sh \
             --binary "$binary" \
@@ -100,6 +118,7 @@ jobs:
             --dist-root dist \
             --version "${{ needs.validate.outputs.version }}" \
             --require-target x86_64-unknown-linux-gnu \
+            --require-target x86_64-unknown-linux-musl \
             --require-target x86_64-apple-darwin \
             --require-target aarch64-apple-darwin
       - name: Create draft GitHub Release
