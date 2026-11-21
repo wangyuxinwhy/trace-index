@@ -1,9 +1,10 @@
-//! Storage format 3, shaped around the five public domain objects.
+//! Storage format 4, shaped around the five public domain objects.
 //!
-//! The storage schema follows the five public objects. Private tables only
-//! represent nested or sparse attributes of those objects.
+//! Format 4 compresses large deduplicated Semantic Blobs with per-blob `zstd`,
+//! stores `item_records` `WITHOUT ROWID`, and adds the term-oriented
+//! `item_search_terms` FTS5 access relation alongside `item_search`.
 
-pub(crate) const STORAGE_FORMAT: u32 = 3;
+pub(crate) const STORAGE_FORMAT: u32 = 4;
 
 pub(crate) const CREATE_SCHEMA: &str = r"
 PRAGMA foreign_keys = ON;
@@ -113,11 +114,13 @@ CREATE UNIQUE INDEX loops_session_position
 -- Deduplicated bounded text referenced from Item Semantic JSON. The hash is
 -- computed from the complete Source text. One immutable database policy makes
 -- that complete value publish one stable bounded text, so the hash is the
--- single identity and uniqueness constraint.
+-- single identity and uniqueness constraint. Short or incompressible rows
+-- store UTF-8 TEXT; larger compressible rows store a zstd frame as BLOB and
+-- are decoded transparently by the public `blobs` view via `blob_text()`.
 CREATE TABLE content_blobs (
     id               INTEGER PRIMARY KEY,
     hash             BLOB    NOT NULL UNIQUE,
-    text             TEXT    NOT NULL,
+    text             BLOB    NOT NULL,
     full_bytes       INTEGER NOT NULL,
     estimated_tokens INTEGER NOT NULL
 );
@@ -143,7 +146,7 @@ CREATE TABLE item_records (
     item_id   INTEGER NOT NULL REFERENCES domain_items(id) ON DELETE CASCADE,
     record_id INTEGER NOT NULL REFERENCES trace_records(id),
     PRIMARY KEY(item_id, record_id)
-);
+) WITHOUT ROWID;
 
 -- Sparse private evidence used to resolve the optional Session id inside a
 -- delegation, subagent activity, or subagent report. It is not a public
@@ -198,12 +201,22 @@ BEGIN
      );
 END;
 
--- Access structure rebuilt from Item semantic text. rowid is items.id.
+-- Trigram access structure rebuilt from Item semantic text. rowid is items.id.
 CREATE VIRTUAL TABLE item_search USING fts5(
     text,
     content = '',
     tokenize = 'trigram',
     detail = 'none',
+    contentless_delete = 1
+);
+
+-- Term-oriented access structure rebuilt from pre-tokenized Item semantic text
+-- (CJK bigrams, code identifier splits, and words). rowid is items.id.
+CREATE VIRTUAL TABLE item_search_terms USING fts5(
+    text,
+    content = '',
+    tokenize = 'unicode61 tokenchars ''_''',
+    detail = 'full',
     contentless_delete = 1
 );
 ";
@@ -264,8 +277,8 @@ mod tests {
     use super::{CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, STORAGE_FORMAT};
 
     #[test]
-    fn creates_the_minimal_v2_schema() {
-        assert_eq!(STORAGE_FORMAT, 3);
+    fn creates_the_format_4_schema() {
+        assert_eq!(STORAGE_FORMAT, 4);
         let connection = Connection::open_in_memory().expect("open database");
         connection
             .execute_batch(CREATE_SCHEMA)
@@ -295,6 +308,7 @@ mod tests {
             "item_records",
             "item_session_links",
             "item_search",
+            "item_search_terms",
         ] {
             assert!(tables.contains(expected), "missing {expected}");
         }
@@ -307,13 +321,16 @@ mod tests {
             assert!(!tables.contains(removed), "legacy table {removed} survived");
         }
 
-        let item_columns = connection
-            .prepare("SELECT name FROM pragma_table_info('domain_items') ORDER BY cid")
-            .expect("prepare Item column query")
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query Item columns")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect Item columns");
+        let item_records_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'item_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read item_records DDL");
+        assert!(item_records_sql.contains("WITHOUT ROWID"));
+
+        let item_columns = table_columns(&connection, "domain_items");
         assert_eq!(
             item_columns,
             [
@@ -326,28 +343,12 @@ mod tests {
                 "semantic",
             ]
         );
-
-        let blob_columns = connection
-            .prepare("SELECT name FROM pragma_table_info('content_blobs') ORDER BY cid")
-            .expect("prepare Blob column query")
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query Blob columns")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect Blob columns");
         assert_eq!(
-            blob_columns,
+            table_columns(&connection, "content_blobs"),
             ["id", "hash", "text", "full_bytes", "estimated_tokens"]
         );
-
-        let loop_columns = connection
-            .prepare("SELECT name FROM pragma_table_info('domain_loops') ORDER BY cid")
-            .expect("prepare Loop column query")
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query Loop columns")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect Loop columns");
         assert_eq!(
-            loop_columns,
+            table_columns(&connection, "domain_loops"),
             [
                 "id",
                 "session_id",
@@ -371,6 +372,18 @@ mod tests {
             )
             .expect("read Item role index");
         assert!(role_index.contains("json_extract(semantic, '$.role')"));
+    }
+
+    fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .expect("prepare column query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns")
     }
 
     #[test]

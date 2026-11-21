@@ -256,7 +256,7 @@ mod tests {
                 .body
                 .contains("`session metadata delete`")
         );
-        assert_eq!(by_name("relation-list").body.lines().count(), 8);
+        assert_eq!(by_name("relation-list").body.lines().count(), 9);
         assert_eq!(by_name("persist-sites").body.matches('`').count(), 6 * 2);
     }
 }

@@ -55,7 +55,7 @@ Item ──cites──> one or more physical Records
 - `loops` identifies outer execution lifecycles inside Sessions.
 - `items` contains the individually queryable facts produced in those contexts.
 
-`blobs` and `item_search` are additional access relations. `blobs` resolves bounded Semantic text by id; `item_search` retrieves candidates over selected text. Neither is another domain object.
+`blobs`, `item_search`, and `item_search_terms` are additional access relations. `blobs` resolves bounded Semantic text by id; `item_search` and `item_search_terms` retrieve candidates over selected text. None of them is another domain object.
 
 ## 5. Read Items in a Loop
 
@@ -118,12 +118,16 @@ Use `semantic` directly for roles and non-text values; such queries should not a
 
 ## 7. Search text, then confirm it
 
-For a broad literal of at least three Unicode characters, use `item_search` to produce candidates:
+Two contentless search access relations generate candidate `item_id` values (`rowid`):
+
+- Use `item_search_terms(search_query('...'))` for words, split code identifiers (`camelCase` / `snake_case`), multi-word queries, or 2+ character CJK terms, with optional `bm25(item_search_terms)` ranking.
+- Use `item_search(trigram_query('...'))` for 3+ character literal substrings or punctuation-bearing literals.
 
 ```sql
 WITH candidates AS MATERIALIZED (
-  SELECT rowid AS item_id
-  FROM item_search(trigram_query('needle phrase'))
+  SELECT rowid AS item_id,
+         bm25(item_search_terms) AS score
+  FROM item_search_terms(search_query('needle phrase'))
 )
 SELECT i.item_id,
        json_extract(i.semantic, '$.role') AS role,
@@ -137,12 +141,13 @@ JOIN blobs b
        ELSE json_extract(i.semantic, '$.value.text.blob_id')
      END
 WHERE instr(b.text, 'needle phrase') > 0
+ORDER BY candidates.score, i.item_id
 LIMIT 20;
 ```
 
-The trigram match is case-folded and intentionally broader than exact literal matching. A candidate is not proof of a match: join `rowid` to `items.item_id`, select the BlobRef defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()`.
+Search retrieval is case-folded and intentionally broader than exact literal matching. A candidate is not proof of a match: join `rowid` to `items.item_id`, select the BlobRef defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()`.
 
-`item_search` covers only semantic text explicitly selected by the Item contract. For one- or two-character literals, first narrow with `sessions`, `loops`, or `semantic.role`, then join the referenced Blobs and scan that smaller text set with `instr()`.
+Both search relations cover only semantic text explicitly selected by the Item contract. For single-character literals or punctuation shorter than three characters, first narrow with `sessions`, `loops`, or `semantic.role`, then join the referenced Blobs and scan that smaller text set with `instr()`.
 
 When the input contains only partial natural-language clues, use several literal anchors, compare compact candidate Sessions against the supplied scope, and expand only supported candidates. Do not dump every hit; preserve ambiguity when the available evidence does not identify one Session. The complete funnel and bounded SQL patterns are in `trace-index docs get how-to/search-literals`.
 

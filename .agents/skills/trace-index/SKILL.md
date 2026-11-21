@@ -19,7 +19,7 @@ Load `trace-index docs get start-here` when the index has not been built or the 
 
 Load the full schema for one relation only when its field descriptions or JSON contract are needed.
 
-The public domain objects are `sources`, `records`, `sessions`, `loops`, and `items`. `blobs` and `item_search` are access relations, not domain objects. `blobs` resolves bounded semantic text by `blob_id`; `item_search` retrieves candidate Item ids. Do not build routine analysis on visible storage tables.
+The public domain objects are `sources`, `records`, `sessions`, `loops`, and `items`. `blobs`, `item_search`, and `item_search_terms` are access relations, not domain objects. `blobs` resolves bounded semantic text by `blob_id`; `item_search` and `item_search_terms` retrieve candidate Item ids. Do not build routine analysis on visible storage tables.
 
 Use `items` as the central fact relation. Within one Loop, order by `loop_position`. Each Item has:
 
@@ -58,7 +58,7 @@ For broad text recall, use search only to generate candidates instead of fetchin
 
 In `sessions`, `session_id` is the Trace Index-local join key and `native_id` is the Runtime-native identity. Report `runtime` plus `native_id` when the user asks for a native Session id.
 
-Use `item_search` only to generate broad literal candidates. Its contentless `text` column is a MATCH operand and reads as NULL; candidate output is `rowid`. Join that id to `items.item_id`, select the `blob_id` defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()` or an equally explicit comparison. Trigram matching is case-folded and broader than exact matching. For literals shorter than three Unicode characters, narrow Items structurally first and join only their referenced Blobs.
+Use `item_search_terms` (`search_query('...')`) for term, identifier (`camelCase`/`snake_case`), multi-word, or 2+ character CJK candidate retrieval (supports `bm25(item_search_terms)` ranking). Use `item_search` (`trigram_query('...')`) for 3+ character literal substrings or punctuation-bearing literals. Both have contentless `text` columns that read as NULL and output candidate `rowid`. Join `rowid` to `items.item_id`, select the `blob_id` defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()` or an equally explicit comparison. Both indexes are broader than exact literal matching. For single-character or non-word literals shorter than three characters, narrow Items structurally first and join only their referenced Blobs.
 
 Do not join `blobs` for role counts, timelines, tool metadata, Loop usage, or any other query that does not read text. Keeping Blob access demand-driven avoids loading large values into routine analysis.
 

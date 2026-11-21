@@ -54,12 +54,32 @@ pub fn query_sql(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQue
                 "SQL contains a literal `\\n`; pass real newlines with `--stdin` and a quoted heredoc, or use `--file`",
             ))
         }
-        Err(error) if is_fts5_query_error(&error) => Err(error.context(
-            "item_search is a contentless trigram index with detail=none; pass literal strings through item_search(trigram_query('...')) and see 'trace-index docs get how-to/search-literals'",
-        )),
-        Err(error) if is_missing_schema_object_error(&error) => Err(error.context(
-            "inspect the current public relations and columns with 'trace-index schema list' or 'trace-index schema get <RELATION> --compact'",
-        )),
+        Err(error) if is_fts5_query_error(&error) => {
+            let format = store
+                .storage_format()
+                .unwrap_or(crate::storage::schema::STORAGE_FORMAT);
+            let hint = if format >= 4 {
+                "use item_search_terms(search_query('...')) for word, identifier, or 2+ char CJK searches (supports bm25()), or item_search(trigram_query('...')) for 3+ char literal substrings; see 'trace-index docs get how-to/search-literals'".to_owned()
+            } else {
+                format!(
+                    "this Format {format} index has only item_search (trigram, detail=none); pass 3+ char literal strings through item_search(trigram_query('...')) or build a Format 4 index for item_search_terms; see 'trace-index docs get how-to/search-literals'"
+                )
+            };
+            Err(error.context(hint))
+        }
+        Err(error) if is_missing_schema_object_error(&error) => {
+            let format = store
+                .storage_format()
+                .unwrap_or(crate::storage::schema::STORAGE_FORMAT);
+            let hint = if format < 4 && error_mentions_item_search_terms(&error) {
+                format!(
+                    "item_search_terms requires a Format 4 index (this database is Format {format}); use item_search(trigram_query('...')) or narrow structurally via items and blobs, or build a Format 4 index"
+                )
+            } else {
+                "inspect the current public relations and columns with 'trace-index schema list' or 'trace-index schema get <RELATION> --compact'".to_owned()
+            };
+            Err(error.context(hint))
+        }
         result => result,
     }
 }
@@ -99,6 +119,12 @@ fn is_missing_schema_object_error(error: &anyhow::Error) -> bool {
         let message = cause.to_string();
         message.contains("no such column:") || message.contains("no such table:")
     })
+}
+
+fn error_mentions_item_search_terms(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("item_search_terms"))
 }
 
 fn run_query(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryReport> {
@@ -274,7 +300,7 @@ pub fn public_schema(
     requested: Option<&str>,
     include_descriptions: bool,
 ) -> Result<SchemaReport> {
-    validate_public_relations(store.connection())?;
+    validate_public_relations(store.connection(), store.storage_format()?)?;
     describe_schema(requested, include_descriptions)
 }
 
@@ -379,7 +405,9 @@ mod tests {
                  );
                  INSERT INTO item_records(item_id, record_id) VALUES (1, 1);
                  INSERT INTO item_search(rowid, text)
-                 VALUES (1, 'AgentFriendly 讨论智能体使用和知识索引');",
+                 VALUES (1, 'AgentFriendly 讨论智能体使用和知识索引');
+                 INSERT INTO item_search_terms(rowid, text)
+                 VALUES (1, 'agentfriendly agent friendly 讨论 论智 智能 能体 体使 使用 用和 和知 知识 识索 索引');",
             )
             .expect("insert search fixture");
     }
@@ -725,9 +753,14 @@ mod tests {
 
         let short = query_sql(&store, "SELECT trigram_query('中文') AS query", TEST_BUDGET)
             .expect_err("reject short trigram query");
+        let message = format!("{short:#}");
         assert!(
-            format!("{short:#}").contains("narrow by source, project, actor, or time"),
-            "{short:#}"
+            message.contains("item_search_terms(search_query('...'))"),
+            "{message}"
+        );
+        assert!(
+            message.contains("narrow by source, session, role, or time"),
+            "{message}"
         );
     }
 
@@ -744,9 +777,120 @@ mod tests {
             TEST_BUDGET,
         )
         .expect_err("reject FTS5 phrase query on detail=none index");
+        let message = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("item_search(trigram_query('...'))"),
-            "{error:#}"
+            message.contains("item_search(trigram_query('...'))"),
+            "{message}"
+        );
+        assert!(
+            message.contains("item_search_terms(search_query('...'))"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn searches_terms_short_cjk_identifiers_and_bm25_through_item_search_terms() {
+        let directory = tempdir().expect("temp directory");
+        let database = directory.path().join("index.sqlite");
+        let store = Store::open(&database).expect("open store");
+        insert_search_fixture(&store);
+
+        let schema =
+            public_schema(&store, Some("item_search_terms"), true).expect("term search schema");
+        assert_eq!(schema.objects.len(), 1);
+        assert_eq!(schema.objects[0].name, "item_search_terms");
+        assert!(schema.objects[0].columns[0].nullable);
+
+        // 2-character CJK query (unsupported by trigram_query)
+        let cjk2 = query_sql(
+            &store,
+            "SELECT rowid, text, bm25(item_search_terms) AS score
+               FROM item_search_terms(search_query('索引'))
+              ORDER BY score",
+            TEST_BUDGET,
+        )
+        .expect("query 2-char CJK");
+        assert_eq!(cjk2.returned, 1);
+        assert_eq!(cjk2.rows[0]["rowid"], 1);
+        assert!(cjk2.rows[0]["text"].is_null());
+        assert!(cjk2.rows[0]["score"].is_number());
+
+        // 3+ character CJK requires exact adjacency ("智能 能体"), rejecting non-adjacent chars.
+        let cjk_phrase = query_sql(
+            &store,
+            "SELECT rowid FROM item_search_terms(search_query('智能体'))",
+            TEST_BUDGET,
+        )
+        .expect("query 3-char CJK phrase");
+        assert_eq!(cjk_phrase.returned, 1);
+
+        let cjk_nonadjacent = query_sql(
+            &store,
+            "SELECT rowid FROM item_search_terms(search_query('智能索引'))",
+            TEST_BUDGET,
+        )
+        .expect("query non-adjacent 4-char CJK");
+        assert_eq!(cjk_nonadjacent.returned, 0);
+
+        // Split camelCase identifier + mixed CJK & English multi-word query.
+        let mixed = query_sql(
+            &store,
+            "SELECT i.item_id, b.text
+               FROM item_search_terms(search_query('friendly 知识')) t
+               JOIN items i ON i.item_id = t.rowid
+               JOIN blobs b
+                 ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')",
+            TEST_BUDGET,
+        )
+        .expect("query mixed split identifier and 2-char CJK");
+        assert_eq!(mixed.returned, 1);
+        assert_eq!(mixed.rows[0]["item_id"], 1);
+    }
+
+    #[test]
+    fn hints_format_3_readers_without_suggesting_missing_item_search_terms() {
+        let directory = tempdir().expect("temp directory");
+        let database = directory.path().join("format3.sqlite");
+        let store = Store::open(&database).expect("open store");
+        insert_search_fixture(&store);
+        store
+            .connection()
+            .execute_batch(
+                "DROP TABLE item_search_terms;
+                 DROP VIEW blobs;
+                 CREATE VIEW blobs AS
+                 SELECT b.id AS \"blob_id\",
+                        b.text AS \"text\",
+                        b.full_bytes AS \"full_bytes\",
+                        b.estimated_tokens AS \"estimated_tokens\"
+                 FROM content_blobs b;
+                 PRAGMA user_version = 3;",
+            )
+            .expect("downgrade to format 3");
+        drop(store);
+
+        let reader = Store::open_read_only(&database).expect("open format 3 read-only");
+        let missing = query_sql(
+            &reader,
+            "SELECT rowid FROM item_search_terms(search_query('索引'))",
+            TEST_BUDGET,
+        )
+        .expect_err("item_search_terms absent on format 3");
+        let missing_msg = format!("{missing:#}");
+        assert!(missing_msg.contains("Format 4 index"), "{missing_msg}");
+        assert!(missing_msg.contains("Format 3"), "{missing_msg}");
+
+        let fts_err = query_sql(
+            &reader,
+            "SELECT rowid FROM item_search WHERE item_search MATCH '\"agent friendly\"'",
+            TEST_BUDGET,
+        )
+        .expect_err("fts5 error on format 3");
+        let fts_msg = format!("{fts_err:#}");
+        assert!(fts_msg.contains("Format 3 index"), "{fts_msg}");
+        assert!(
+            fts_msg.contains("item_search(trigram_query('...'))"),
+            "{fts_msg}"
         );
     }
 }

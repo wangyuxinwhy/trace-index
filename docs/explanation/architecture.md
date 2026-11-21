@@ -27,7 +27,7 @@ flowchart TD
 - `ingest` discovers Sources, reads complete Records within explicit bounds, and maintains byte locators and fingerprints.
 - `adapters` detects supported Runtime transcripts and projects ordered Records into adapter-neutral facts. It owns Runtime mappings and private rule diagnostics.
 - `domain` declares the Semantic role/value contract, evidence strength, Loop outcomes, and typed nested values.
-- `storage` persists the database-wide indexing policy together with physical and domain facts, privately deduplicates bounded Semantic text, publishes five domain Relations plus the `blobs` and `item_search` access Relations, and validates database shape.
+- `storage` persists the database-wide indexing policy together with physical and domain facts, privately deduplicates bounded Semantic text, publishes five domain Relations plus the `blobs`, `item_search`, and `item_search_terms` access Relations, and validates database shape.
 - `indexing` coordinates per-Source synchronization, status, progress, and telemetry.
 - `interface` owns configuration, bundled documentation, public-schema discovery, bounded SQL, and stable machine output.
 - `shell` extracts the shell structure embedded in supported Semantic tool-call values. Its structs are nested Item values rather than additional public domain entities.
@@ -48,9 +48,9 @@ Each Source update is transactional. Readers see either the previous committed p
 
 Only explicit `index sync` opens the trace index for writes. `session metadata set/delete` write a separate persistent caller-owned store. Schema discovery reads declarations without opening a database. Queries, status, and evidence inspection open the index read-only. Query setup attaches the selected metadata store read-only and installs a connection-local view; user SQL cannot attach arbitrary files or mutate either store. SQL execution retains its time and output budgets.
 
-The trace SQL surface is `sources`, `records`, `sessions`, `loops`, `items`, `blobs`, and `item_search`. `session_metadata` separately exposes caller-owned data, left-joined by stable Runtime identity; it carries no Runtime Record evidence. The first five publish domain objects. `items.semantic` encodes the domain Semantic as `{role, value, evidence_strength}`; only its top-level TextContent changes representation, becoming a BlobRef resolved through `blobs`. This SQL encoding is an interface choice, not a second domain model. `blobs` and `item_search` provide demand-driven text access and candidate retrieval without becoming domain entities. Private tables may still be readable because the local caller owns the database, but they carry storage mechanics rather than public meaning.
+The trace SQL surface is `sources`, `records`, `sessions`, `loops`, `items`, `blobs`, `item_search`, and `item_search_terms`. `session_metadata` separately exposes caller-owned data, left-joined by stable Runtime identity; it carries no Runtime Record evidence. The first five publish domain objects. `items.semantic` encodes the domain Semantic as `{role, value, evidence_strength}`; only its top-level TextContent changes representation, becoming a BlobRef resolved through `blobs`. This SQL encoding is an interface choice, not a second domain model. `blobs`, `item_search`, and `item_search_terms` provide demand-driven text access and candidate retrieval without becoming domain entities. Private tables may still be readable because the local caller owns the database, but they carry storage mechanics rather than public meaning.
 
-`item_search` is maintained from selected Semantic text. It accelerates candidate recall and returns to `items` for meaning and provenance, then to `blobs` for exact text. Non-text queries never need the Blob access path.
+`item_search` and `item_search_terms` are maintained from selected Semantic text. They accelerate candidate recall and return to `items` for meaning and provenance, then to `blobs` for exact text. Non-text queries never need the Blob access path.
 
 ## Rebuildable evidence derivative
 
