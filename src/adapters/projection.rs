@@ -92,12 +92,20 @@ pub(crate) struct ShellStatement {
     pub pipeline_pos: Option<u32>,
 }
 
+/// Retains complete tool-call arguments only when they fit inside the published
+/// text bound. Oversized arguments are omitted by persistence (the supporting
+/// Record remains the recovery path), so neither hashing nor retaining a prefix
+/// is useful for non-delegation tool calls.
+pub(crate) fn complete_arguments(text: &str, max_bytes: usize) -> Option<String> {
+    (text.len() <= max_bytes).then(|| text.to_owned())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationProjection {
     pub statement: usize,
     pub program: String,
-    /// Ordered argument words as a JSON array. Shell words, not a runtime argv.
-    pub argv: String,
+    /// Ordered argument words. Shell words, not a runtime argv.
+    pub argv: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +140,7 @@ pub(crate) enum ItemDetail {
         /// mistake that once invented two runtime markers no runtime has.
         cmd_lang: Option<&'static str>,
         workdir: Option<String>,
-        args: Option<BoundedText>,
+        args: Option<String>,
         /// Filled by the syntax pass between projection and persistence.
         syntax: Option<SyntaxProjection>,
     },

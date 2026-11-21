@@ -82,7 +82,7 @@ struct PendingToolEnd {
     ts_ms: Option<i64>,
     facts: ToolOutputFacts,
     mcp_call_name: Option<String>,
-    mcp_arguments: Option<BoundedText>,
+    mcp_arguments: Option<String>,
     mcp_output: Option<BoundedText>,
 }
 
@@ -95,8 +95,6 @@ struct LoopBuilder {
     awaiting_context: bool,
     start_seq: u64,
     end_seq: u64,
-    started_at: Option<i64>,
-    ended_at: Option<i64>,
     status: &'static str,
     end_record_seq: Option<u64>,
     abort_reason: Option<String>,
@@ -106,13 +104,6 @@ struct LoopBuilder {
     usage: Option<crate::domain::Usage>,
     /// A turn-scoped cumulative counter supersedes legacy per-response events.
     structured_usage: bool,
-    personality: Option<String>,
-    collab_mode: Option<String>,
-    approval_policy: Option<String>,
-    sandbox_mode: Option<String>,
-    network_access: Option<bool>,
-    user_instructions: Option<BoundedText>,
-    developer_instructions: Option<BoundedText>,
     items: Vec<ItemProjection>,
     /// `call_id` to the item index of its call, so an output can backfill it.
     calls: HashMap<String, usize>,
@@ -138,8 +129,6 @@ impl LoopBuilder {
             awaiting_context: false,
             start_seq,
             end_seq: start_seq,
-            started_at: None,
-            ended_at: None,
             status: "open",
             end_record_seq: None,
             abort_reason: None,
@@ -148,13 +137,6 @@ impl LoopBuilder {
             context_window: None,
             usage: None,
             structured_usage: false,
-            personality: None,
-            collab_mode: None,
-            approval_policy: None,
-            sandbox_mode: None,
-            network_access: None,
-            user_instructions: None,
-            developer_instructions: None,
             items: Vec::new(),
             calls: HashMap::new(),
             outputs: HashMap::new(),
@@ -257,7 +239,7 @@ impl LoopBuilder {
                 ts_ms: ended.ts_ms,
                 semantic_role: semantic::AGENT_TOOL_CALL.to_owned(),
                 basis: basis::RECORD_KIND.to_owned(),
-                preview: ended.mcp_arguments.clone(),
+                preview: None,
                 detail: ItemDetail::ToolCall {
                     call_id: call_id.clone(),
                     name: Some(name),
@@ -271,7 +253,6 @@ impl LoopBuilder {
                 searchable: false,
             });
             self.calls.insert(call_id.clone(), call_index);
-            let output = ended.mcp_output;
             let output_index = self.push_item(ItemProjection {
                 seq: ended.seq,
                 record_seq: ended.seq,
@@ -279,10 +260,10 @@ impl LoopBuilder {
                 ts_ms: ended.ts_ms,
                 semantic_role: semantic::TOOL_OUTPUT.to_owned(),
                 basis: basis::RECORD_KIND.to_owned(),
-                preview: output.clone(),
+                preview: None,
                 detail: ItemDetail::ToolOutput {
                     call_id: call_id.clone(),
-                    output,
+                    output: ended.mcp_output,
                     facts: ended.facts,
                 },
                 linked_session_native_id: None,
@@ -330,18 +311,9 @@ struct SessionBuilder {
     start_seq: u64,
     end_seq: u64,
     started_at: Option<i64>,
-    ended_at: Option<i64>,
     cwd: Option<String>,
-    originator: Option<String>,
-    cli_version: Option<String>,
-    model_provider: Option<String>,
-    source_kind: Option<String>,
-    git_repo: Option<String>,
-    git_branch: Option<String>,
-    git_commit: Option<String>,
     forked_from_native_id: Option<String>,
     delegated_from_native_id: Option<String>,
-    base_instructions: Option<BoundedText>,
     items: Vec<ItemProjection>,
     loops: Vec<LoopProjection>,
     closed_loops: HashMap<String, ClosedLoopIndex>,
@@ -357,18 +329,9 @@ impl SessionBuilder {
             start_seq,
             end_seq: start_seq,
             started_at: None,
-            ended_at: None,
             cwd: None,
-            originator: None,
-            cli_version: None,
-            model_provider: None,
-            source_kind: None,
-            git_repo: None,
-            git_branch: None,
-            git_commit: None,
             forked_from_native_id: None,
             delegated_from_native_id: None,
-            base_instructions: None,
             items: Vec::new(),
             loops: Vec::new(),
             closed_loops: HashMap::new(),
@@ -629,10 +592,6 @@ impl CodexProjector {
             .and_then(parse_timestamp_ms)
             .or(ts_ms);
         session.cwd = string_at(payload, "cwd").map(str::to_owned);
-        session.originator = string_at(payload, "originator").map(str::to_owned);
-        session.cli_version = string_at(payload, "cli_version").map(str::to_owned);
-        session.model_provider = string_at(payload, "model_provider").map(str::to_owned);
-        session.source_kind = session_source_kind(payload);
         session.forked_from_native_id = string_at(payload, "forked_from_id").map(str::to_owned);
         let is_subagent = string_at(payload, "thread_source") == Some("subagent")
             || payload
@@ -661,19 +620,6 @@ impl CodexProjector {
             .and_then(|source| source.get("subagent"))
             .and_then(|subagent| string_at(subagent, "other"))
             == Some("guardian");
-        if let Some(git) = payload.get("git") {
-            session.git_repo = string_at(git, "repository_url").map(str::to_owned);
-            session.git_branch = string_at(git, "branch").map(str::to_owned);
-            session.git_commit = string_at(git, "commit_hash").map(str::to_owned);
-        }
-        session.base_instructions = payload
-            .get("base_instructions")
-            .and_then(|value| {
-                value
-                    .as_str()
-                    .or_else(|| value.get("text").and_then(Value::as_str))
-            })
-            .map(|text| self.blob(text));
         self.session = Some(session);
     }
 
@@ -699,16 +645,6 @@ impl CodexProjector {
     }
 
     fn begin_loop(&mut self, seq: u64, payload: &Value) {
-        let max_text_bytes = self.max_text_bytes;
-        let user_instructions =
-            string_at(payload, "user_instructions").map(|text| blob_of(text, max_text_bytes));
-        let developer_instructions = payload
-            .get("collaboration_mode")
-            .and_then(|mode| mode.get("settings"))
-            .and_then(|settings| settings.get("developer_instructions"))
-            .and_then(Value::as_str)
-            .map(|text| blob_of(text, max_text_bytes));
-
         let turn_uuid = string_at(payload, "turn_id").map(str::to_owned);
         let session = self.session_mut(seq);
 
@@ -769,18 +705,6 @@ impl CodexProjector {
             .get("model_context_window")
             .and_then(Value::as_u64)
             .or(turn.context_window);
-        turn.personality = string_at(payload, "personality").map(str::to_owned);
-        turn.collab_mode = payload
-            .get("collaboration_mode")
-            .and_then(|mode| string_at(mode, "mode"))
-            .map(str::to_owned);
-        turn.approval_policy = string_at(payload, "approval_policy").map(str::to_owned);
-        if let Some(sandbox) = payload.get("sandbox_policy") {
-            turn.sandbox_mode = string_at(sandbox, "type").map(str::to_owned);
-            turn.network_access = sandbox.get("network_access").and_then(Value::as_bool);
-        }
-        turn.user_instructions = user_instructions;
-        turn.developer_instructions = developer_instructions;
         session.active_loop = Some(turn);
     }
 
@@ -855,7 +779,7 @@ impl CodexProjector {
         }
     }
 
-    fn task_started(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>) {
+    fn task_started(&mut self, seq: u64, payload: &Value, _ts_ms: Option<i64>) {
         let native_id = string_at(payload, "turn_id").map(str::to_owned);
         let session = self.session_mut(seq);
         let starts_new = session.active_loop.as_ref().is_some_and(|current| {
@@ -881,45 +805,36 @@ impl CodexProjector {
         if opened_here {
             turn.turn_uuid = native_id;
         }
-        turn.started_at = turn.started_at.or(ts_ms);
         turn.end_seq = turn.end_seq.max(seq);
     }
 
-    fn task_complete(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>) {
+    fn task_complete(&mut self, seq: u64, payload: &Value, _ts_ms: Option<i64>) {
         let last_message_hash = string_at(payload, "last_agent_message")
             .map(|text| *blake3::hash(text.as_bytes()).as_bytes());
         let session = self.session_mut(seq);
-        {
-            let turn = session.loop_mut(seq);
-            turn.status = "completed";
-            turn.end_record_seq = Some(seq);
-            // A turn can abort and then complete: the runtime interrupts one
-            // attempt and finishes the next inside the same turn_context
-            // window. The last outcome wins, and its reason and its evidence
-            // must go with it.
-            turn.abort_reason = None;
-            turn.ended_at = ts_ms;
-            turn.end_seq = turn.end_seq.max(seq);
-            turn.last_agent_message_hash = last_message_hash;
-            // Resolve the answer now: later records must not extend the
-            // window in which a fallback match could be found.
-            turn.resolve_final_answer();
-        }
-        session.ended_at = ts_ms.or(session.ended_at);
+        let turn = session.loop_mut(seq);
+        turn.status = "completed";
+        turn.end_record_seq = Some(seq);
+        // A turn can abort and then complete: the runtime interrupts one
+        // attempt and finishes the next inside the same turn_context
+        // window. The last outcome wins, and its reason and its evidence
+        // must go with it.
+        turn.abort_reason = None;
+        turn.end_seq = turn.end_seq.max(seq);
+        turn.last_agent_message_hash = last_message_hash;
+        // Resolve the answer now: later records must not extend the
+        // window in which a fallback match could be found.
+        turn.resolve_final_answer();
     }
 
-    fn turn_aborted(&mut self, seq: u64, payload: &Value, ts_ms: Option<i64>) {
+    fn turn_aborted(&mut self, seq: u64, payload: &Value, _ts_ms: Option<i64>) {
         let reason = string_at(payload, "reason").map(str::to_owned);
         let session = self.session_mut(seq);
-        {
-            let turn = session.loop_mut(seq);
-            turn.status = "aborted";
-            turn.end_record_seq = Some(seq);
-            turn.abort_reason = reason;
-            turn.ended_at = ts_ms;
-            turn.end_seq = turn.end_seq.max(seq);
-        }
-        session.ended_at = ts_ms.or(session.ended_at);
+        let turn = session.loop_mut(seq);
+        turn.status = "aborted";
+        turn.end_record_seq = Some(seq);
+        turn.abort_reason = reason;
+        turn.end_seq = turn.end_seq.max(seq);
     }
 
     // ── messages and the dual-track pairing ────────────────────────────────
@@ -1325,10 +1240,17 @@ impl CodexProjector {
         let workdir = parsed
             .as_ref()
             .and_then(|args| string_at(args, "workdir").map(str::to_owned));
-        let args_blob = raw_args.as_deref().map(|text| self.blob(text));
-        let preview_text = cmd.clone().or_else(|| raw_args.clone());
-        let preview = preview_text.as_deref().map(|text| self.blob(text));
+        let args = raw_args
+            .as_deref()
+            .and_then(|text| projection::complete_arguments(text, self.max_text_bytes));
         let is_delegation = name.as_deref() == Some("spawn_agent");
+        let preview = is_delegation
+            .then(|| {
+                cmd.as_deref()
+                    .or(raw_args.as_deref())
+                    .map(|text| self.blob(text))
+            })
+            .flatten();
 
         let item = ItemProjection {
             seq,
@@ -1349,7 +1271,7 @@ impl CodexProjector {
                 cmd,
                 cmd_lang,
                 workdir,
-                args: args_blob,
+                args,
                 syntax: None,
             },
             linked_session_native_id: None,
@@ -1425,7 +1347,7 @@ impl CodexProjector {
             ts_ms,
             semantic_role: semantic::TOOL_OUTPUT.to_owned(),
             basis: basis::RECORD_KIND.to_owned(),
-            preview: blob.clone(),
+            preview: None,
             detail: ItemDetail::ToolOutput {
                 call_id: call_id.clone(),
                 output: blob,
@@ -1434,6 +1356,7 @@ impl CodexProjector {
             linked_session_native_id: None,
             searchable: false,
         };
+        let max_text_bytes = self.max_text_bytes;
         let turn = self.session_mut(seq).loop_mut(seq);
         let index = if let Some(&index) = turn.outputs.get(&call_id) {
             let existing = &mut turn.items[index];
@@ -1450,7 +1373,6 @@ impl CodexProjector {
             ) = (&mut existing.detail, item.detail)
             {
                 if output.is_none() {
-                    existing.preview.clone_from(&new_output);
                     *output = new_output;
                 }
                 facts.exit_code = facts.exit_code.or(new_facts.exit_code);
@@ -1472,7 +1394,7 @@ impl CodexProjector {
             && turn.items[call_index].semantic_role == semantic::AGENT_DELEGATION
             && turn.items[call_index].linked_session_native_id.is_none()
         {
-            merge_spawn_end(&mut turn.items[call_index], seq, native_id);
+            merge_spawn_end(&mut turn.items[call_index], seq, native_id, max_text_bytes);
         }
         // The call keeps the correlation; the indexer resolves it to row ids.
         let _ = turn.calls.get(&call_id);
@@ -1489,7 +1411,9 @@ impl CodexProjector {
             ts_ms,
             facts,
             mcp_call_name,
-            mcp_arguments: mcp_arguments.as_deref().map(|text| self.blob(text)),
+            mcp_arguments: mcp_arguments
+                .as_deref()
+                .and_then(|text| projection::complete_arguments(text, self.max_text_bytes)),
             mcp_output: mcp_output.as_deref().map(|text| self.blob(text)),
         };
         let turn = self.session_mut(seq).loop_mut(seq);
@@ -1507,9 +1431,15 @@ impl CodexProjector {
         ) else {
             return;
         };
+        let max_text_bytes = self.max_text_bytes;
         let turn = self.session_mut(seq).loop_mut(seq);
         if let Some(index) = turn.calls.get(call_id).copied() {
-            merge_spawn_end(&mut turn.items[index], seq, native_id.to_owned());
+            merge_spawn_end(
+                &mut turn.items[index],
+                seq,
+                native_id.to_owned(),
+                max_text_bytes,
+            );
         }
     }
 
@@ -1527,12 +1457,18 @@ impl CodexProjector {
             string_at(payload, "event_id"),
             linked_session_native_id.as_ref(),
         ) {
+            let max_text_bytes = self.max_text_bytes;
             let turn = self.session_mut(seq).loop_mut(seq);
             if let Some(call_index) = turn.calls.get(event_id).copied()
                 && turn.items[call_index].semantic_role == semantic::AGENT_DELEGATION
                 && turn.items[call_index].linked_session_native_id.is_none()
             {
-                merge_spawn_end(&mut turn.items[call_index], seq, thread_id.clone());
+                merge_spawn_end(
+                    &mut turn.items[call_index],
+                    seq,
+                    thread_id.clone(),
+                    max_text_bytes,
+                );
             }
         }
         let item = ItemProjection {
@@ -1614,7 +1550,7 @@ impl CodexProjector {
     }
 
     fn blob(&self, text: &str) -> BoundedText {
-        blob_of(text, self.max_text_bytes)
+        BoundedText::bounded(text, self.max_text_bytes)
     }
 }
 
@@ -1663,7 +1599,7 @@ fn upsert_command_execution(
             ts_ms,
             semantic_role: semantic::AGENT_TOOL_CALL.to_owned(),
             basis: basis::RECORD_KIND.to_owned(),
-            preview: cmd.as_deref().map(blob),
+            preview: None,
             detail: ItemDetail::ToolCall {
                 call_id: id.to_owned(),
                 name: (string_at(item, "source") == Some("unified_exec_startup"))
@@ -1722,8 +1658,7 @@ fn upsert_command_execution(
         } = &mut existing_item.detail
         {
             if output.is_some() {
-                existing.clone_from(&output);
-                existing_item.preview = output;
+                *existing = output;
             }
             existing_facts.exit_code = facts.exit_code.or(existing_facts.exit_code);
             existing_facts.nonzero_exit = facts.nonzero_exit.or(existing_facts.nonzero_exit);
@@ -1739,7 +1674,7 @@ fn upsert_command_execution(
             ts_ms,
             semantic_role: semantic::TOOL_OUTPUT.to_owned(),
             basis: basis::RECORD_KIND.to_owned(),
-            preview: output.clone(),
+            preview: None,
             detail: ItemDetail::ToolOutput {
                 call_id: id.to_owned(),
                 output,
@@ -2020,20 +1955,6 @@ fn argument_text(value: &Value) -> Option<String> {
     }
 }
 
-fn session_source_kind(payload: &Value) -> Option<String> {
-    match payload.get("source")? {
-        Value::String(value) => Some(value.clone()),
-        Value::Object(value) if value.contains_key("subagent") => Some("subagent".to_owned()),
-        Value::Object(value) if value.len() == 1 => value.keys().next().cloned(),
-        Value::Object(_) => Some("object".to_owned()),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => None,
-    }
-}
-
-fn blob_of(text: &str, max_bytes: usize) -> BoundedText {
-    BoundedText::bounded(text, max_bytes)
-}
-
 fn collect_text<'a>(value: &'a Value, fragments: &mut Vec<&'a str>) {
     match value {
         Value::String(text) => fragments.push(text),
@@ -2252,10 +2173,23 @@ fn merge_tool_end(item: &mut ItemProjection, ended: &PendingToolEnd) {
     }
 }
 
-fn merge_spawn_end(item: &mut ItemProjection, end_seq: u64, native_id: String) {
+fn merge_spawn_end(
+    item: &mut ItemProjection,
+    end_seq: u64,
+    native_id: String,
+    max_text_bytes: usize,
+) {
     item.seq = item.seq.min(end_seq);
     item.ui_seq = Some(end_seq);
     semantic::AGENT_DELEGATION.clone_into(&mut item.semantic_role);
+    if item.preview.is_none()
+        && let ItemDetail::ToolCall { cmd, args, .. } = &item.detail
+    {
+        item.preview = cmd
+            .as_deref()
+            .or(args.as_deref())
+            .map(|text| BoundedText::bounded(text, max_text_bytes));
+    }
     item.linked_session_native_id = Some(native_id);
     item.searchable = true;
 }
@@ -2731,7 +2665,7 @@ mod tests {
             panic!("expected tool call")
         };
         assert_eq!(name.as_deref(), Some("codex.list_mcp_resources"));
-        assert!(args.as_ref().is_some_and(|args| args.text.is_some()));
+        assert!(args.is_some());
         let ItemDetail::ToolOutput { facts, .. } = &items[1].detail else {
             panic!("expected tool output")
         };

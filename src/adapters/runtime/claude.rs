@@ -561,7 +561,7 @@ impl ClaudeProjector {
                     seeds.push(ItemSeed {
                         semantic_role: semantic::TOOL_OUTPUT.to_owned(),
                         basis: basis::BLOCK_TYPE,
-                        preview: blob.clone(),
+                        preview: None,
                         detail: ItemDetail::ToolOutput {
                             call_id: call_id.clone(),
                             output: blob,
@@ -722,15 +722,13 @@ impl ClaudeProjector {
                     if name == "Skill" {
                         self.session_mut(seq).skill_call_ids.insert(call_id.clone());
                     }
-                    let args = self.blob(arguments);
+                    let args = projection::complete_arguments(arguments, self.max_text_bytes);
                     let is_delegation = name == "Agent";
-                    let preview = if is_delegation {
+                    let preview = is_delegation.then(|| {
                         delegation_text
                             .as_deref()
                             .map_or_else(|| self.blob(name), |text| self.blob(text))
-                    } else {
-                        self.blob(name)
-                    };
+                    });
                     seeds.push(ItemSeed {
                         semantic_role: if is_delegation {
                             semantic::AGENT_DELEGATION.to_owned()
@@ -738,14 +736,14 @@ impl ClaudeProjector {
                             semantic::AGENT_TOOL_CALL.to_owned()
                         },
                         basis: basis::BLOCK_TYPE,
-                        preview: Some(preview),
+                        preview,
                         detail: ItemDetail::ToolCall {
                             call_id: call_id.clone(),
                             name: Some(name.clone()),
                             cmd: cmd.clone(),
                             cmd_lang: *cmd_lang,
                             workdir: None,
-                            args: Some(args),
+                            args,
                             syntax: None,
                         },
                         linked_session_native_id: None,
@@ -850,7 +848,7 @@ impl ClaudeProjector {
             Some(AsyncTask::Tool { call_id }) => ItemSeed {
                 semantic_role: semantic::TOOL_OUTPUT.to_owned(),
                 basis: notification.basis,
-                preview: Some(preview.clone()),
+                preview: None,
                 detail: ItemDetail::ToolOutput {
                     call_id,
                     output: Some(preview),
@@ -862,7 +860,7 @@ impl ClaudeProjector {
             None if notification.tool_use_id.is_some() => ItemSeed {
                 semantic_role: semantic::TOOL_OUTPUT.to_owned(),
                 basis: notification.basis,
-                preview: Some(preview.clone()),
+                preview: None,
                 detail: ItemDetail::ToolOutput {
                     call_id: notification.tool_use_id.unwrap_or_default(),
                     output: Some(preview),

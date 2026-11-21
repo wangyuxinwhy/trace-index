@@ -68,72 +68,130 @@ fn is_semantic_statement(kind: &str) -> bool {
     )
 }
 
-/// Fill in the parsed shape of every tool call whose Adapter declared a
-/// language for its command.
+/// Reusable tree-sitter parser for declared shell tool calls.
 ///
-/// Runs between projection and persistence: the Adapter states the language,
-/// this states the structure, and `persist` only writes. Keeping the parse out
-/// of the Adapter is what stops a projector from having to know four grammars,
-/// and keeping it out of `persist` is what lets it be tested without a
-/// database.
-pub(crate) fn parse_declared_commands(
-    session: &mut crate::adapters::projection::SessionProjection,
-    max_text_bytes: usize,
-) {
-    for item in &mut session.items {
-        parse_item_command(item, max_text_bytes);
+/// Constructing a `tree_sitter::Parser` and binding its grammar once per sync
+/// run avoids thousands of repeated parser allocations across shell commands.
+pub(crate) struct ShellParser {
+    bash: Option<Parser>,
+}
+
+impl ShellParser {
+    pub(crate) fn new() -> Self {
+        let mut parser = Parser::new();
+        let bash = parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .ok()
+            .map(|()| parser);
+        Self { bash }
     }
-    for turn in &mut session.loops {
-        for item in &mut turn.items {
-            parse_item_command(item, max_text_bytes);
+
+    /// Fill in the parsed shape of every tool call whose Adapter declared a
+    /// language for its command.
+    ///
+    /// Runs between projection and persistence: the Adapter states the language,
+    /// this states the structure, and `persist` only writes. Keeping the parse
+    /// out of the Adapter is what stops a projector from having to know four
+    /// grammars, and keeping it out of `persist` is what lets it be tested
+    /// without a database.
+    pub(crate) fn parse_declared_commands(
+        &mut self,
+        session: &mut crate::adapters::projection::SessionProjection,
+        max_text_bytes: usize,
+    ) {
+        for item in &mut session.items {
+            self.parse_item_command(item, max_text_bytes);
+        }
+        for turn in &mut session.loops {
+            for item in &mut turn.items {
+                self.parse_item_command(item, max_text_bytes);
+            }
         }
     }
-}
 
-fn parse_item_command(
-    item: &mut crate::adapters::projection::ItemProjection,
-    max_text_bytes: usize,
-) {
-    let crate::adapters::projection::ItemDetail::ToolCall {
-        cmd,
-        cmd_lang,
-        syntax,
-        ..
-    } = &mut item.detail
-    else {
-        return;
-    };
-    let (Some(text), Some(declared)) = (cmd.as_deref(), *cmd_lang) else {
-        return;
-    };
-    let parsed = extract(text, declared, max_text_bytes);
-    if !parsed.fragments.is_empty() {
-        *syntax = Some(parsed);
+    fn parse_item_command(
+        &mut self,
+        item: &mut crate::adapters::projection::ItemProjection,
+        max_text_bytes: usize,
+    ) {
+        let crate::adapters::projection::ItemDetail::ToolCall {
+            cmd,
+            cmd_lang,
+            syntax,
+            ..
+        } = &mut item.detail
+        else {
+            return;
+        };
+        let (Some(text), Some(declared)) = (cmd.as_deref(), *cmd_lang) else {
+            return;
+        };
+        let parsed = self.extract(text, declared, max_text_bytes);
+        if !parsed.fragments.is_empty() {
+            *syntax = Some(parsed);
+        }
     }
-}
 
-/// Parse one Runtime-declared shell text into nested Semantic shell values.
-///
-/// Pure: no database, no filesystem. `text` is the slot's content and `lang`
-/// is what the Adapter declared it to be.
-pub(crate) fn extract(text: &str, lang: &'static str, max_text_bytes: usize) -> SyntaxProjection {
-    let mut out = SyntaxProjection::default();
-    if text.is_empty() {
-        return out;
+    /// Parse one Runtime-declared shell text into nested Semantic shell values.
+    ///
+    /// Pure: no database, no filesystem. `text` is the slot's content and `lang`
+    /// is what the Adapter declared it to be.
+    pub(crate) fn extract(
+        &mut self,
+        text: &str,
+        lang: &'static str,
+        max_text_bytes: usize,
+    ) -> SyntaxProjection {
+        let mut out = SyntaxProjection::default();
+        if text.is_empty() {
+            return out;
+        }
+        match lang {
+            lang::SHELL => self.extract_shell(text, max_text_bytes, &mut out),
+            // Declared but unparsed. Naming a language this build cannot read is a
+            // fact; filing it as something else would not be.
+            _ => {
+                out.fragments.push(root_fragment(
+                    text,
+                    max_text_bytes,
+                    parse_status::UNSUPPORTED,
+                ));
+            }
+        }
+        out
     }
-    match lang {
-        lang::SHELL => extract_shell(text, max_text_bytes, &mut out),
-        // Declared but unparsed. Naming a language this build cannot read is a
-        // fact; filing it as something else would not be.
-        _ => {
+
+    fn extract_shell(&mut self, text: &str, max_text_bytes: usize, out: &mut SyntaxProjection) {
+        let Some(parser) = self.bash.as_mut() else {
             out.fragments.push(root_fragment(
                 text,
                 max_text_bytes,
                 parse_status::UNSUPPORTED,
             ));
-        }
+            return;
+        };
+        let Some(tree) = parser.parse(text, None) else {
+            out.fragments.push(root_fragment(
+                text,
+                max_text_bytes,
+                parse_status::UNSUPPORTED,
+            ));
+            return;
+        };
+        let status = if tree.root_node().has_error() {
+            parse_status::PARTIAL
+        } else {
+            parse_status::PARSED
+        };
+        out.fragments
+            .push(root_fragment(text, max_text_bytes, status));
+        collect(tree.root_node(), text, 0, out);
     }
-    out
+}
+
+#[cfg(test)]
+pub(crate) fn extract(text: &str, lang: &'static str, max_text_bytes: usize) -> SyntaxProjection {
+    ShellParser::new().extract(text, lang, max_text_bytes)
 }
 
 fn root_fragment(text: &str, max_text_bytes: usize, status: &'static str) -> FragmentProjection {
@@ -142,37 +200,6 @@ fn root_fragment(text: &str, max_text_bytes: usize, status: &'static str) -> Fra
         content: BoundedText::bounded(text, max_text_bytes),
         parse_status: status,
     }
-}
-
-fn extract_shell(text: &str, max_text_bytes: usize, out: &mut SyntaxProjection) {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        out.fragments.push(root_fragment(
-            text,
-            max_text_bytes,
-            parse_status::UNSUPPORTED,
-        ));
-        return;
-    }
-    let Some(tree) = parser.parse(text, None) else {
-        out.fragments.push(root_fragment(
-            text,
-            max_text_bytes,
-            parse_status::UNSUPPORTED,
-        ));
-        return;
-    };
-    let status = if tree.root_node().has_error() {
-        parse_status::PARTIAL
-    } else {
-        parse_status::PARSED
-    };
-    out.fragments
-        .push(root_fragment(text, max_text_bytes, status));
-    collect(tree.root_node(), text, 0, out);
 }
 
 /// Walk one fragment's tree, emitting statements and their per-kind detail.
@@ -204,8 +231,7 @@ fn collect(root: Node, text: &str, fragment: usize, out: &mut SyntaxProjection) 
     // upstream of which. Length is a COUNT over the identity, not a column.
     let mut pipelines: Vec<usize> = Vec::new();
     for node in &found {
-        let (parent, _) = nearest_statement_ancestor(*node, &found);
-        let parent = parent.map(|index| base + index);
+        let parent = nearest_statement_ancestor(*node, &found).map(|index| base + index);
         let (pipeline_id, pipeline_pos) = pipeline_position(*node, &mut pipelines);
         out.statements.push(StatementProjection {
             fragment,
@@ -272,43 +298,15 @@ fn pipeline_position(node: Node, pipelines: &mut Vec<usize>) -> (Option<u32>, Op
     }
 }
 
-/// The innermost emitted statement containing this one, and the field of *that*
-/// statement the path into this one goes through.
-///
-/// Both have to come from the same walk. Reading the role off the immediate AST
-/// parent instead reported a loop body's role as whatever field it occupied in
-/// the `do_group`, while its `parent_statement_id` pointed at the
-/// `for_statement` two levels up — a role that named a field the recorded
-/// parent does not have.
-fn nearest_statement_ancestor(node: Node, found: &[Node]) -> (Option<usize>, Option<String>) {
+/// The innermost emitted statement containing this one.
+fn nearest_statement_ancestor(node: Node, found: &[Node]) -> Option<usize> {
     let mut current = node;
     loop {
-        let Some(parent) = current.parent() else {
-            return (None, None);
-        };
+        let parent = current.parent()?;
         if is_semantic_statement(parent.kind()) {
-            return (
-                found.iter().position(|other| other.id() == parent.id()),
-                field_name_of_child(parent, current),
-            );
+            return found.iter().position(|other| other.id() == parent.id());
         }
         current = parent;
-    }
-}
-
-/// The grammar's field name for `child`'s slot in `parent`.
-fn field_name_of_child(parent: Node, child: Node) -> Option<String> {
-    let mut cursor = parent.walk();
-    if !cursor.goto_first_child() {
-        return None;
-    }
-    loop {
-        if cursor.node().id() == child.id() {
-            return cursor.field_name().map(str::to_owned);
-        }
-        if !cursor.goto_next_sibling() {
-            return None;
-        }
     }
 }
 
@@ -489,14 +487,14 @@ fn emit_command(node: Node, text: &str, statement: usize, out: &mut SyntaxProjec
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
-    let raw = text_of(name_node, text).to_owned();
+    let raw = text_of(name_node, text);
     let basis = basis_of(name_node, text);
     // Normalizing a word the shell has not finished with would invent a value:
     // taking the basename of `./bin/*` yields `*`, which names nothing.
     let program = if basis == "dynamic" {
-        raw.clone()
+        raw.to_owned()
     } else {
-        normalize_program(&raw)
+        normalize_program(raw)
     };
     let mut cursor = node.walk();
     let argv: Vec<String> = node
@@ -506,7 +504,7 @@ fn emit_command(node: Node, text: &str, statement: usize, out: &mut SyntaxProjec
     out.invocations.push(InvocationProjection {
         statement,
         program,
-        argv: serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_owned()),
+        argv,
     });
 }
 

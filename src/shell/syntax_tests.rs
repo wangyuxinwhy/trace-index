@@ -25,9 +25,7 @@ fn extracts_programs_and_arguments_in_source_order() {
         .collect::<Vec<_>>();
     assert_eq!(programs, ["git", "cargo"]);
 
-    let first_argv: Vec<String> =
-        serde_json::from_str(&parsed.invocations[0].argv).expect("valid argv JSON");
-    assert_eq!(first_argv, ["-C", "/repo", "status"]);
+    assert_eq!(parsed.invocations[0].argv, ["-C", "/repo", "status"]);
 }
 
 #[test]

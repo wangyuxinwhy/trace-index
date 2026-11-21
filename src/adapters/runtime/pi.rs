@@ -571,8 +571,7 @@ impl PiProjector {
         }
 
         for call in tool_calls {
-            let args = self.blob(&call.arguments);
-            let preview = self.blob(&call.name);
+            let args = projection::complete_arguments(&call.arguments, self.max_text_bytes);
             self.session_mut(seq).loop_mut(seq).push(ItemProjection {
                 seq,
                 record_seq: seq,
@@ -580,7 +579,7 @@ impl PiProjector {
                 ts_ms,
                 semantic_role: semantic::AGENT_TOOL_CALL.to_owned(),
                 basis: basis::RECORD_KIND.to_owned(),
-                preview: Some(preview),
+                preview: None,
                 detail: ItemDetail::ToolCall {
                     call_id: call.id,
                     cmd_lang: (call.name == PI_SHELL_TOOL)
@@ -591,7 +590,7 @@ impl PiProjector {
                     // `timeout` are its only parameters, and the executor is
                     // handed a `cwd` the model never sees.
                     workdir: None,
-                    args: Some(args),
+                    args,
                     syntax: None,
                 },
                 searchable: false,
@@ -674,7 +673,7 @@ impl PiProjector {
             ts_ms,
             semantic_role: semantic::TOOL_OUTPUT.to_owned(),
             basis: basis::RECORD_KIND.to_owned(),
-            preview: blob.clone(),
+            preview: None,
             detail: ItemDetail::ToolOutput {
                 call_id,
                 output: blob,

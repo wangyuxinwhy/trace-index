@@ -765,7 +765,7 @@ fn stored_semantic_value(
             };
             let tool_call = ToolCall {
                 tool_name: name.clone(),
-                arguments: args.as_ref().and_then(semantic_arguments),
+                arguments: args.as_deref().map(semantic_arguments),
                 working_directory: workdir.clone(),
             };
             if role == SemanticRole::AgentToolCallShell {
@@ -828,15 +828,11 @@ fn stored_semantic_value(
 
 /// Publishes complete structured arguments as JSON and complete scalar tool
 /// input as a JSON string. Some Runtime tools, notably Codex web search, record
-/// a plain string rather than a JSON object. A bounded prefix is not published
-/// as though it were the complete argument; the supporting Record remains the
+/// a plain string rather than a JSON object. Oversized arguments are already
+/// omitted before reaching persistence; the supporting Record remains the
 /// recovery path in that case.
-fn semantic_arguments(arguments: &BoundedText) -> Option<serde_json::Value> {
-    let text = arguments.text.as_deref()?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) != arguments.full_bytes {
-        return None;
-    }
-    Some(serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned())))
+fn semantic_arguments(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned()))
 }
 
 fn normalized_role(role: &str, detail: &ItemDetail) -> Result<SemanticRole> {
@@ -1029,7 +1025,7 @@ fn shell_fragments(syntax: Option<&SyntaxProjection>) -> Result<Vec<ShellFragmen
                 .filter(|value| value.statement == statement_index)
                 .map(|value| Invocation {
                     program: value.program.clone(),
-                    argv: serde_json::from_str(&value.argv).unwrap_or_default(),
+                    argv: value.argv.clone(),
                 })
                 .collect();
             let redirects = syntax
