@@ -5,10 +5,10 @@ description: Explore public relations with selective, bounded, read-only SQL.
 
 # Query Indexed Facts
 
-Trace Index publishes five domain objects and two text-access relations:
+Trace Index publishes five domain objects and three text-access relations:
 
 ```text
-sources  records  sessions  loops  items  blobs  item_search
+sources  records  sessions  loops  items  blobs  item_search  item_search_terms
 ```
 
 Start by discovering the current binary's contract:

@@ -5,13 +5,14 @@ description: Recover broad memories through bounded literal candidates and confi
 
 # Search Literal Text
 
-`item_search` is the text-search access relation. It returns candidate Item ids; it is not a domain object and does not establish an exact match, authorship, Session, or relevance. Its contentless `text` column is only a `MATCH` operand and reads as `NULL`, so it is not another text source. The candidate's meaning comes from `items`, while its bounded text comes from `blobs`.
+`item_search` and `item_search_terms` are the text-search access relations. Both return candidate Item ids; neither is a domain object and neither establishes an exact match, authorship, Session, or relevance. Their contentless `text` columns are only `MATCH` operands and read as `NULL`, so they are not another text source. The candidate's meaning comes from `items`, while its bounded text comes from `blobs`.
 
-Choose the search plan from the scope already known:
+Choose the search plan from the query shape and the scope already known:
 
-- For a broad literal of at least three Unicode characters, retrieve trigram candidates from `item_search`.
-- For a selective Session, project, role, or time range, narrow Items first and then join only their referenced Blobs.
-- Tool output is not in `item_search`; select `tool.output` Items, join their text Blob, and scan that smaller set.
+- For words, split code identifiers (`camelCase` / `snake_case`), multi-word queries, 2+ character CJK terms, or `bm25()` ranking, retrieve candidates from `item_search_terms(search_query('...'))`.
+- For exact 3+ character literal substrings, mid-word fragments, or punctuation-bearing literals, retrieve trigram candidates from `item_search(trigram_query('...'))`.
+- For a selective Session, project, role, or time range — or single-character or non-word literals shorter than three characters — narrow Items first and then join only their referenced Blobs.
+- Tool output is not in `item_search` or `item_search_terms`; select `tool.output` Items, join their text Blob, and scan that smaller set.
 - Queries that do not read text should never join `blobs`.
 
 ## Recover a topic from an imprecise memory
@@ -29,7 +30,7 @@ A candidate satisfying one literal anchor is not yet a conclusion. If the availa
 
 ### Measure candidate density
 
-`item_search` candidate counts are cheap enough to decide which anchor deserves expansion. This query intentionally does not read Blob text:
+Candidate counts from `item_search` or `item_search_terms(search_query('...'))` are cheap enough to decide which anchor deserves expansion. This query intentionally does not read Blob text:
 
 ```sql
 WITH hits(term, item_id) AS (
@@ -129,7 +130,39 @@ The values in `parameters` only demonstrate how to make the bound explicit; they
 
 If `query run` returns `complete=false`, its rows are a partial result set. Follow the returned `hint`: reduce the projection, aggregate, narrow the scope, or continue from a stable ordered boundary. A nonzero `cells_truncated` means some returned cells are prefixes even when every row was returned.
 
-## Retrieve candidates, then exact-check Blob text
+## Rank term, identifier, and short CJK candidates
+
+`item_search_terms` pre-tokenizes text into CJK bigrams, lowercased words, and split code identifier parts while keeping `_` intact. `search_query('...')` builds the matching FTS5 expression, joins whitespace-separated terms with `AND`, and requires adjacent bigrams for 3+ character CJK strings. Because `item_search_terms` stores full position data, `bm25(item_search_terms)` ranks denser matches first (more negative scores rank higher):
+
+```sql
+WITH candidates AS MATERIALIZED (
+  SELECT rowid AS item_id,
+         bm25(item_search_terms) AS score
+  FROM item_search_terms(search_query('索引 timeout'))
+  ORDER BY score
+  LIMIT 40
+)
+SELECT i.item_id,
+       i.session_id,
+       json_extract(i.semantic, '$.role') AS role,
+       substr(b.text, 1, 320) AS snippet
+FROM candidates c
+JOIN items i USING (item_id)
+JOIN blobs b
+  ON b.blob_id = CASE
+       WHEN json_extract(i.semantic, '$.role') = 'runtime.compaction_summary'
+         THEN json_extract(i.semantic, '$.value.summary.blob_id')
+       ELSE json_extract(i.semantic, '$.value.text.blob_id')
+     END
+WHERE instr(b.text, '索引') > 0
+  AND instr(lower(b.text), 'timeout') > 0
+ORDER BY c.score, i.item_id
+LIMIT 20;
+```
+
+Older Format 2 and Format 3 databases can still be queried read-only without `item_search_terms`; use `item_search(trigram_query('...'))` or structural narrowing on those indexes. Note that an inner `LIMIT` inside `candidates` bounds top-ranked hits *before* outer filters; widen or omit the inner `LIMIT` when adding selective Session, role, or case-sensitive `instr()` predicates in the outer `WHERE`.
+
+## Retrieve trigram candidates, then exact-check Blob text
 
 Most text-bearing Semantic values use `value.text = {blob_id}`. A compaction summary instead uses `value.summary = {blob_id}`. Select the reference according to the documented role, then join `blobs`:
 
@@ -167,7 +200,7 @@ The final `instr()` is required. Trigram retrieval is case-folded and deliberate
 
 ## Search tool output directly
 
-Tool output is often large and repetitive, so it is not inserted into `item_search`. Scope the Items first, then resolve only their text references:
+Tool output is often large and repetitive, so it is not inserted into `item_search` or `item_search_terms`. Scope the Items first, then resolve only their text references:
 
 ```sql
 WITH outputs AS MATERIALIZED (
@@ -215,11 +248,11 @@ SELECT si.item_id,
        substr(b.text, 1, 512) AS snippet
 FROM scoped_items si
 JOIN blobs b USING (blob_id)
-WHERE instr(b.text, '知识') > 0
+WHERE instr(b.text, '->') > 0
 ORDER BY si.occurred_at, si.item_id
 LIMIT 20;
 ```
 
-`item_search` folds case while SQLite `instr()` is case-sensitive. Use `instr(lower(b.text), lower('ExampleName')) > 0` only when the requested exact check should also ignore case.
+`item_search` and `item_search_terms` fold case while SQLite `instr()` is case-sensitive. Use `instr(lower(b.text), lower('ExampleName')) > 0` only when the requested exact check should also ignore case.
 
 The index searches only bounded Semantic text selected for retrieval. A miss cannot prove that the literal was absent from every original Record. Follow the Item's `record_ids` and use `record inspect` only when the task explicitly requires raw evidence.

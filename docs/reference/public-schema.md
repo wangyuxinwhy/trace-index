@@ -5,7 +5,7 @@ description: Public relations and their evidence semantics.
 
 # Public SQL Schema
 
-Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` for candidate retrieval. The caller-owned `session_metadata` relation adds uninterpreted JSON associations. It is independent of Runtime evidence and is not another trace domain object.
+Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` plus `item_search_terms` for candidate retrieval. The caller-owned `session_metadata` relation adds uninterpreted JSON associations. It is independent of Runtime evidence and is not another trace domain object.
 
 Discover the exact names, columns, SQLite types, nullability, and descriptions from the running binary:
 
@@ -24,7 +24,8 @@ trace-index schema get items --compact
 - `loops`: Outer Agent execution lifecycles. Some Adapters group Items by input when the Runtime does not expose confirmed boundaries. A missing `end` means no ending has been observed. An `end` without outcome means the boundary is known and the Runtime did not state a result.
 - `items`: Individually queryable Agent program facts. `semantic` is the typed Trace Index meaning; `record_ids` identifies its physical evidence.
 - `blobs`: Bounded Semantic text addressable through Item BlobRef values. Blob rows are access data, not independent trace facts.
-- `item_search`: Trigram candidate index over explicitly documented Item semantic text. `rowid` is the matching `items.item_id`; exact-check candidate text.
+- `item_search`: Trigram candidate index over explicitly documented Item semantic text. `rowid` is the matching `items.item_id`; query with `trigram_query('...')` and exact-check candidate text via `blobs`.
+- `item_search_terms`: Term-oriented candidate index (Format 4+) over pre-tokenized Item semantic text (2+ character CJK terms, words, and split code identifiers) with `bm25()` ranking. `rowid` is the matching `items.item_id`; query with `search_query('...')` and exact-check candidate text via `blobs`.
 - `session_metadata`: Caller-owned, uninterpreted Session JSON from the independent metadata database.
 
 <!-- /generated -->
@@ -162,9 +163,9 @@ Use SQLite JSON functions for direct projection. For example, `json_each(source_
 
 ## Text retrieval
 
-`item_search` is a trigram candidate index, not a domain object. It indexes only Semantic text explicitly selected for retrieval; Runtime bookkeeping and tool output are not implicitly covered. Its `text` column is a contentless FTS `MATCH` operand, not another readable copy of the text: selecting it returns `NULL`. Candidate output is `rowid`. Join that id to `items.item_id`, obtain the BlobRef selected by `semantic.role`, join `blobs`, and exact-check `blobs.text` because trigram matching is case-folded and approximate.
+`item_search` (trigram) and `item_search_terms` (pre-tokenized terms, split code identifiers, and CJK bigrams with `bm25()` ranking) are candidate indexes, not domain objects. Both index only Semantic text explicitly selected for retrieval; Runtime bookkeeping and tool output are not implicitly covered. Their `text` columns are contentless FTS `MATCH` operands, not readable copies of the text: selecting `text` returns `NULL`. Candidate output is `rowid`. Join that id to `items.item_id`, obtain the BlobRef selected by `semantic.role`, join `blobs`, and exact-check `blobs.text` because both candidate indexes are case-folded and broader than exact literal matching.
 
-`blobs` and `item_search` are public because they provide access capabilities that the five domain relations do not provide cheaply: demand-driven large-text reads and indexed candidate retrieval. Search results still take their meaning and provenance from `items` and `records`.
+`blobs`, `item_search`, and `item_search_terms` are public because they provide access capabilities that the five domain relations do not provide cheaply: demand-driven large-text reads and indexed candidate retrieval. Search results still take their meaning and provenance from `items` and `records`.
 
 ## Public contract and private storage
 

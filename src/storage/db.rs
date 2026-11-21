@@ -8,10 +8,12 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
+use super::blob::decode_blob_text;
 use super::public_schema::{recreate_public_views, validate_public_relations};
 use super::schema::{
     CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, DROP_SECONDARY_INDEXES, STORAGE_FORMAT,
 };
+use super::search::make_term_search_query;
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -179,8 +181,8 @@ impl Store {
             connection,
             path: canonical,
         };
-        store.validate_schema()?;
-        store.connect_public_virtual_tables()?;
+        let version = store.validate_schema()?;
+        store.connect_public_virtual_tables(version)?;
         Ok(store)
     }
 
@@ -306,13 +308,13 @@ impl Store {
         }
 
         if version == STORAGE_FORMAT {
-            self.validate_schema()?;
+            let validated_version = self.validate_schema()?;
             // A cold build defers query-only indexes. If the process is killed,
             // the next write-mode open restores them before synchronization.
             // Every statement is idempotent and no correctness constraint is
             // part of the deferred set.
             self.create_secondary_indexes()?;
-            self.connect_public_virtual_tables()?;
+            self.connect_public_virtual_tables(validated_version)?;
             return Ok(());
         }
 
@@ -346,24 +348,31 @@ impl Store {
             .context("failed to read storage format")
     }
 
-    fn validate_schema(&self) -> Result<()> {
+    fn validate_schema(&self) -> Result<u32> {
         let version = self.storage_format()?;
-        // Format 3 expands the writable Runtime set. Format 2 still exposes
-        // the same public relations and can be queried in place.
-        if !matches!(version, 2 | STORAGE_FORMAT) {
+        // Format 4 compresses Semantic Blobs and adds `item_search_terms`.
+        // Format 2 and Format 3 still expose the earlier public relations and
+        // can be queried read-only in place without reindexing.
+        if !matches!(version, 2 | 3 | STORAGE_FORMAT) {
             bail!(
                 "storage format {version} does not match current format {STORAGE_FORMAT}; \
                 create a new index database and reindex the source JSONL files"
             );
         }
 
-        validate_public_relations(&self.connection)?;
-        Ok(())
+        validate_public_relations(&self.connection, version)?;
+        Ok(version)
     }
 
-    fn connect_public_virtual_tables(&self) -> Result<()> {
+    fn connect_public_virtual_tables(&self, storage_format: u32) -> Result<()> {
+        let sql = if storage_format >= 4 {
+            "SELECT rowid FROM item_search WHERE 0;
+             SELECT rowid FROM item_search_terms WHERE 0;"
+        } else {
+            "SELECT rowid FROM item_search WHERE 0;"
+        };
         self.connection
-            .execute_batch("SELECT rowid FROM item_search WHERE 0;")
+            .execute_batch(sql)
             .context("failed to connect public virtual tables")
     }
 }
@@ -381,14 +390,63 @@ fn register_query_functions(connection: &Connection) -> Result<()> {
                 )
             })
         })
-        .context("failed to register trigram_query SQL function")
+        .context("failed to register trigram_query SQL function")?;
+    connection
+        .create_scalar_function("search_query", 1, flags, |context| {
+            let query = context.get::<String>(0)?;
+            make_term_search_query(&query).map_err(|message| {
+                rusqlite::Error::UserFunctionError(
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into(),
+                )
+            })
+        })
+        .context("failed to register search_query SQL function")?;
+    connection
+        .create_scalar_function("blob_text", 1, flags, |context| {
+            use rusqlite::types::{Value, ValueRef};
+
+            match context.get_raw(0) {
+                ValueRef::Null => Ok(Value::Null),
+                ValueRef::Text(bytes) => {
+                    let text = std::str::from_utf8(bytes).map_err(|error| {
+                        rusqlite::Error::UserFunctionError(
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error).into(),
+                        )
+                    })?;
+                    Ok(Value::Text(text.to_owned()))
+                }
+                ValueRef::Blob(bytes) => {
+                    decode_blob_text(bytes).map(Value::Text).map_err(|error| {
+                        rusqlite::Error::UserFunctionError(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("{error:#}"),
+                            )
+                            .into(),
+                        )
+                    })
+                }
+                other => Err(rusqlite::Error::UserFunctionError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "unexpected content_blobs.text type: {:?}",
+                            other.data_type()
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        })
+        .context("failed to register blob_text SQL function")
 }
 
 fn make_trigram_query(literal: &str) -> std::result::Result<String, &'static str> {
     let characters = literal.chars().collect::<Vec<_>>();
     if characters.len() < 3 {
         return Err("trigram_query requires at least 3 Unicode characters; \
-             narrow by source, project, actor, or time and use instr() instead");
+             use item_search_terms(search_query('...')) for 2+ character words or CJK terms, \
+             or narrow by source, session, role, or time and use instr()");
     }
 
     Ok(characters
@@ -766,5 +824,106 @@ mod tests {
             )
             .expect("inspect unchanged database");
         assert_eq!(new_tables, 0);
+    }
+
+    #[test]
+    fn decompresses_zstd_blobs_and_passes_plain_text_through_blobs_view() {
+        let directory = tempdir().expect("temp directory");
+        let database = directory.path().join("index.sqlite");
+        let mut store = Store::open(&database).expect("create index");
+
+        let short_text = "short text under compression threshold";
+        let long_text = "compressed semantic blob payload ".repeat(40);
+        let mut blobs = crate::storage::blob::BlobCache::for_connection(store.connection())
+            .expect("init blob cache");
+        let mut telemetry = crate::indexing::telemetry::IndexTelemetry::default();
+        let transaction = store.connection_mut().transaction().expect("begin tx");
+        let short_id = blobs
+            .intern(
+                &transaction,
+                &crate::adapters::projection::BoundedText::bounded(short_text, 64 * 1024),
+                &mut telemetry,
+            )
+            .expect("intern short blob");
+        let long_id = blobs
+            .intern(
+                &transaction,
+                &crate::adapters::projection::BoundedText::bounded(&long_text, 64 * 1024),
+                &mut telemetry,
+            )
+            .expect("intern long blob");
+        transaction.commit().expect("commit blobs");
+
+        let short_storage_type: String = store
+            .connection()
+            .query_row(
+                "SELECT typeof(text) FROM content_blobs WHERE id = ?1",
+                [short_id],
+                |row| row.get(0),
+            )
+            .expect("inspect short blob type");
+        let long_storage_type: String = store
+            .connection()
+            .query_row(
+                "SELECT typeof(text) FROM content_blobs WHERE id = ?1",
+                [long_id],
+                |row| row.get(0),
+            )
+            .expect("inspect long blob type");
+        assert_eq!(short_storage_type, "text");
+        assert_eq!(long_storage_type, "blob");
+
+        let decoded_short: String = store
+            .connection()
+            .query_row(
+                "SELECT text FROM blobs WHERE blob_id = ?1",
+                [short_id],
+                |row| row.get(0),
+            )
+            .expect("read short blob via public view");
+        let decoded_long: String = store
+            .connection()
+            .query_row(
+                "SELECT text FROM blobs WHERE blob_id = ?1",
+                [long_id],
+                |row| row.get(0),
+            )
+            .expect("read compressed blob via public view");
+        assert_eq!(decoded_short, short_text);
+        assert_eq!(decoded_long, long_text);
+    }
+
+    #[test]
+    fn opens_format_3_database_read_only_without_item_search_terms() {
+        let directory = tempdir().expect("temp directory");
+        let database = directory.path().join("format3.sqlite");
+        let store = Store::open(&database).expect("create index");
+        store
+            .connection()
+            .execute_batch(
+                "DROP TABLE item_search_terms;
+                 DROP VIEW blobs;
+                 CREATE VIEW blobs AS
+                 SELECT b.id AS \"blob_id\",
+                        b.text AS \"text\",
+                        b.full_bytes AS \"full_bytes\",
+                        b.estimated_tokens AS \"estimated_tokens\"
+                 FROM content_blobs b;
+                 INSERT INTO content_blobs(id, hash, text, full_bytes, estimated_tokens)
+                 VALUES (1, X'01', 'legacy format 3 text', 20, 5);
+                 PRAGMA user_version = 3;",
+            )
+            .expect("downgrade fixture to format 3 shape");
+        drop(store);
+
+        let reader = Store::open_read_only(&database).expect("open format 3 database read-only");
+        assert_eq!(reader.storage_format().expect("format"), 3);
+        let text: String = reader
+            .connection()
+            .query_row("SELECT text FROM blobs WHERE blob_id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read format 3 blob");
+        assert_eq!(text, "legacy format 3 text");
     }
 }

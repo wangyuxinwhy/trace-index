@@ -82,7 +82,7 @@ Semantic role vocabulary:
 
 Public SQL surface:
   Domain Relations: sources, records, sessions, loops, items
-  Access Relations: blobs, item_search
+  Access Relations: blobs, item_search, item_search_terms
   Caller-owned data: session_metadata
 
   Access Relations provide text lookup and candidate retrieval; they are not
