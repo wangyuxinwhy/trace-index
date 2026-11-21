@@ -165,19 +165,10 @@ pub(crate) enum EvidenceStrength {
     Heuristic,
 }
 
-impl EvidenceStrength {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Structural => "structural",
-            Self::Heuristic => "heuristic",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Text {
+pub(crate) struct Text<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     pub(crate) has_images: bool,
 }
 
@@ -190,10 +181,10 @@ pub(crate) enum ReasoningRepresentation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Reasoning {
+pub(crate) struct Reasoning<T = TextContent> {
     pub(crate) representation: ReasoningRepresentation,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,13 +212,13 @@ pub(crate) struct ShellToolCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Observable result returned for a tool call.
-pub(crate) struct ToolOutput {
+pub(crate) struct ToolOutput<T = TextContent> {
     /// Item that issued the call, when the trace exposes a reliable pairing key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) call_item_id: Option<ItemId>,
     /// Bounded textual output published by Trace Index.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     /// Process-style exit code when the Runtime reports one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<i64>,
@@ -246,36 +237,36 @@ pub(crate) struct ToolOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Delegation {
+pub(crate) struct Delegation<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     pub(crate) has_images: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) child_session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentActivity {
+pub(crate) struct SubagentActivity<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     pub(crate) has_images: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subagent_session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentReport {
+pub(crate) struct SubagentReport<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     pub(crate) has_images: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Compaction {
+pub(crate) struct Compaction<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) summary: Option<TextContent>,
+    pub(crate) summary: Option<T>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,9 +282,9 @@ pub(crate) enum InstructionCategory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Instruction {
+pub(crate) struct Instruction<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) category: Option<InstructionCategory>,
 }
@@ -309,9 +300,9 @@ pub(crate) enum ContextCategory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Context {
+pub(crate) struct Context<T = TextContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) text: Option<TextContent>,
+    pub(crate) text: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) category: Option<ContextCategory>,
     pub(crate) has_images: bool,
@@ -320,32 +311,47 @@ pub(crate) struct Context {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 /// Closed set of value shapes selected by [`SemanticRole`].
-pub(crate) enum SemanticValue {
-    Text(Text),
-    Reasoning(Reasoning),
+pub(crate) enum SemanticValue<T = TextContent> {
+    Text(Text<T>),
+    Reasoning(Reasoning<T>),
     ToolCall(ToolCall),
     ShellToolCall(ShellToolCall),
-    ToolOutput(ToolOutput),
-    Delegation(Delegation),
-    SubagentActivity(SubagentActivity),
-    SubagentReport(SubagentReport),
-    Compaction(Compaction),
-    Instruction(Instruction),
-    Context(Context),
+    ToolOutput(ToolOutput<T>),
+    Delegation(Delegation<T>),
+    SubagentActivity(SubagentActivity<T>),
+    SubagentReport(SubagentReport<T>),
+    Compaction(Compaction<T>),
+    Instruction(Instruction<T>),
+    Context(Context<T>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Trace Index's queryable interpretation of one Item.
-pub(crate) struct Semantic {
+pub(crate) struct Semantic<T = TextContent> {
     /// Selects the contract of `value`.
     pub(crate) role: SemanticRole,
     /// Typed value whose variant must agree with `role`.
-    pub(crate) value: SemanticValue,
+    pub(crate) value: SemanticValue<T>,
     /// Strength of the trace evidence supporting this interpretation.
     pub(crate) evidence_strength: EvidenceStrength,
 }
 
+#[cfg(test)]
 pub(crate) fn validate_semantic(semantic: &Semantic) -> Result<()> {
+    let has_nonempty_text = match &semantic.value {
+        SemanticValue::Reasoning(reasoning) => reasoning
+            .text
+            .as_ref()
+            .is_some_and(|text| !text.value.is_empty()),
+        _ => false,
+    };
+    validate_semantic_with_text(semantic, has_nonempty_text)
+}
+
+pub(crate) fn validate_semantic_with_text<T>(
+    semantic: &Semantic<T>,
+    has_nonempty_text: bool,
+) -> Result<()> {
     use SemanticRole as R;
     use SemanticValue as V;
     let valid = matches!(
@@ -376,10 +382,7 @@ pub(crate) fn validate_semantic(semantic: &Semantic) -> Result<()> {
     if let V::Reasoning(reasoning) = &semantic.value {
         match reasoning.representation {
             ReasoningRepresentation::Full | ReasoningRepresentation::Summary => ensure!(
-                reasoning
-                    .text
-                    .as_ref()
-                    .is_some_and(|text| !text.value.is_empty()),
+                reasoning.text.is_some() && has_nonempty_text,
                 "full or summary reasoning requires text"
             ),
             ReasoningRepresentation::Unavailable => ensure!(
@@ -417,7 +420,7 @@ mod tests {
 
     #[test]
     fn omits_absent_optional_semantic_members() {
-        let semantic = Semantic {
+        let semantic: Semantic = Semantic {
             role: SemanticRole::ToolOutput,
             value: SemanticValue::ToolOutput(ToolOutput {
                 call_item_id: None,

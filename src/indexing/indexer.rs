@@ -129,7 +129,7 @@ fn index_paths_internal(
     };
 
     let mut adapters = BTreeSet::new();
-    let mut blobs = BlobCache::default();
+    let mut blobs = BlobCache::for_connection(store.connection())?;
     for file in &files {
         // One unreadable file must not decide the fate of the other 1,528. A
         // stray or truncated JSONL under a trace root is a local fact; aborting

@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension as _, Transaction, params};
+use serde::Serialize;
 
 use super::blob::BlobCache;
 use super::db::to_sql_i64;
@@ -20,11 +21,21 @@ use crate::adapters::projection::{
 use crate::adapters::semantic;
 use crate::domain::{
     ByteRange, Compaction, Completeness, Context as SemanticContext, ContextCategory, Delegation,
-    EvidenceStrength, Instruction, InstructionCategory, Invocation, PipelinePosition, Reasoning,
-    Redirect, Semantic, SemanticRole, SemanticValue, ShellFragment, ShellStatement, ShellToolCall,
-    SubagentActivity, SubagentReport, Text, ToolCall, ToolOutput,
+    EvidenceStrength, Instruction, InstructionCategory, Invocation, ItemId, PipelinePosition,
+    Reasoning, Redirect, Semantic, SemanticRole, SemanticValue, SessionId, ShellFragment,
+    ShellStatement, ShellToolCall, SubagentActivity, SubagentReport, Text, ToolCall, ToolOutput,
 };
 use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
+
+/// Public SQL access encoding for top-level bounded Semantic text.
+///
+/// The domain model carries `TextContent`; persistence stores that text in
+/// `content_blobs` and serializes `{ "blob_id": ... }` directly inside
+/// `Semantic<BlobRef>` without constructing an intermediate JSON DOM tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct BlobRef {
+    blob_id: i64,
+}
 
 pub(crate) fn clear_projection(transaction: &Transaction<'_>, source_id: i64) -> Result<()> {
     transaction
@@ -143,24 +154,25 @@ pub(crate) fn write_session(
             .transpose()?;
         let started = Instant::now();
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT INTO domain_loops(
                  source_id, session_id, ordinal, session_position, native_id,
                  start_record_id, end_record_id, outcome, model, usage)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    source_id,
-                    session_id,
-                    source_ordinal,
-                    session_position,
-                    projected_loop.native_id,
-                    start_record_id,
-                    end_record_id,
-                    outcome,
-                    model,
-                    usage
-                ],
             )
+            .context("failed to prepare Loop insert")?
+            .execute(params![
+                source_id,
+                session_id,
+                source_ordinal,
+                session_position,
+                projected_loop.native_id,
+                start_record_id,
+                end_record_id,
+                outcome,
+                model,
+                usage
+            ])
             .context("failed to store Loop")?;
         writer
             .telemetry
@@ -191,9 +203,9 @@ pub(crate) fn write_session(
 /// timestamp; storage identity is only the final deterministic tie-breaker.
 /// The two update passes keep the unique constraint valid throughout.
 fn normalize_loop_positions(transaction: &Transaction<'_>, session_id: i64) -> Result<()> {
-    let loop_ids = transaction
+    let loops = transaction
         .prepare_cached(
-            "SELECT l.id
+            "SELECT l.id, l.session_position
                FROM domain_loops l
                JOIN trace_records r ON r.id = l.start_record_id
                LEFT JOIN session_sources ss ON ss.source_id = l.source_id
@@ -202,45 +214,47 @@ fn normalize_loop_positions(transaction: &Transaction<'_>, session_id: i64) -> R
                        l.source_id, l.ordinal, l.id",
         )
         .context("failed to prepare Session Loop ordering")?
-        .query_map([session_id], |row| row.get::<_, i64>(0))
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
         .context("failed to query Session Loop ordering")?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to collect Session Loop ordering")?;
-    if loop_ids.is_empty() {
+    if loops.is_empty()
+        || loops
+            .iter()
+            .enumerate()
+            .all(|(position, (_, current))| i64::try_from(position).ok() == Some(*current))
+    {
         return Ok(());
     }
 
-    let maximum: i64 = transaction
-        .query_row(
-            "SELECT MAX(session_position) FROM domain_loops WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .context("failed to inspect Session Loop positions")?;
+    let maximum = loops
+        .iter()
+        .map(|(_, current)| *current)
+        .max()
+        .expect("loops is non-empty");
     let temporary_base = maximum
-        .checked_add(i64::try_from(loop_ids.len()).context("Loop count exceeds SQLite INTEGER")?)
+        .checked_add(i64::try_from(loops.len()).context("Loop count exceeds SQLite INTEGER")?)
         .and_then(|value| value.checked_add(1))
         .context("Loop position exceeds SQLite INTEGER")?;
-    for (position, loop_id) in loop_ids.iter().enumerate() {
+    let mut update = transaction
+        .prepare_cached("UPDATE domain_loops SET session_position = ?1 WHERE id = ?2")
+        .context("failed to prepare Session Loop ordering update")?;
+    for (position, (loop_id, _)) in loops.iter().enumerate() {
         let temporary = temporary_base
             .checked_add(i64::try_from(position).context("Loop position exceeds SQLite INTEGER")?)
             .context("Loop position exceeds SQLite INTEGER")?;
-        transaction
-            .execute(
-                "UPDATE domain_loops SET session_position = ?1 WHERE id = ?2",
-                params![temporary, loop_id],
-            )
+        update
+            .execute(params![temporary, loop_id])
             .context("failed to stage Session Loop ordering")?;
     }
-    for (position, loop_id) in loop_ids.iter().enumerate() {
-        transaction
-            .execute(
-                "UPDATE domain_loops SET session_position = ?1 WHERE id = ?2",
-                params![
-                    i64::try_from(position).context("Loop position exceeds SQLite INTEGER")?,
-                    loop_id
-                ],
-            )
+    for (position, (loop_id, _)) in loops.iter().enumerate() {
+        update
+            .execute(params![
+                i64::try_from(position).context("Loop position exceeds SQLite INTEGER")?,
+                loop_id
+            ])
             .context("failed to store Session Loop ordering")?;
     }
     Ok(())
@@ -336,6 +350,7 @@ struct ItemWriter<'a, 'connection> {
     call_items: HashMap<String, i64>,
     session_targets: HashMap<String, Option<i64>>,
     pending_outputs: Vec<(i64, String)>,
+    json_buffer: Vec<u8>,
     item_total: u64,
 }
 
@@ -360,6 +375,7 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
             call_items: HashMap::new(),
             session_targets: HashMap::new(),
             pending_outputs: Vec::new(),
+            json_buffer: Vec::with_capacity(512),
             item_total: 0,
         }
     }
@@ -375,22 +391,53 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         if item.semantic_role == semantic::RUNTIME_LIFECYCLE {
             return Ok(false);
         }
-        let evidence = item_record_ids(item, self.record_ids)?;
-        let (role, mut value) = semantic_value(item)?;
-        if let Some(target_native_id) = item.linked_session_native_id.as_deref() {
-            let target_session_id = self.resolve_session_target(target_native_id)?;
-            set_session_link(&mut value, role, target_session_id)?;
-        }
-        let semantic = Semantic {
+        let (primary_record_id, secondary_record_id) = item_record_ids(item, self.record_ids)?;
+        let role = normalized_role(&item.semantic_role, &item.detail)?;
+        let target_session_id =
+            if let Some(target_native_id) = item.linked_session_native_id.as_deref() {
+                let _ = session_link_member(role)?;
+                self.resolve_session_target(target_native_id)?
+                    .map(SessionId)
+            } else {
+                None
+            };
+        let (inline_call_item_id, pending_call_id) = match (&item.detail, role) {
+            (ItemDetail::ToolOutput { call_id, .. }, SemanticRole::ToolOutput) => {
+                if let Some(&call_item_id) = self.call_items.get(call_id) {
+                    (Some(ItemId(call_item_id)), None)
+                } else {
+                    (None, Some(call_id.as_str()))
+                }
+            }
+            _ => (None, None),
+        };
+        let (blob_source, searchable_text) = item_text_sources(item, role);
+        let has_nonempty_text = blob_source
+            .and_then(|content| content.text.as_deref())
+            .is_some_and(|text| !text.is_empty());
+        let blob_ref = blob_source
+            .map(|content| {
+                self.blobs
+                    .intern(self.transaction, content, self.telemetry)
+                    .map(|blob_id| BlobRef { blob_id })
+            })
+            .transpose()?;
+        let stored_semantic = Semantic {
             role,
-            value: value.clone(),
+            value: stored_semantic_value(
+                item,
+                role,
+                blob_ref,
+                target_session_id,
+                inline_call_item_id,
+            )?,
             evidence_strength: evidence_strength(&item.basis),
         };
-        crate::domain::validate_semantic(&semantic)?;
-        let blob_id = semantic_blob(item, &value)
-            .map(|content| self.blobs.intern(self.transaction, content, self.telemetry))
-            .transpose()?;
-        let stored_semantic = stored_semantic(&semantic, blob_id)?;
+        crate::domain::validate_semantic_with_text(&stored_semantic, has_nonempty_text)?;
+
+        self.json_buffer.clear();
+        serde_json::to_writer(&mut self.json_buffer, &stored_semantic)?;
+        let semantic_json = std::str::from_utf8(&self.json_buffer)?;
 
         let started = Instant::now();
         self.transaction
@@ -406,7 +453,7 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
                 loop_id,
                 loop_position,
                 item.ts_ms,
-                serde_json::to_string(&stored_semantic)?,
+                semantic_json,
             ])
             .context("failed to store Item")?;
         self.telemetry
@@ -414,17 +461,24 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         self.telemetry.count_item();
         let item_id = self.transaction.last_insert_rowid();
 
-        for record_id in evidence {
-            self.transaction
+        {
+            let mut insert_evidence = self
+                .transaction
                 .prepare_cached("INSERT INTO item_records(item_id, record_id) VALUES (?1, ?2)")
-                .context("failed to prepare Item Record evidence insert")?
-                .execute(params![item_id, record_id])
+                .context("failed to prepare Item Record evidence insert")?;
+            insert_evidence
+                .execute(params![item_id, primary_record_id])
                 .context("failed to store Item Record evidence")?;
+            if let Some(record_id) = secondary_record_id {
+                insert_evidence
+                    .execute(params![item_id, record_id])
+                    .context("failed to store Item Record evidence")?;
+            }
         }
-        self.remember_tool_link(item, item_id, &value);
+        self.remember_tool_link(item, item_id, pending_call_id);
         self.remember_session_link(item, item_id, role)?;
         if item.searchable
-            && let Some(text) = semantic_text(&value)
+            && let Some(text) = searchable_text
         {
             let started = Instant::now();
             self.transaction
@@ -439,15 +493,16 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         Ok(true)
     }
 
-    fn remember_tool_link(&mut self, item: &ItemProjection, item_id: i64, value: &SemanticValue) {
-        match (&item.detail, value) {
-            (ItemDetail::ToolCall { call_id, .. }, _) => {
-                self.call_items.insert(call_id.clone(), item_id);
-            }
-            (ItemDetail::ToolOutput { call_id, .. }, SemanticValue::ToolOutput(_)) => {
-                self.pending_outputs.push((item_id, call_id.clone()));
-            }
-            _ => {}
+    fn remember_tool_link(
+        &mut self,
+        item: &ItemProjection,
+        item_id: i64,
+        pending_call_id: Option<&str>,
+    ) {
+        if let ItemDetail::ToolCall { call_id, .. } = &item.detail {
+            self.call_items.insert(call_id.clone(), item_id);
+        } else if let Some(call_id) = pending_call_id {
+            self.pending_outputs.push((item_id, call_id.to_owned()));
         }
     }
 
@@ -522,30 +577,6 @@ fn session_link_member(role: SemanticRole) -> Result<&'static str> {
             bail!("only delegation, subagent activity, and subagent report may reference a Session")
         }
     }
-}
-
-fn set_session_link(
-    value: &mut SemanticValue,
-    role: SemanticRole,
-    target_session_id: Option<i64>,
-) -> Result<()> {
-    let target_session_id = target_session_id.map(crate::domain::SessionId);
-    match (role, value) {
-        (SemanticRole::AgentDelegation, SemanticValue::Delegation(value)) => {
-            value.child_session_id = target_session_id;
-        }
-        (SemanticRole::SubagentActivity, SemanticValue::SubagentActivity(value)) => {
-            value.subagent_session_id = target_session_id;
-        }
-        (SemanticRole::SubagentReport, SemanticValue::SubagentReport(value)) => {
-            value.source_session_id = target_session_id;
-        }
-        _ => {
-            let _ = session_link_member(role)?;
-            bail!("Item Session link role and Semantic value do not match")
-        }
-    }
-    Ok(())
 }
 
 fn resolve_tool_output_link(
@@ -629,15 +660,19 @@ fn record_id(record_ids: &HashMap<u64, i64>, seq: u64, fact: &str) -> Result<i64
         .with_context(|| format!("{fact} Record {seq} was not persisted"))
 }
 
-fn item_record_ids(item: &ItemProjection, record_ids: &HashMap<u64, i64>) -> Result<Vec<i64>> {
-    let mut ids = vec![record_id(record_ids, item.record_seq, "Item")?];
-    if let Some(seq) = item.ui_seq {
-        let id = record_id(record_ids, seq, "Item secondary witness")?;
-        if id != ids[0] {
-            ids.push(id);
+fn item_record_ids(
+    item: &ItemProjection,
+    record_ids: &HashMap<u64, i64>,
+) -> Result<(i64, Option<i64>)> {
+    let primary = record_id(record_ids, item.record_seq, "Item")?;
+    let secondary = match item.ui_seq {
+        Some(seq) => {
+            let id = record_id(record_ids, seq, "Item secondary witness")?;
+            (id != primary).then_some(id)
         }
-    }
-    Ok(ids)
+        None => None,
+    };
+    Ok((primary, secondary))
 }
 
 fn loop_end(
@@ -661,13 +696,45 @@ fn loop_end(
     Ok((end_record_id, outcome))
 }
 
-fn preview(item: &ItemProjection) -> Option<crate::domain::TextContent> {
-    item.preview.as_ref().and_then(BoundedText::content)
+/// Selects the Adapter text that backs the public Semantic `TextContent` and
+/// optional full-text search entry without cloning the bounded string.
+///
+/// A Tool Output keeps its text in the typed detail rather than the general
+/// Item preview and is not indexed into conversation search. Every other
+/// text-bearing Semantic value is built from `preview`. Tool arguments and
+/// parsed shell structure remain ordinary typed Semantic data; Blob is not a
+/// generic JSON externalization mechanism.
+fn item_text_sources(
+    item: &ItemProjection,
+    role: SemanticRole,
+) -> (Option<&BoundedText>, Option<&str>) {
+    match role {
+        SemanticRole::AgentToolCall | SemanticRole::AgentToolCallShell => (None, None),
+        SemanticRole::ToolOutput => {
+            let ItemDetail::ToolOutput { output, .. } = &item.detail else {
+                unreachable!("tool output role must carry tool output detail")
+            };
+            let blob = output.as_ref().filter(|content| content.text.is_some());
+            (blob, None)
+        }
+        _ => {
+            let blob = item
+                .preview
+                .as_ref()
+                .filter(|content| content.text.is_some());
+            let searchable_text = blob.and_then(|content| content.text.as_deref());
+            (blob, searchable_text)
+        }
+    }
 }
 
-fn semantic_value(item: &ItemProjection) -> Result<(SemanticRole, SemanticValue)> {
-    let role = normalized_role(&item.semantic_role, &item.detail)?;
-    let text = preview(item);
+fn stored_semantic_value(
+    item: &ItemProjection,
+    role: SemanticRole,
+    blob: Option<BlobRef>,
+    target_session_id: Option<SessionId>,
+    call_item_id: Option<ItemId>,
+) -> Result<SemanticValue<BlobRef>> {
     let has_images = matches!(
         &item.detail,
         ItemDetail::Message {
@@ -682,7 +749,7 @@ fn semantic_value(item: &ItemProjection) -> Result<(SemanticRole, SemanticValue)
             };
             SemanticValue::Reasoning(Reasoning {
                 representation: *representation,
-                text,
+                text: blob,
             })
         }
         SemanticRole::AgentToolCall | SemanticRole::AgentToolCallShell => {
@@ -711,12 +778,12 @@ fn semantic_value(item: &ItemProjection) -> Result<(SemanticRole, SemanticValue)
             }
         }
         SemanticRole::ToolOutput => {
-            let ItemDetail::ToolOutput { output, facts, .. } = &item.detail else {
+            let ItemDetail::ToolOutput { facts, .. } = &item.detail else {
                 unreachable!()
             };
             SemanticValue::ToolOutput(ToolOutput {
-                call_item_id: None,
-                text: output.as_ref().and_then(BoundedText::content),
+                call_item_id,
+                text: blob,
                 exit_code: facts.exit_code,
                 failed: facts.nonzero_exit,
                 duration_ms: facts.duration_ms,
@@ -725,35 +792,38 @@ fn semantic_value(item: &ItemProjection) -> Result<(SemanticRole, SemanticValue)
             })
         }
         SemanticRole::AgentDelegation => SemanticValue::Delegation(Delegation {
-            text,
+            text: blob,
             has_images,
-            child_session_id: None,
+            child_session_id: target_session_id,
         }),
         SemanticRole::SubagentActivity => SemanticValue::SubagentActivity(SubagentActivity {
-            text,
+            text: blob,
             has_images,
-            subagent_session_id: None,
+            subagent_session_id: target_session_id,
         }),
         SemanticRole::SubagentReport => SemanticValue::SubagentReport(SubagentReport {
-            text,
+            text: blob,
             has_images,
-            source_session_id: None,
+            source_session_id: target_session_id,
         }),
         SemanticRole::RuntimeCompactionSummary => {
-            SemanticValue::Compaction(Compaction { summary: text })
+            SemanticValue::Compaction(Compaction { summary: blob })
         }
         SemanticRole::RuntimeInstructions => SemanticValue::Instruction(Instruction {
-            text,
+            text: blob,
             category: instruction_category(&item.semantic_role),
         }),
         SemanticRole::RuntimeContext => SemanticValue::Context(SemanticContext {
-            text,
+            text: blob,
             category: context_category(&item.semantic_role),
             has_images,
         }),
-        _ => SemanticValue::Text(Text { text, has_images }),
+        _ => SemanticValue::Text(Text {
+            text: blob,
+            has_images,
+        }),
     };
-    Ok((role, value))
+    Ok(value)
 }
 
 /// Publishes complete structured arguments as JSON and complete scalar tool
@@ -858,87 +928,85 @@ fn evidence_strength(basis: &str) -> EvidenceStrength {
     }
 }
 
-fn semantic_text(value: &SemanticValue) -> Option<&str> {
-    match value {
-        SemanticValue::Text(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::Reasoning(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::Delegation(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::SubagentActivity(value) => {
-            value.text.as_ref().map(|text| text.value.as_str())
-        }
-        SemanticValue::SubagentReport(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::Compaction(value) => value.summary.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::Instruction(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        SemanticValue::Context(value) => value.text.as_ref().map(|text| text.value.as_str()),
-        _ => None,
-    }
-}
-
-/// Selects the Adapter text that backs the public Semantic `TextContent`.
-///
-/// A Tool Output keeps its text in the typed detail rather than the general
-/// Item preview. Every other current text-bearing Semantic value is built from
-/// `preview`. Tool arguments and parsed shell structure remain ordinary typed
-/// Semantic data; Blob is not a generic JSON externalization mechanism.
-fn semantic_blob<'a>(item: &'a ItemProjection, value: &SemanticValue) -> Option<&'a BoundedText> {
-    match (&item.detail, value) {
-        (ItemDetail::ToolOutput { output, .. }, SemanticValue::ToolOutput(value))
-            if value.text.is_some() =>
-        {
-            output.as_ref()
-        }
-        (_, value) if semantic_text(value).is_some() => item.preview.as_ref(),
-        _ => None,
-    }
-}
-
-/// Produces the complete SQL Semantic encoding stored with an Item.
-///
-/// The domain Semantic uses `TextContent`; its stable SQL representation uses
-/// `{blob_id}` for top-level bounded text. The public Blob relation resolves
-/// that reference without forcing every Item query to join and rebuild JSON.
+/// Converts a domain `Semantic<TextContent>` into its SQL `Semantic<BlobRef>`
+/// access encoding for contract-equivalence tests.
+#[cfg(test)]
 fn stored_semantic(semantic: &Semantic, blob_id: Option<i64>) -> Result<serde_json::Value> {
-    let value = serde_json::to_value(&semantic.value)?;
-    let mut stored = serde_json::json!({
-        "role": semantic.role.as_str(),
-        "value": value,
-        "evidence_strength": semantic.evidence_strength.as_str(),
-    });
-    let text_member = match &semantic.value {
-        SemanticValue::Text(_)
-        | SemanticValue::Reasoning(_)
-        | SemanticValue::ToolOutput(_)
-        | SemanticValue::Delegation(_)
-        | SemanticValue::SubagentActivity(_)
-        | SemanticValue::SubagentReport(_)
-        | SemanticValue::Instruction(_)
-        | SemanticValue::Context(_) => Some("text"),
-        SemanticValue::Compaction(_) => Some("summary"),
-        SemanticValue::ToolCall(_) | SemanticValue::ShellToolCall(_) => None,
+    let blob_ref = |has_text: bool| -> Result<Option<BlobRef>> {
+        match (has_text, blob_id) {
+            (true, Some(blob_id)) => Ok(Some(BlobRef { blob_id })),
+            (false, None) => Ok(None),
+            (true, None) => bail!("text-bearing Semantic value was stored without a Blob"),
+            (false, Some(_)) => bail!("text-bearing Semantic value was not externalized"),
+        }
     };
-
-    if let Some(blob_id) = blob_id {
-        let member = text_member.context("text-bearing Semantic value has no text member")?;
-        let value = stored
-            .get_mut("value")
-            .and_then(serde_json::Value::as_object_mut)
-            .context("Semantic value is not an object")?;
-        let replaced = value.insert(member.to_owned(), serde_json::json!({ "blob_id": blob_id }));
-        ensure!(
-            replaced.is_some(),
-            "text-bearing Semantic value was not externalized"
-        );
-    } else if let Some(member) = text_member {
-        let has_inline_text = stored
-            .get("value")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|value| value.contains_key(member));
-        ensure!(
-            !has_inline_text,
-            "text-bearing Semantic value was stored without a Blob"
-        );
-    }
-    Ok(stored)
+    let value = match &semantic.value {
+        SemanticValue::Text(value) => SemanticValue::Text(Text {
+            text: blob_ref(value.text.is_some())?,
+            has_images: value.has_images,
+        }),
+        SemanticValue::Reasoning(value) => SemanticValue::Reasoning(Reasoning {
+            representation: value.representation,
+            text: blob_ref(value.text.is_some())?,
+        }),
+        SemanticValue::ToolCall(value) => {
+            ensure!(
+                blob_id.is_none(),
+                "text-bearing Semantic value has no text member"
+            );
+            SemanticValue::ToolCall(value.clone())
+        }
+        SemanticValue::ShellToolCall(value) => {
+            ensure!(
+                blob_id.is_none(),
+                "text-bearing Semantic value has no text member"
+            );
+            SemanticValue::ShellToolCall(value.clone())
+        }
+        SemanticValue::ToolOutput(value) => SemanticValue::ToolOutput(ToolOutput {
+            call_item_id: value.call_item_id,
+            text: blob_ref(value.text.is_some())?,
+            exit_code: value.exit_code,
+            failed: value.failed,
+            duration_ms: value.duration_ms,
+            runtime_truncated: value.runtime_truncated,
+            runtime_output_tokens: value.runtime_output_tokens,
+        }),
+        SemanticValue::Delegation(value) => SemanticValue::Delegation(Delegation {
+            text: blob_ref(value.text.is_some())?,
+            has_images: value.has_images,
+            child_session_id: value.child_session_id,
+        }),
+        SemanticValue::SubagentActivity(value) => {
+            SemanticValue::SubagentActivity(SubagentActivity {
+                text: blob_ref(value.text.is_some())?,
+                has_images: value.has_images,
+                subagent_session_id: value.subagent_session_id,
+            })
+        }
+        SemanticValue::SubagentReport(value) => SemanticValue::SubagentReport(SubagentReport {
+            text: blob_ref(value.text.is_some())?,
+            has_images: value.has_images,
+            source_session_id: value.source_session_id,
+        }),
+        SemanticValue::Compaction(value) => SemanticValue::Compaction(Compaction {
+            summary: blob_ref(value.summary.is_some())?,
+        }),
+        SemanticValue::Instruction(value) => SemanticValue::Instruction(Instruction {
+            text: blob_ref(value.text.is_some())?,
+            category: value.category,
+        }),
+        SemanticValue::Context(value) => SemanticValue::Context(SemanticContext {
+            text: blob_ref(value.text.is_some())?,
+            category: value.category,
+            has_images: value.has_images,
+        }),
+    };
+    Ok(serde_json::to_value(Semantic {
+        role: semantic.role,
+        value,
+        evidence_strength: semantic.evidence_strength,
+    })?)
 }
 
 fn shell_fragments(syntax: Option<&SyntaxProjection>) -> Result<Vec<ShellFragment>> {
@@ -1143,5 +1211,203 @@ mod tests {
 
         assert_eq!(semantic["value"]["call_item_id"], 3);
         assert_eq!(semantic["value"]["text"]["blob_id"], 42);
+    }
+
+    fn test_tool_call(seq: u64, call_id: &str) -> crate::adapters::projection::ItemProjection {
+        crate::adapters::projection::ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms: Some(1_000 + i64::try_from(seq).expect("seq")),
+            semantic_role: crate::adapters::semantic::AGENT_TOOL_CALL.to_owned(),
+            basis: crate::adapters::semantic::basis::RECORD_KIND.to_owned(),
+            preview: None,
+            detail: crate::adapters::projection::ItemDetail::ToolCall {
+                call_id: call_id.to_owned(),
+                name: Some("read".to_owned()),
+                cmd: None,
+                cmd_lang: None,
+                workdir: None,
+                args: None,
+                syntax: None,
+            },
+            linked_session_native_id: None,
+            searchable: false,
+        }
+    }
+
+    fn test_tool_output(seq: u64, call_id: &str) -> crate::adapters::projection::ItemProjection {
+        crate::adapters::projection::ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms: Some(1_000 + i64::try_from(seq).expect("seq")),
+            semantic_role: crate::adapters::semantic::TOOL_OUTPUT.to_owned(),
+            basis: crate::adapters::semantic::basis::RECORD_KIND.to_owned(),
+            preview: None,
+            detail: crate::adapters::projection::ItemDetail::ToolOutput {
+                call_id: call_id.to_owned(),
+                output: Some(crate::adapters::projection::BoundedText::bounded("ok", 64)),
+                facts: crate::adapters::projection::ToolOutputFacts::default(),
+            },
+            linked_session_native_id: None,
+            searchable: false,
+        }
+    }
+
+    #[test]
+    fn tool_output_links_inline_when_call_precedes_output_and_defers_when_out_of_order() {
+        use std::collections::HashMap;
+        use tempfile::tempdir;
+
+        use super::ItemWriter;
+        use crate::indexing::telemetry::IndexTelemetry;
+        use crate::storage::blob::BlobCache;
+        use crate::storage::db::Store;
+
+        let dir = tempdir().expect("temp dir");
+        let mut store = Store::open(&dir.path().join("index.sqlite")).expect("open store");
+        let tx = store.connection_mut().transaction().expect("begin tx");
+        tx.execute(
+            "INSERT INTO trace_sources(adapter, path) VALUES ('codex', '/tmp/t.jsonl')",
+            [],
+        )
+        .expect("insert source");
+        let source_id = tx.last_insert_rowid();
+        let mut record_ids = HashMap::new();
+        for seq in 0_u64..4 {
+            tx.execute(
+                "INSERT INTO trace_records(source_id, seq, byte_offset, byte_length, raw_hash, native_type, parse_status)
+                 VALUES (?1, ?2, ?2, 1, 'h', 't', 'ok')",
+                rusqlite::params![source_id, i64::try_from(seq).expect("seq")],
+            )
+            .expect("insert record");
+            record_ids.insert(seq, tx.last_insert_rowid());
+        }
+        tx.execute(
+            "INSERT INTO domain_sessions(runtime, native_id) VALUES ('codex', 's1')",
+            [],
+        )
+        .expect("insert session");
+        let session_id = tx.last_insert_rowid();
+
+        let mut blobs = BlobCache::default();
+        let mut telemetry = IndexTelemetry::new();
+        let mut writer = ItemWriter::new(
+            &tx,
+            source_id,
+            session_id,
+            "codex".to_owned(),
+            &record_ids,
+            &mut blobs,
+            &mut telemetry,
+        );
+        // In-order pair: call (seq 0) before output (seq 1)
+        writer
+            .write(&test_tool_call(0, "c-inline"), None, None)
+            .expect("write call");
+        writer
+            .write(&test_tool_output(1, "c-inline"), None, None)
+            .expect("write output");
+        assert!(
+            writer.pending_outputs.is_empty(),
+            "in-order tool output should resolve inline without deferred UPDATE"
+        );
+        // Out-of-order pair: output (seq 2) before call (seq 3)
+        writer
+            .write(&test_tool_output(2, "c-deferred"), None, None)
+            .expect("write early output");
+        assert_eq!(writer.pending_outputs.len(), 1);
+        writer
+            .write(&test_tool_call(3, "c-deferred"), None, None)
+            .expect("write late call");
+        writer.finish().expect("finish writer");
+
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT id, semantic FROM domain_items ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(rows.len(), 4);
+        let inline_out: serde_json::Value = serde_json::from_str(&rows[1].1).expect("json");
+        assert_eq!(inline_out["value"]["call_item_id"], rows[0].0);
+        let deferred_out: serde_json::Value = serde_json::from_str(&rows[2].1).expect("json");
+        assert_eq!(deferred_out["value"]["call_item_id"], rows[3].0);
+    }
+
+    #[test]
+    fn normalize_loop_positions_skips_updates_when_already_ordered() {
+        use tempfile::tempdir;
+
+        use super::normalize_loop_positions;
+        use crate::storage::db::Store;
+
+        let dir = tempdir().expect("temp dir");
+        let mut store = Store::open(&dir.path().join("index.sqlite")).expect("open store");
+        let tx = store.connection_mut().transaction().expect("begin tx");
+        tx.execute(
+            "INSERT INTO trace_sources(adapter, path) VALUES ('codex', '/tmp/t.jsonl')",
+            [],
+        )
+        .expect("insert source");
+        let source_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO domain_sessions(runtime, native_id) VALUES ('codex', 's1')",
+            [],
+        )
+        .expect("insert session");
+        let session_id = tx.last_insert_rowid();
+
+        let mut rec_ids = Vec::new();
+        for (seq, ts) in [(0_i64, 100_i64), (1, 200)] {
+            tx.execute(
+                "INSERT INTO trace_records(source_id, seq, byte_offset, byte_length, raw_hash, ts_ms, native_type, parse_status)
+                 VALUES (?1, ?2, ?2, 1, 'h', ?3, 't', 'ok')",
+                rusqlite::params![source_id, seq, ts],
+            )
+            .expect("insert record");
+            rec_ids.push(tx.last_insert_rowid());
+        }
+        tx.execute(
+            "INSERT INTO session_sources(session_id, source_id, identity_record_id, created_at)
+             VALUES (?1, ?2, ?3, 100)",
+            rusqlite::params![session_id, source_id, rec_ids[0]],
+        )
+        .expect("insert session_source");
+        for (pos, rec_id) in rec_ids.iter().enumerate() {
+            let pos = i64::try_from(pos).expect("pos");
+            tx.execute(
+                "INSERT INTO domain_loops(source_id, session_id, ordinal, session_position, start_record_id)
+                 VALUES (?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![source_id, session_id, pos, rec_id],
+            )
+            .expect("insert loop");
+        }
+
+        let before = tx.total_changes();
+        normalize_loop_positions(&tx, session_id).expect("normalize ordered loops");
+        assert_eq!(
+            tx.total_changes(),
+            before,
+            "already-ordered loops should not run redundant UPDATE statements"
+        );
+
+        // Now reverse timestamps and confirm reordering still runs cleanly.
+        tx.execute(
+            "UPDATE trace_records SET ts_ms = 300 WHERE id = ?1",
+            [rec_ids[0]],
+        )
+        .expect("update ts");
+        normalize_loop_positions(&tx, session_id).expect("normalize reordered loops");
+        let positions: Vec<(i64, i64)> = tx
+            .prepare("SELECT ordinal, session_position FROM domain_loops ORDER BY session_position")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(positions, vec![(1, 0), (0, 1)]);
     }
 }
