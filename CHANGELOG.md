@@ -2,6 +2,15 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.1] - 2026-11-22
+
+### Changed
+
+- Accelerate Source discovery by short-circuiting Antigravity conversation directories directly to `.system_generated/logs`, using `DirEntry::file_type()`, and reusing canonical paths and `stat` metadata across discovery and synchronization.
+- Decode `.jsonl.zst` archives into a bounded (`32 MiB`) reusable in-memory buffer during indexing (spilling larger archives transparently to an anonymous temporary file) to eliminate temporary-file disk write/read overhead for most compressed rollouts.
+- Pipeline new-Source preparation (decoding, line framing, BLAKE3 hashing, JSON parsing, projection, and shell parsing) across a bounded pool of up to 4 worker threads while preserving exact deterministic discovery order and single-writer per-Source `SQLite` transactions. Storage Format 4 is unchanged; existing Format 4 indexes need no reindexing.
+- Document the SQLite unary `+call.item_id` expression-index seek idiom for reverse-direction `call LEFT JOIN output` queries in `how-to/query-evidence`.
+
 ## [0.5.0] - 2026-11-22
 
 ### Added
