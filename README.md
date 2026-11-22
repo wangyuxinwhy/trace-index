@@ -9,7 +9,7 @@ Trace Index is a local, bounded-memory query plane for Agent trace files. It ind
 Install from crates.io when a Rust toolchain is available:
 
 ```bash
-cargo install trace-index --version 0.5.2 --locked
+cargo install trace-index --version 0.5.3 --locked
 ```
 
 Or install a verified prebuilt binary on Apple Silicon macOS, Intel macOS, or x86-64 Linux:
@@ -42,7 +42,7 @@ trace-index query run \
   "SELECT json_extract(semantic, '$.role') AS role, COUNT(*) AS item_count FROM items GROUP BY role"
 ```
 
-Read commands never synchronize or mutate the index. Run `index sync` explicitly when newly written traces are required.
+Read commands never synchronize or mutate the index. Check `index status` for coverage and live `index watch` state, run `index sync` on demand when newly written traces are required, or opt in to `index watch run` / `index watch install`.
 
 ## For Agents
 
