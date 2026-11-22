@@ -15,7 +15,7 @@ trace-index config show
 trace-index config check
 ```
 
-`--discover` adds only standard Codex, Pi, and Claude Code roots that currently exist. Use repeatable `--root PATH` instead when the scope must be explicit. Initialization creates and validates only the configuration file; it does not create the database or synchronize traces. You can also leave roots empty and pass files or directories directly to `index sync`.
+`--discover` adds only standard Codex, Pi, Claude Code, and Antigravity CLI roots that currently exist. Use repeatable `--root PATH` instead when the scope must be explicit. Initialization creates and validates only the configuration file; it does not create the database or synchronize traces. You can also leave roots empty and pass files or directories directly to `index sync`.
 
 ## 2. Build the index
 

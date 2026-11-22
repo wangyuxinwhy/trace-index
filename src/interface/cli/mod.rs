@@ -461,7 +461,7 @@ enum ConfigCommand {
         #[arg(long, value_name = "PATH")]
         root: Vec<PathBuf>,
 
-        /// Add standard Codex, Pi, and Claude Code roots that currently exist.
+        /// Add standard Codex, Pi, Claude Code, and Antigravity CLI roots that currently exist.
         #[arg(long)]
         discover: bool,
     },

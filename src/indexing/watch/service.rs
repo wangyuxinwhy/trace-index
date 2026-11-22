@@ -376,19 +376,40 @@ fn current_uid() -> Result<String> {
 fn load_os_service(descriptor: &ServiceDescriptor) -> Result<()> {
     match descriptor.platform {
         "macos-launchd" => {
+            const LAUNCHD_BOOTSTRAP_ATTEMPTS: usize = 10;
+            const LAUNCHD_BOOTSTRAP_RETRY_DELAY: std::time::Duration =
+                std::time::Duration::from_millis(150);
+
             let domain = format!("gui/{}", current_uid()?);
             let target = format!("{domain}/{}", descriptor.service_id);
-            // Ignore errors if not previously loaded.
+            // Unload any previous instance first. `launchctl bootout` tears down
+            // running jobs asynchronously, so retry transient `bootstrap` exit-5
+            // (EIO) failures while launchd finishes releasing the service slot
+            // (including right after a separate `index watch uninstall`).
             let _ = Command::new("launchctl")
                 .args(["bootout", &target])
                 .output();
-            let output = Command::new("launchctl")
-                .arg("bootstrap")
-                .arg(&domain)
-                .arg(&descriptor.service_path)
-                .output()
-                .context("failed to execute `launchctl bootstrap`")?;
-            if !output.status.success() {
+            let mut last_output = None;
+            for attempt in 0..LAUNCHD_BOOTSTRAP_ATTEMPTS {
+                if attempt > 0 {
+                    std::thread::sleep(LAUNCHD_BOOTSTRAP_RETRY_DELAY);
+                }
+                let output = Command::new("launchctl")
+                    .arg("bootstrap")
+                    .arg(&domain)
+                    .arg(&descriptor.service_path)
+                    .output()
+                    .context("failed to execute `launchctl bootstrap`")?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                let retryable_eio = output.status.code() == Some(5);
+                last_output = Some(output);
+                if !retryable_eio {
+                    break;
+                }
+            }
+            if let Some(output) = last_output {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 bail!(
                     "`launchctl bootstrap` failed with status {}: {}",
