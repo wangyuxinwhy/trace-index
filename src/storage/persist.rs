@@ -21,8 +21,9 @@ use super::semantic_encode::{
 };
 use crate::adapters::projection::{ItemDetail, ItemProjection, LoopProjection, SessionProjection};
 use crate::adapters::semantic;
-use crate::domain::{ItemId, Semantic, SemanticRole, SessionId};
+use crate::domain::{EvidenceStrength, ItemId, Semantic, SemanticRole, SessionId};
 use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
+use crate::shell::syntax::ShellParser;
 
 pub(crate) fn clear_projection(transaction: &Transaction<'_>, source_id: i64) -> Result<()> {
     transaction
@@ -395,6 +396,12 @@ pub(super) struct ExistingSessionLink {
     pub(super) json_member: String,
 }
 
+enum ExistingBlobRef {
+    Absent,
+    Present(BlobRef),
+    Missing,
+}
+
 pub(super) struct ExistingItem {
     pub(super) id: i64,
     pub(super) loop_position: Option<i64>,
@@ -413,6 +420,9 @@ pub(super) struct ItemWriter<'a, 'connection> {
     record_ids: &'a HashMap<u64, i64>,
     blobs: &'a mut BlobCache,
     pub(super) telemetry: &'a mut IndexTelemetry,
+    shell_parser: Option<&'a mut ShellParser>,
+    max_text_bytes: usize,
+    trusted_prefix_limit: Option<u64>,
     call_items: HashMap<String, i64>,
     session_targets: HashMap<String, Option<i64>>,
     pending_outputs: Vec<PendingOutput>,
@@ -438,6 +448,9 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
             record_ids,
             blobs,
             telemetry,
+            shell_parser: None,
+            max_text_bytes: 0,
+            trusted_prefix_limit: None,
             call_items: HashMap::new(),
             session_targets: HashMap::new(),
             pending_outputs: Vec::new(),
@@ -446,12 +459,40 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         }
     }
 
+    /// Attaches lazy shell parsing and verified-prefix preservation context for
+    /// incremental append-only synchronization.
+    pub(super) fn with_incremental_context(
+        mut self,
+        shell_parser: &'a mut ShellParser,
+        max_text_bytes: usize,
+        trusted_prefix_limit: Option<u64>,
+    ) -> Self {
+        self.shell_parser = Some(shell_parser);
+        self.max_text_bytes = max_text_bytes;
+        self.trusted_prefix_limit = trusted_prefix_limit;
+        self
+    }
+
+    fn is_trusted_prefix_item(&self, item: &ItemProjection) -> bool {
+        self.trusted_prefix_limit.is_some_and(|limit| {
+            item.record_seq < limit && item.ui_seq.is_none_or(|seq| seq < limit)
+        })
+    }
+
+    fn ensure_shell_parsed(&mut self, item: &mut ItemProjection) {
+        if needs_lazy_shell_parse(item)
+            && let Some(parser) = self.shell_parser.as_deref_mut()
+        {
+            parser.parse_item_command(item, self.max_text_bytes);
+        }
+    }
+
     /// Checks whether an existing persisted Item is semantically and structurally
     /// identical to `item` at `loop_position`, preserving its `item_id` and
     /// recording its `ToolCall` / deferred `ToolOutput` linkage when matched.
     pub(super) fn try_preserve_existing(
         &mut self,
-        item: &ItemProjection,
+        item: &mut ItemProjection,
         existing: &ExistingItem,
         loop_position: Option<i64>,
     ) -> Result<bool> {
@@ -462,6 +503,22 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         if !record_witnesses_match(&existing.record_ids, primary_record_id, secondary_record_id) {
             return Ok(false);
         }
+
+        let trusted_prefix = self.is_trusted_prefix_item(item);
+        // Fast path for cryptographically verified prefix Items with no Session
+        // link: every Record witness is bit-identical to when the row was
+        // persisted, so verifying role, evidence strength, blob presence, and
+        // tool-call linkage proves semantic equivalence in O(1) without
+        // re-running tree-sitter, probing `content_blobs`, or re-serializing
+        // JSON for tens of thousands of unchanged historical Items.
+        if trusted_prefix
+            && item.linked_session_native_id.is_none()
+            && existing.session_link.is_none()
+            && let Some(preserved) = self.try_preserve_trusted_prefix_fast(item, existing)?
+        {
+            return Ok(preserved);
+        }
+        self.ensure_shell_parsed(item);
 
         let role = normalized_role(&item.semantic_role, &item.detail)?;
         let target_session_id =
@@ -502,14 +559,14 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         let has_nonempty_text = blob_source
             .and_then(|content| content.text.as_deref())
             .is_some_and(|text| !text.is_empty());
-        let blob_ref = match blob_source {
-            Some(content) => {
-                let Some(blob_id) = self.blobs.lookup_existing(self.transaction, content)? else {
-                    return Ok(false);
-                };
-                Some(BlobRef { blob_id })
-            }
-            None => None,
+        let blob_ref = match self.resolve_existing_blob_ref(
+            blob_source,
+            trusted_prefix,
+            &existing.semantic,
+        )? {
+            ExistingBlobRef::Absent => None,
+            ExistingBlobRef::Present(reference) => Some(reference),
+            ExistingBlobRef::Missing => return Ok(false),
         };
 
         let stored_semantic = Semantic {
@@ -553,6 +610,97 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         }
         self.item_total += 1;
         Ok(true)
+    }
+
+    /// Resolves the `BlobRef` for an existing Item, distinguishing an Item
+    /// without text from one whose required Blob is not yet in storage.
+    fn resolve_existing_blob_ref(
+        &mut self,
+        blob_source: Option<&crate::adapters::projection::BoundedText>,
+        trusted_prefix: bool,
+        existing_semantic: &str,
+    ) -> Result<ExistingBlobRef> {
+        let Some(content) = blob_source else {
+            return Ok(ExistingBlobRef::Absent);
+        };
+        let blob_id = if trusted_prefix
+            && let Some(existing_id) = extract_existing_blob_id(existing_semantic)
+        {
+            existing_id
+        } else {
+            let Some(blob_id) = self.blobs.lookup_existing(self.transaction, content)? else {
+                return Ok(ExistingBlobRef::Missing);
+            };
+            blob_id
+        };
+        Ok(ExistingBlobRef::Present(BlobRef { blob_id }))
+    }
+
+    /// Attempts O(1) preservation of a verified-prefix Item whose witnesses
+    /// precede `resume_line` and that carries no cross-Session link.
+    ///
+    /// Returns `Ok(Some(true))` when preserved, or `Ok(None)` to fall back to
+    /// the full exact comparison path.
+    fn try_preserve_trusted_prefix_fast(
+        &mut self,
+        item: &ItemProjection,
+        existing: &ExistingItem,
+    ) -> Result<Option<bool>> {
+        let role = if needs_lazy_shell_parse(item) {
+            SemanticRole::AgentToolCallShell
+        } else {
+            normalized_role(&item.semantic_role, &item.detail)?
+        };
+        let strength = match evidence_strength(&item.basis) {
+            EvidenceStrength::Structural => "structural",
+            EvidenceStrength::Heuristic => "heuristic",
+        };
+        if !semantic_has_role_and_strength(&existing.semantic, role.as_str(), strength) {
+            return Ok(None);
+        }
+        let (blob_source, _) = item_text_sources(item, role);
+        let existing_has_blob = extract_existing_blob_id(&existing.semantic).is_some();
+        if blob_source.is_some() != existing_has_blob {
+            return Ok(None);
+        }
+
+        let pending_call_id = match (&item.detail, role) {
+            (ItemDetail::ToolOutput { call_id, .. }, SemanticRole::ToolOutput) => {
+                if let Some(&call_item_id) = self.call_items.get(call_id) {
+                    if existing.call_item_id != Some(call_item_id) {
+                        return Ok(None);
+                    }
+                    None
+                } else {
+                    Some(call_id.as_str())
+                }
+            }
+            _ => None,
+        };
+
+        if let ItemDetail::ToolCall { call_id, .. } = &item.detail {
+            self.call_items.insert(call_id.clone(), existing.id);
+        } else if let Some(call_id) = pending_call_id {
+            self.pending_outputs.push(PendingOutput {
+                item_id: existing.id,
+                call_id: call_id.to_owned(),
+                stored_link: existing.call_item_id,
+            });
+        }
+        self.item_total += 1;
+        Ok(Some(true))
+    }
+
+    /// Writes one selected Item after lazily parsing declared shell syntax if
+    /// it was deferred during incremental prefix projection.
+    pub(super) fn write_mut(
+        &mut self,
+        item: &mut ItemProjection,
+        loop_id: Option<i64>,
+        loop_position: Option<i64>,
+    ) -> Result<bool> {
+        self.ensure_shell_parsed(item);
+        self.write(item, loop_id, loop_position)
     }
 
     /// Writes one selected Item. Returns false for lifecycle-only projections,
@@ -774,6 +922,67 @@ fn record_witnesses_match(existing: &[i64], primary: i64, secondary: Option<i64>
         None => existing == [primary],
         Some(secondary) => existing == [primary, secondary] || existing == [secondary, primary],
     }
+}
+
+fn needs_lazy_shell_parse(item: &ItemProjection) -> bool {
+    item.semantic_role == semantic::AGENT_TOOL_CALL
+        && matches!(
+            &item.detail,
+            ItemDetail::ToolCall {
+                cmd: Some(text),
+                cmd_lang: Some(_),
+                syntax: None,
+                ..
+            } if !text.is_empty()
+        )
+}
+
+/// Extracts the top-level `BlobRef` id (`"text":{"blob_id":N}` or
+/// `"summary":{"blob_id":N}`) from a stored `Semantic<BlobRef>` JSON string.
+fn extract_existing_blob_id(semantic_json: &str) -> Option<i64> {
+    for marker in ["\"text\":{\"blob_id\":", "\"summary\":{\"blob_id\":"] {
+        if let Some(start) = semantic_json.find(marker) {
+            let rest = &semantic_json[start + marker.len()..];
+            let end = rest.find('}')?;
+            return rest[..end].parse::<i64>().ok();
+        }
+    }
+    None
+}
+
+/// Extracts `$.value.call_item_id` from a stored `tool.output` Semantic JSON
+/// string without invoking `SQLite`'s JSON parser on every non-tool-output row.
+pub(super) fn extract_existing_call_item_id(semantic_json: &str) -> Option<i64> {
+    if !semantic_json.starts_with("{\"role\":\"tool.output\",") {
+        return None;
+    }
+    let marker = "\"call_item_id\":";
+    let start = semantic_json.find(marker)?;
+    let rest = &semantic_json[start + marker.len()..];
+    let digits = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit() || *byte == b'-')
+        .count();
+    rest[..digits].parse::<i64>().ok()
+}
+
+fn semantic_has_role_and_strength(semantic_json: &str, role: &str, strength: &str) -> bool {
+    let Some(after_role_key) = semantic_json.strip_prefix("{\"role\":\"") else {
+        return false;
+    };
+    let Some(after_role) = after_role_key.strip_prefix(role) else {
+        return false;
+    };
+    if !after_role.starts_with("\",\"value\":") {
+        return false;
+    }
+    let Some(before_close) = semantic_json.strip_suffix("\"}") else {
+        return false;
+    };
+    let Some(before_strength) = before_close.strip_suffix(strength) else {
+        return false;
+    };
+    before_strength.ends_with(",\"evidence_strength\":\"")
 }
 
 fn resolve_tool_output_link(

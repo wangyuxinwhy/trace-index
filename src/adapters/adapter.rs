@@ -132,6 +132,17 @@ impl Projector {
         }
     }
 
+    /// Returns true when an already-persisted prefix line provably has no
+    /// effect on projection, avoiding full `serde_json::Value` DOM allocation
+    /// on large ignored records during incremental appends.
+    pub(crate) fn can_skip_prefix_record(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Codex(projector) => projector.can_skip_prefix_record(bytes),
+            Self::Antigravity(projector) => projector.can_skip_prefix_record(bytes),
+            Self::Pi(_) | Self::Claude(_) => false,
+        }
+    }
+
     /// Hands over sessions that are already closed, so a long source is not
     /// held in memory all at once.
     pub(crate) fn drain_completed(&mut self) -> Vec<SessionProjection> {

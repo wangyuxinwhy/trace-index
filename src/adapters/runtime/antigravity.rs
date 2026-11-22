@@ -125,6 +125,38 @@ impl AntigravityProjector {
         self.session
     }
 
+    /// Returns true when an already-indexed prefix line provably cannot affect
+    /// Antigravity projection, avoiding full JSON DOM allocation on ignored
+    /// `GENERIC` / `CHECKPOINT` steps during incremental append scans.
+    pub(crate) fn can_skip_prefix_record(&self, bytes: &[u8]) -> bool {
+        if !self.session.identity_confirmed {
+            return false;
+        }
+        // Antigravity writes top-level metadata (`step_index`, `source`,
+        // `type`, `status`, `created_at`) before any free-text payload keys.
+        // Inspect only the metadata prefix before the first payload key so we
+        // never scan multi-kilobyte `content` or `thinking` strings and cannot
+        // match text inside a payload value.
+        let head = &bytes[..bytes.len().min(256)];
+        let meta_end = earliest_subslice(
+            head,
+            &[
+                b"\"content\"",
+                b"\"thinking\"",
+                b"\"tool_calls\"",
+                b"\"error\"",
+                b"\"media\"",
+            ],
+        )
+        .unwrap_or(head.len());
+        let meta = &head[..meta_end];
+        !contains_subslice(meta, b"\\u")
+            && (contains_subslice(meta, b"\"type\":\"GENERIC\"")
+                || contains_subslice(meta, b"\"type\": \"GENERIC\"")
+                || contains_subslice(meta, b"\"type\":\"CHECKPOINT\"")
+                || contains_subslice(meta, b"\"type\": \"CHECKPOINT\""))
+    }
+
     pub(crate) fn push(&mut self, seq: u64, value: &Value) {
         if !is_step(value) {
             return;
@@ -294,4 +326,21 @@ impl Step<'_> {
             },
         )
     }
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn earliest_subslice(haystack: &[u8], needles: &[&[u8]]) -> Option<usize> {
+    needles
+        .iter()
+        .filter_map(|needle| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == *needle)
+        })
+        .min()
 }

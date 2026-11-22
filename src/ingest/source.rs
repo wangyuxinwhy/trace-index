@@ -391,6 +391,13 @@ pub(crate) enum RecordReadInto {
     End,
 }
 
+/// Tracks the new whole-prefix `BLAKE3` digest while optionally verifying an
+/// earlier indexed byte prefix during the same sequential read pass.
+pub(crate) struct PrefixVerify<'a> {
+    pub(crate) hasher: &'a mut blake3::Hasher,
+    pub(crate) remaining: u64,
+}
+
 /// Reads one newline-terminated Record into a caller-reused byte buffer.
 ///
 /// Skipping `compute_record_hash` avoids hashing already-persisted prefix lines
@@ -399,7 +406,45 @@ pub(crate) enum RecordReadInto {
 pub(crate) fn read_bounded_record_into(
     reader: &mut impl BufRead,
     max_record_bytes: usize,
+    prefix_hasher: Option<&mut blake3::Hasher>,
+    compute_record_hash: bool,
+    buffer: &mut Vec<u8>,
+) -> Result<RecordReadInto> {
+    read_bounded_record_inner(
+        reader,
+        max_record_bytes,
+        prefix_hasher,
+        None,
+        compute_record_hash,
+        buffer,
+    )
+}
+
+/// Reads one newline-terminated Record while updating both the new whole-prefix
+/// digest and an optional verification digest over the previously indexed prefix.
+pub(crate) fn read_bounded_record_with_verify(
+    reader: &mut impl BufRead,
+    max_record_bytes: usize,
+    prefix_hasher: Option<&mut blake3::Hasher>,
+    verify: Option<&mut PrefixVerify<'_>>,
+    compute_record_hash: bool,
+    buffer: &mut Vec<u8>,
+) -> Result<RecordReadInto> {
+    read_bounded_record_inner(
+        reader,
+        max_record_bytes,
+        prefix_hasher,
+        verify,
+        compute_record_hash,
+        buffer,
+    )
+}
+
+fn read_bounded_record_inner(
+    reader: &mut impl BufRead,
+    max_record_bytes: usize,
     mut prefix_hasher: Option<&mut blake3::Hasher>,
+    mut verify: Option<&mut PrefixVerify<'_>>,
     compute_record_hash: bool,
     buffer: &mut Vec<u8>,
 ) -> Result<RecordReadInto> {
@@ -437,8 +482,16 @@ pub(crate) fn read_bounded_record_into(
         }
 
         let consume = data_len + usize::from(newline.is_some());
+        let consumed_slice = &available[..consume];
         if let Some(hasher) = prefix_hasher.as_deref_mut() {
-            hasher.update(&available[..consume]);
+            hasher.update(consumed_slice);
+        }
+        if let Some(verify) = verify.as_deref_mut()
+            && verify.remaining > 0
+        {
+            let take = usize::try_from(verify.remaining.min(consumed_slice.len() as u64))?;
+            verify.hasher.update(&consumed_slice[..take]);
+            verify.remaining -= u64::try_from(take)?;
         }
         reader.consume(consume);
         consumed_bytes += u64::try_from(consume)?;

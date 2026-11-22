@@ -1782,3 +1782,166 @@ fn pipelined_batch_preserves_deterministic_order_and_isolates_unrecognized_sourc
         ]
     );
 }
+
+fn write_append_only_fast_path_fixtures(root: &Path) -> (PathBuf, PathBuf) {
+    let codex_trace = root.join("codex-append.jsonl");
+    let agy_logs = root
+        .join("brain")
+        .join("955c79ca-6f59-46b9-8a47-c8ab27227b8a")
+        .join(".system_generated")
+        .join("logs");
+    fs::create_dir_all(&agy_logs).expect("create antigravity logs dir");
+    let agy_trace = agy_logs.join("transcript_full.jsonl");
+
+    write_jsonl(
+        &codex_trace,
+        &[
+            json!({"timestamp":"2026-08-20T00:00:00.000Z","type":"session_meta","payload":{"id":"codex-fast","cwd":"/repo"}}),
+            json!({"timestamp":"2026-08-20T00:00:00.050Z","type":"world_state","payload":{"full":true,"state":{"k":"v"}}}),
+            json!({"timestamp":"2026-08-20T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5"}}),
+            json!({"timestamp":"2026-08-20T00:00:00.150Z","type":"event_msg","payload":{"type":"user_message","message":"run status"}}),
+            json!({"timestamp":"2026-08-20T00:00:00.200Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"git status\",\"workdir\":\"/repo\"}"}}),
+            json!({"timestamp":"2026-08-20T00:00:00.250Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}),
+            json!({"timestamp":"2026-08-20T00:00:00.300Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","content":"big"}]}}),
+        ],
+    );
+    write_jsonl(
+        &agy_trace,
+        &[
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-20T00:00:01Z","content":"check tests"}),
+            json!({"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-08-20T00:00:02Z","content":"ignored display row"}),
+            json!({"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-08-20T00:00:03Z","model":"gemini-2.5","thinking":"plan","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test --locked","Cwd":"/repo"}}]}),
+            json!({"step_index":3,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-08-20T00:00:04Z","content":"ignored checkpoint"}),
+        ],
+    );
+    (codex_trace, agy_trace)
+}
+
+fn dump_indexed_items(store: &Store) -> Vec<(String, i64, String, String)> {
+    store
+        .connection()
+        .prepare(
+            "SELECT s.native_id, COALESCE(i.loop_position, -1),
+                    json_extract(i.semantic, '$.role'),
+                    COALESCE(json_extract(i.semantic, '$.value.tool_name'), '')
+               FROM domain_items i
+               JOIN domain_sessions s ON s.id = i.session_id
+              ORDER BY s.native_id, i.id",
+        )
+        .expect("prep")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect")
+}
+
+#[test]
+fn append_only_fast_path_matches_full_rebuild_and_recovers_from_prefix_rewrite() {
+    use std::io::Write as _;
+
+    let traces = tempdir().expect("trace directory");
+    let (codex_trace, agy_trace) = write_append_only_fast_path_fixtures(traces.path());
+
+    let db_dir = tempdir().expect("database directory");
+    let mut inc_store = Store::open(&db_dir.path().join("inc.sqlite")).expect("open inc");
+    let options = IndexOptions {
+        rebuild: false,
+        max_record_bytes: 16 * 1024 * 1024,
+        max_text_bytes: 64 * 1024,
+    };
+    let both = [codex_trace.clone(), agy_trace.clone()];
+    let initial = index_paths(&mut inc_store, &both, &options).expect("initial sync");
+    assert_eq!(initial.indexed_files, 2);
+
+    let initial_item_ids: Vec<i64> = inc_store
+        .connection()
+        .prepare("SELECT id FROM domain_items ORDER BY id")
+        .expect("prep")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+
+    // Append new complete records to both Codex and Antigravity traces.
+    let mut codex_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&codex_trace)
+        .expect("open codex append");
+    writeln!(
+        codex_file,
+        "{}",
+        json!({"timestamp":"2026-08-20T00:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{\"cmd\":\"ls -la\"}"}})
+    )
+    .expect("append codex call");
+    writeln!(
+        codex_file,
+        "{}",
+        json!({"timestamp":"2026-08-20T00:00:01.100Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"all done"}]}})
+    )
+    .expect("append codex answer");
+    let mut agy_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&agy_trace)
+        .expect("open agy append");
+    writeln!(
+        agy_file,
+        "{}",
+        json!({"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-08-20T00:00:05Z","content":"tests passed"})
+    )
+    .expect("append agy answer");
+
+    let appended = index_paths(&mut inc_store, &both, &options).expect("append sync");
+    assert_eq!(appended.indexed_files, 2);
+    assert_eq!(appended.rebuilt_files, 0);
+    assert!(
+        appended
+            .source_results
+            .iter()
+            .all(|res| res.action == "appended"),
+        "both sources must take the append-only fast path: {:?}",
+        appended.source_results
+    );
+
+    let after_append_ids: Vec<i64> = inc_store
+        .connection()
+        .prepare("SELECT id FROM domain_items ORDER BY id")
+        .expect("prep")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+    assert_eq!(
+        &after_append_ids[..initial_item_ids.len()],
+        initial_item_ids.as_slice(),
+        "prefix item_ids must be preserved across append-only fast path"
+    );
+
+    let mut fresh_store = Store::open(&db_dir.path().join("fresh.sqlite")).expect("open fresh");
+    index_paths(&mut fresh_store, &both, &options).expect("fresh sync");
+    assert_eq!(
+        dump_indexed_items(&inc_store),
+        dump_indexed_items(&fresh_store)
+    );
+
+    // Appending an incomplete tail (no newline) verifies prefix without rewriting.
+    write!(agy_file, "{{\"step_index\":5").expect("write incomplete tail");
+    let partial =
+        index_paths(&mut inc_store, std::slice::from_ref(&agy_trace), &options).expect("partial");
+    assert_eq!(partial.unchanged_files, 1);
+    assert_eq!(partial.incomplete_files, 1);
+
+    // Mutating a byte inside the indexed prefix while growing the file must
+    // abort the fast path and trigger a clean rebuild.
+    let raw = fs::read_to_string(&codex_trace).expect("read codex");
+    let rewritten = format!(
+        "{}{}\n",
+        raw.replacen("run status", "run check!", 1),
+        json!({"timestamp":"2026-08-20T00:00:02.000Z","type":"event_msg","payload":{"type":"task_complete"}})
+    );
+    fs::write(&codex_trace, rewritten).expect("rewrite codex");
+
+    let rebuilt =
+        index_paths(&mut inc_store, std::slice::from_ref(&codex_trace), &options).expect("rebuild");
+    assert_eq!(rebuilt.rebuilt_files, 1);
+    assert_eq!(rebuilt.source_results[0].action, "rebuilt");
+}
