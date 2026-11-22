@@ -417,7 +417,7 @@ fn conditional_guidance_lives_with_the_command_that_needs_it() {
     let sync = run(&["index", "sync", "--help"]);
     assert!(sync.status.success());
     let sync = String::from_utf8(sync.stdout).expect("UTF-8 sync help");
-    assert!(sync.contains("This is the command that writes the index"));
+    assert!(sync.contains("This command writes the index on demand"));
     assert!(sync.contains("Without PATHS, it uses the configured [[roots]]"));
     assert!(sync.contains("database-wide policy"));
     assert!(sync.contains("Changing policy requires a new"));
@@ -428,7 +428,32 @@ fn conditional_guidance_lives_with_the_command_that_needs_it() {
     let status = String::from_utf8(status.stdout).expect("UTF-8 status help");
     assert!(status.contains("existing database read-only"));
     assert!(status.contains("does not discover or"));
+    assert!(status.contains("index watch status"));
     assert!(status.contains("stored indexing policy"));
+
+    let watch_run = run(&["index", "watch", "run", "--help"]);
+    assert!(watch_run.status.success());
+    let watch_run = String::from_utf8(watch_run.stdout).expect("UTF-8 watch run help");
+    assert!(watch_run.contains("OS filesystem events"));
+    assert!(watch_run.contains("--reconcile-secs"));
+    assert!(watch_run.contains("advisory lock"));
+
+    let watch_status = run(&["index", "watch", "status", "--help"]);
+    assert!(watch_status.status.success());
+    let watch_status = String::from_utf8(watch_status.stdout).expect("UTF-8 watch status help");
+    assert!(watch_status.contains("Does not open or create the database"));
+
+    let watch_install = run(&["index", "watch", "install", "--help"]);
+    assert!(watch_install.status.success());
+    let watch_install = String::from_utf8(watch_install.stdout).expect("UTF-8 watch install help");
+    assert!(watch_install.contains("Requires at least one configured [[roots]]"));
+    assert!(watch_install.contains("never registers background processes"));
+
+    let watch_uninstall = run(&["index", "watch", "uninstall", "--help"]);
+    assert!(watch_uninstall.status.success());
+    let watch_uninstall =
+        String::from_utf8(watch_uninstall.stdout).expect("UTF-8 watch uninstall help");
+    assert!(watch_uninstall.contains("Unloads and removes"));
 
     let docs = run(&["docs", "list", "--help"]);
     assert!(docs.status.success());
@@ -924,4 +949,76 @@ fn error_recovery_hints_point_to_public_contract_discovery() {
         );
         assert!(stderr.contains("how-to/search-literals"));
     }
+}
+
+#[test]
+fn index_watch_status_and_service_dry_run_are_non_mutating() {
+    let directory = tempdir().expect("temporary directory");
+    let database = directory.path().join("index.sqlite");
+    let config = directory.path().join("config.toml");
+    let traces_dir = directory.path().join("traces");
+    fs::create_dir_all(&traces_dir).expect("create traces dir");
+
+    // Watch status works even before the database exists, without creating it.
+    let status_before = compact_json(&run(&[
+        "--db",
+        path_text(&database),
+        "index",
+        "watch",
+        "status",
+    ]));
+    assert_eq!(status_before["data"]["active"], false);
+    assert_eq!(status_before["data"]["service_installed"], false);
+    assert!(!database.exists());
+
+    // Initialize explicit config, then preview install/uninstall via --dry-run.
+    let init = run(&[
+        "--config",
+        path_text(&config),
+        "--db",
+        path_text(&database),
+        "config",
+        "init",
+        "--root",
+        path_text(&traces_dir),
+    ]);
+    assert!(init.status.success());
+
+    let install_preview = compact_json(&run(&[
+        "--config",
+        path_text(&config),
+        "--db",
+        path_text(&database),
+        "index",
+        "watch",
+        "install",
+        "--dry-run",
+    ]));
+    assert_eq!(install_preview["data"]["action"], "install");
+    assert_eq!(install_preview["data"]["dry_run"], true);
+    assert!(install_preview["data"].get("loaded").is_none());
+    let definition = install_preview["data"]["definition"]
+        .as_str()
+        .expect("dry-run definition");
+    assert!(definition.contains("watch"));
+    assert!(definition.contains("run"));
+
+    let uninstall_preview = compact_json(&run(&[
+        "--config",
+        path_text(&config),
+        "--db",
+        path_text(&database),
+        "index",
+        "watch",
+        "uninstall",
+        "--dry-run",
+    ]));
+    assert_eq!(uninstall_preview["data"]["action"], "uninstall");
+    assert_eq!(uninstall_preview["data"]["dry_run"], true);
+
+    // Sync a fixture and verify `index status` exposes the live `watch` object.
+    let (indexed_db, _, _) = index_fixture(directory.path(), "watch status check");
+    let index_status = compact_json(&run(&["--db", path_text(&indexed_db), "index", "status"]));
+    assert_eq!(index_status["data"]["watch"]["active"], false);
+    assert_eq!(index_status["data"]["watch"]["service_installed"], false);
 }

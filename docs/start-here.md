@@ -24,7 +24,7 @@ trace-index index sync
 trace-index index status
 ```
 
-Synchronization is explicit. Read commands never refresh or modify the index.
+Synchronization is explicit. Read commands never refresh or modify the index. `index status` reports coverage, freshness, and whether an opt-in `index watch` process is active for this database. Default to querying directly, and run `index sync` only when newly written traces are required and watch is inactive (or when immediate freshness is needed). See `docs get how-to/configure-and-sync` to enable optional event-driven watching.
 
 ## 3. Discover the current contract
 

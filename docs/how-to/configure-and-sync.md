@@ -106,13 +106,33 @@ Each Source is committed in one transaction. SQLite WAL mode lets read commands 
 
 ## Check the published snapshot
 
-Inspect coverage without scanning trace files again:
+Inspect coverage, freshness, and live watch state without scanning trace files again:
 
 ```bash
 trace-index index status
 ```
 
-`incomplete_sources` counts Sources whose trailing Record was incomplete at the last synchronization. `observed_roles` reports the `semantic.role` values actually published as Items in this index. It describes the current corpus, not every role the compiled Adapters could produce.
+`incomplete_sources` counts Sources whose trailing Record was incomplete at the last synchronization. `watch` reports whether an `index watch` process currently holds the advisory lock for this database (`watch.active`) and whether a user-level OS service definition is installed (`watch.service_installed`). `observed_roles` reports the `semantic.role` values actually published as Items in this index. It describes the current corpus, not every role the compiled Adapters could produce.
+
+## Keep the index fresh with event-driven watch (opt-in)
+
+Installing `trace-index` never registers a background process or scheduled task. When you want the index to stay close to fresh automatically without hand-writing service files, activate the built-in event-driven watcher explicitly:
+
+```bash
+# Run in the foreground (Ctrl-C to stop):
+trace-index index watch run
+
+# Or opt in to a user-level OS service (macOS LaunchAgent / Linux systemd --user):
+trace-index index watch install
+trace-index index watch status
+
+# Remove the user-level OS service at any time:
+trace-index index watch uninstall
+```
+
+`index watch` observes configured `[[roots]]` (or explicit `PATHS` for `index watch run`) using OS filesystem notifications, coalesces rapid writes per file (`--debounce-ms`, `--max-wait-ms`), runs targeted incremental synchronization on only the changed trace files, and performs a low-frequency incremental safety-net reconcile (`--reconcile-secs`, `0` to disable; unchanged complete files are skipped by size and modification time) to recover from lagged or dropped OS events. It ignores the database, lock, and non-trace files, opens `SQLite` only during active sync batches, and holds an exclusive advisory lock so at most one watcher runs per database. Use `--dry-run` on `install` or `uninstall` to inspect the generated service path and definition without modifying anything.
+
+Read commands (`query`, `schema`, `record`, `asset`, `index status`) remain strictly read-only whether or not `index watch` is active. Default to querying directly; run `index sync` explicitly only when newly written traces are required and watch is inactive (or when immediate freshness is needed).
 
 For row and field names, inspect the current query contract rather than guessing:
 

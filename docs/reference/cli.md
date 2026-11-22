@@ -28,7 +28,12 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 | `config check` | Validate configuration and configured root readiness without mutation |
 | `index` | Maintain and inspect the current trace index |
 | `index sync` | Incrementally index supported Agent trace files or directories |
-| `index status` | Show index coverage, parse status, and source freshness |
+| `index status` | Show index coverage, parse status, source freshness, and live watch status |
+| `index watch` | Keep the index fresh via opt-in event-driven watching and user OS services |
+| `index watch run` | Run a foreground event-driven watcher for configured roots or explicit paths |
+| `index watch status` | Inspect live watcher and user OS service status without mutating anything |
+| `index watch install` | Install and start an opt-in user OS service (launchd / systemd --user) for this database |
+| `index watch uninstall` | Stop and remove the user OS service installed for this database |
 | `schema` | Describe the stable public SQL query contract |
 | `schema list` | List public SQL relations and their descriptions |
 | `schema get` | Get one public SQL relation's schema |
@@ -45,6 +50,6 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 
 Use `trace-index --help`, `trace-index <noun> --help`, and `trace-index <noun> <verb> --help` for version-matched concepts and command details.
 
-`docs`, `config`, `schema`, and `session metadata` can operate without opening the index. `index sync` writes the trace index; `session metadata set/delete` write the independent caller-owned metadata store. Queries open the selected index and metadata store read-only. See [Session Metadata](../how-to/session-metadata.md) for whole-document replacement and version checks.
+`docs`, `config`, `schema`, `index watch status`, and `session metadata` can operate without opening the index. `index sync` and `index watch run` write the trace index; `index watch install/uninstall` manage an opt-in user-level OS service; `session metadata set/delete` write the independent caller-owned metadata store. Queries open the selected index and metadata store read-only. See [Session Metadata](../how-to/session-metadata.md) for whole-document replacement and version checks.
 
 The CLI intentionally has no shortcut command for a query that SQL already expresses. A new command must establish a safety or side-effect boundary, expose a capability SQL cannot reliably express, or be justified by repeated experiments.

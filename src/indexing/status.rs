@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use rusqlite::types::ValueRef;
 
+use super::watch::inspect_watch_status;
 use crate::domain::SEMANTIC_ROLES;
 use crate::interface::output::{ObservedRole, StatusReport};
 use crate::storage::db::{Store, display_database_path};
@@ -38,6 +39,7 @@ pub fn status(store: &Store, database_path: &Path) -> Result<StatusReport> {
         source_bytes: u64::try_from(source_bytes)?,
         indexed_bytes: u64::try_from(indexed_bytes)?,
         incomplete_sources: usize::try_from(incomplete_sources)?,
+        watch: inspect_watch_status(database_path),
         observed_roles: observed_roles(&snapshot)?,
     };
     snapshot.finish()?;

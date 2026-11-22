@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::indexing::watch::WatchStatus;
 use crate::storage::db::IndexingPolicy;
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +231,8 @@ pub struct StatusReport {
     pub source_bytes: u64,
     pub indexed_bytes: u64,
     pub incomplete_sources: usize,
+    /// Live event-watcher and user-level OS service status for this database.
+    pub watch: WatchStatus,
     /// Which semantic roles this index actually holds, and from which
     /// adapters. The compiled vocabulary says what the code can produce; this
     /// says what the corpus did produce, and the two disagreeing is how an

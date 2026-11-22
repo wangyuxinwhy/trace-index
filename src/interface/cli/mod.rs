@@ -162,17 +162,21 @@ Caller-owned Session metadata:
   Use docs get how-to/session-metadata for input, version checks and backup.
 
 Operational boundary:
-  Reads never synchronize or mutate the index. Run index sync explicitly only
-  when newly written traces are required. Commands return compact JSON on stdout;
-  synchronization progress and diagnostics use stderr. Metadata set/delete write
-  only the independent metadata store; they do not modify trace or index data.
+  Reads never synchronize or mutate the index. Default to querying directly;
+  use index status to inspect coverage, freshness, and whether index watch is
+  active for this database. Run index sync explicitly only when newly written
+  traces are required and watch is inactive (or immediate freshness is needed).
+  Commands return compact JSON on stdout; synchronization progress and watch
+  diagnostics use stderr. Metadata set/delete write only the independent
+  metadata store; they do not modify trace or index data.
 
 Use '<noun> --help' for capabilities and '<noun> <verb> --help' for exact
 arguments, defaults, limits, side effects, and command-specific examples.";
 
 const INDEX_SYNC_AFTER_HELP: &str = r"Mutation and input behavior:
-  This is the command that writes the index. With PATHS, it synchronizes those
-  files or directories. Without PATHS, it uses the configured [[roots]].
+  This command writes the index on demand (opt-in index watch run also writes
+  incrementally). With PATHS, it synchronizes those files or directories.
+  Without PATHS, it uses the configured [[roots]].
   The first sync stores the effective Record and text byte limits as one
   database-wide policy. An indexed database owns and reuses that policy; an
   explicit conflicting limit is rejected. Changing policy requires a new
@@ -185,11 +189,50 @@ Examples:
 
 const INDEX_STATUS_AFTER_HELP: &str = r"Behavior:
   Opens the selected existing database read-only. It does not discover or
-  synchronize traces. The result includes Source coverage and freshness plus
-  the stored indexing policy when one has been established.
+  synchronize traces. The result includes Source coverage, freshness, live
+  index watch status for this database, and the stored indexing policy when
+  one has been established.
 
 Example:
   trace-index index status";
+
+const INDEX_WATCH_RUN_AFTER_HELP: &str = r"Behavior:
+  Watches configured [[roots]] (or explicit PATHS) using OS filesystem events
+  and incrementally synchronizes only changed trace files after a per-file
+  debounce window, backed by a low-frequency periodic reconcile (--reconcile-secs,
+  0 to disable) in case OS notifications lag or overflow. Holds an exclusive
+  advisory lock so at most one watcher runs per database, drops SQLite handles
+  between batches, and writes NDJSON events to stderr while returning a final
+  JSON summary on stdout at shutdown.
+
+Example:
+  trace-index index watch run";
+
+const INDEX_WATCH_STATUS_AFTER_HELP: &str = r"Behavior:
+  Read-only check of whether an index watch process currently holds the advisory
+  lock for the selected database and whether a user-level OS service definition
+  is installed. Does not open or create the database.
+
+Example:
+  trace-index index watch status";
+
+const INDEX_WATCH_INSTALL_AFTER_HELP: &str = r"Behavior:
+  Explicitly opts in to a user-level OS background service (macOS LaunchAgent or
+  Linux systemd --user) running `trace-index index watch run` for the selected
+  database. Requires at least one configured [[roots]] entry. Installing
+  trace-index itself never registers background processes. Use --dry-run to
+  inspect the generated service path and definition without writing or loading
+  anything.
+
+Example:
+  trace-index index watch install";
+
+const INDEX_WATCH_UNINSTALL_AFTER_HELP: &str = r"Behavior:
+  Unloads and removes the user-level OS background service installed for the
+  selected database. Use --dry-run to inspect the target service without changes.
+
+Example:
+  trace-index index watch uninstall";
 
 const DOCS_AFTER_HELP: &str = r"Behavior:
   Reads documentation bundled with this binary without loading configuration or
@@ -437,9 +480,109 @@ enum IndexCommand {
     /// Incrementally index supported Agent trace files or directories.
     Sync(IndexSyncArgs),
 
-    /// Show index coverage, parse status, and source freshness.
+    /// Show index coverage, parse status, source freshness, and live watch status.
     #[command(after_help = INDEX_STATUS_AFTER_HELP)]
     Status,
+
+    /// Keep the index fresh via opt-in event-driven watching and user OS services.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchCommand {
+    /// Run a foreground event-driven watcher for configured roots or explicit paths.
+    #[command(after_help = INDEX_WATCH_RUN_AFTER_HELP)]
+    Run(WatchRunArgs),
+
+    /// Inspect live watcher and user OS service status without mutating anything.
+    #[command(after_help = INDEX_WATCH_STATUS_AFTER_HELP)]
+    Status,
+
+    /// Install and start an opt-in user OS service (launchd / systemd --user) for this database.
+    #[command(after_help = INDEX_WATCH_INSTALL_AFTER_HELP)]
+    Install(WatchInstallArgs),
+
+    /// Stop and remove the user OS service installed for this database.
+    #[command(after_help = INDEX_WATCH_UNINSTALL_AFTER_HELP)]
+    Uninstall {
+        /// Preview the target service path without unloading or deleting files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct WatchRunArgs {
+    /// Trace JSONL files, compressed Codex .jsonl.zst files, or directories to watch instead of configured roots.
+    paths: Vec<PathBuf>,
+
+    /// Quiet window in milliseconds after the last file write before syncing.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::indexing::watch::DEFAULT_DEBOUNCE_MS,
+        value_parser = parse_debounce_ms
+    )]
+    debounce_ms: u64,
+
+    /// Maximum wait in milliseconds before flushing a continuously streaming file.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::indexing::watch::DEFAULT_MAX_WAIT_MS,
+        value_parser = parse_max_wait_ms
+    )]
+    max_wait_ms: u64,
+
+    /// Periodic incremental reconcile interval in seconds to recover missed OS events (0 disables).
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = crate::indexing::watch::DEFAULT_RECONCILE_SECS,
+        value_parser = parse_reconcile_secs
+    )]
+    reconcile_secs: u64,
+
+    /// Skip the catch-up synchronization on startup and wait only for new events.
+    #[arg(long)]
+    no_initial_sync: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchInstallArgs {
+    /// Quiet window in milliseconds after the last file write before syncing.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::indexing::watch::DEFAULT_DEBOUNCE_MS,
+        value_parser = parse_debounce_ms
+    )]
+    debounce_ms: u64,
+
+    /// Maximum wait in milliseconds before flushing a continuously streaming file.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::indexing::watch::DEFAULT_MAX_WAIT_MS,
+        value_parser = parse_max_wait_ms
+    )]
+    max_wait_ms: u64,
+
+    /// Periodic incremental reconcile interval in seconds to recover missed OS events (0 disables).
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = crate::indexing::watch::DEFAULT_RECONCILE_SECS,
+        value_parser = parse_reconcile_secs
+    )]
+    reconcile_secs: u64,
+
+    /// Preview the generated service path and definition without writing or loading it.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -646,6 +789,30 @@ fn parse_asset_bytes(value: &str) -> Result<usize, String> {
 
 fn parse_timeout_seconds(value: &str) -> Result<usize, String> {
     parse_bounded_usize(value, 1, 300, "timeout-seconds")
+}
+
+fn parse_debounce_ms(value: &str) -> Result<u64, String> {
+    parse_bounded_u64(value, 100, 60_000, "debounce-ms")
+}
+
+fn parse_max_wait_ms(value: &str) -> Result<u64, String> {
+    parse_bounded_u64(value, 500, 300_000, "max-wait-ms")
+}
+
+fn parse_reconcile_secs(value: &str) -> Result<u64, String> {
+    parse_bounded_u64(value, 0, 86_400, "reconcile-secs")
+}
+
+fn parse_bounded_u64(value: &str, minimum: u64, maximum: u64, name: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name} {value:?}: {error}"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(format!(
+            "{name} must be between {minimum} and {maximum}, inclusive"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_bounded_usize(

@@ -9,10 +9,15 @@ use clap::error::{ContextKind, ErrorKind};
 use super::{
     AssetCommand, Cli, Command, ConfigCommand, DocsCommand, DocsOutput, IndexCommand,
     MAX_SQL_INPUT_BYTES, QueryCommand, QueryRunArgs, RecordCommand, SchemaCommand, StderrProgress,
+    WatchCommand,
 };
 use crate::indexing::indexer::IndexOptions;
 use crate::indexing::status::status;
 use crate::indexing::sync::{self, SyncRoot};
+use crate::indexing::watch::{
+    WatchRunConfig, inspect_watch_status, run_watch,
+    service::{WatchServiceSpec, install_service, uninstall_service},
+};
 use crate::ingest::record::{export_record, extract_asset, inspect_record, verify_record};
 use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
@@ -44,6 +49,12 @@ pub(crate) fn run() -> Result<()> {
             )?;
             if let Command::Session { command } = command {
                 return run_session(command, &loaded);
+            }
+            if let Command::Index {
+                command: IndexCommand::Watch { command },
+            } = command
+            {
+                return run_watch_command(command, &loaded, config_file.is_some());
             }
             run_operational(command, &loaded)
         }
@@ -101,11 +112,15 @@ fn configured_roots(loaded: &LoadedConfig) -> Vec<SyncRoot> {
         .collect()
 }
 
-fn explicit_roots(paths: Vec<PathBuf>, loaded: &LoadedConfig) -> Result<Vec<SyncRoot>> {
+fn explicit_roots(
+    paths: Vec<PathBuf>,
+    loaded: &LoadedConfig,
+    command_name: &str,
+) -> Result<Vec<SyncRoot>> {
     if paths.is_empty() {
         let roots = configured_roots(loaded);
         if roots.is_empty() {
-            bail!("index sync requires paths or at least one configured [[roots]] entry");
+            bail!("{command_name} requires paths or at least one configured [[roots]] entry");
         }
         return Ok(roots);
     }
@@ -242,7 +257,7 @@ fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) ->
                 args.max_record_bytes,
                 args.max_text_bytes,
             );
-            let roots = explicit_roots(args.paths, loaded)?;
+            let roots = explicit_roots(args.paths, loaded, "index sync")?;
             let mut observer = StderrProgress::new(args.progress.into());
             let mut report = sync::execute_observed(
                 store,
@@ -279,8 +294,83 @@ fn run_index(store: &mut Store, loaded: &LoadedConfig, command: IndexCommand) ->
         IndexCommand::Status => {
             print_envelope(&status(store, &loaded.effective.database.path)?)?;
         }
+        IndexCommand::Watch { .. } => {
+            unreachable!("index watch is dispatched before opening the database")
+        }
     }
     Ok(())
+}
+
+fn run_watch_command(
+    command: WatchCommand,
+    loaded: &LoadedConfig,
+    explicit_config: bool,
+) -> Result<()> {
+    let database_path = &loaded.effective.database.path;
+    match command {
+        WatchCommand::Status => print_envelope(&inspect_watch_status(database_path)),
+        WatchCommand::Run(args) => {
+            if args.max_wait_ms < args.debounce_ms {
+                bail!(
+                    "--max-wait-ms ({}) must be greater than or equal to --debounce-ms ({})",
+                    args.max_wait_ms,
+                    args.debounce_ms
+                );
+            }
+            let roots = explicit_roots(args.paths, loaded, "index watch run")?;
+            let summary = run_watch(&WatchRunConfig {
+                database_path: database_path.clone(),
+                roots,
+                max_record_bytes: loaded.effective.indexing.max_indexed_record_bytes.value,
+                max_text_bytes: loaded.effective.indexing.max_published_text_bytes.value,
+                debounce: Duration::from_millis(args.debounce_ms),
+                max_wait: Duration::from_millis(args.max_wait_ms),
+                reconcile_interval: (args.reconcile_secs > 0)
+                    .then(|| Duration::from_secs(args.reconcile_secs)),
+                initial_sync: !args.no_initial_sync,
+            })?;
+            print_envelope(&summary)
+        }
+        WatchCommand::Install(args) => {
+            if args.max_wait_ms < args.debounce_ms {
+                bail!(
+                    "--max-wait-ms ({}) must be greater than or equal to --debounce-ms ({})",
+                    args.max_wait_ms,
+                    args.debounce_ms
+                );
+            }
+            if loaded.effective.roots.is_empty() {
+                bail!(
+                    "index watch install requires at least one configured [[roots]] entry; \
+                     run `trace-index config init --discover` or add [[roots]] to your configuration first"
+                );
+            }
+            let binary_path = std::env::current_exe()
+                .context("failed to determine current trace-index executable path")?
+                .canonicalize()
+                .context("failed to canonicalize current trace-index executable path")?;
+            let config_path = (explicit_config
+                || loaded.effective.config_file.origin.kind != config::OriginKind::Default
+                || loaded.effective.config_file.path.is_file())
+            .then(|| loaded.effective.config_file.path.clone());
+            let report = install_service(
+                &WatchServiceSpec {
+                    binary_path,
+                    config_path,
+                    database_path: database_path.clone(),
+                    debounce_ms: args.debounce_ms,
+                    max_wait_ms: args.max_wait_ms,
+                    reconcile_secs: args.reconcile_secs,
+                },
+                args.dry_run,
+            )?;
+            print_envelope(&report)
+        }
+        WatchCommand::Uninstall { dry_run } => {
+            let report = uninstall_service(database_path, dry_run)?;
+            print_envelope(&report)
+        }
+    }
 }
 
 /// Resolves the policy requested by one synchronization at the point where

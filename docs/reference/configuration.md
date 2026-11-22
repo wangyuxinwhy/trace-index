@@ -5,7 +5,7 @@ description: Configuration schema, path resolution, defaults, provenance, and pr
 
 # Configuration Reference
 
-Trace Index configuration selects the rebuildable database, the trace roots used when `index sync` receives no positional paths, and the database-wide indexing policy. Runtime adapters are detected from Source contents; a root does not select an adapter.
+Trace Index configuration selects the rebuildable database, the trace roots used when `index sync` or `index watch run` receives no positional paths (and by `index watch install`), and the database-wide indexing policy. Runtime adapters are detected from Source contents; a root does not select an adapter.
 
 The default configuration path is `$XDG_CONFIG_HOME/trace-index/config.toml`, falling back to `$HOME/.config/trace-index/config.toml`. If no configuration exists, built-in defaults remain usable and the root list is empty.
 
@@ -53,7 +53,7 @@ Every path returned by `config show` is absolute.
 - A leading `~` or `~/` expands to the current home directory. Other user-home forms such as `~other` are rejected.
 - `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, when non-empty, must be absolute.
 
-Paths are not canonicalized during loading because a database or root may not exist yet. `config check` and `index sync` canonicalize existing roots when they need physical identity.
+Paths are not canonicalized during loading because a database or root may not exist yet. `config check`, `index sync`, and `index watch run` canonicalize existing roots when they need physical identity.
 
 ## Metadata storage
 
@@ -78,7 +78,7 @@ The database is selected independently:
 
 Indexing limits for a new or empty database come from `[indexing]` and then built-in defaults. After a database contains Sources, its stored policy is authoritative and ordinary synchronization reuses it. The two `index sync --max-*-bytes` flags are explicit one-run requests; a request that conflicts with a non-empty database is rejected.
 
-Positional `index sync PATHS...` replace configured roots for that invocation. There is no environment-variable root list.
+Positional `index sync PATHS...` and `index watch run PATHS...` replace configured roots for that invocation. There is no environment-variable root list.
 
 `config show` returns resolved absolute configuration values together with `cli`, `environment`, `file`, or `default` origin metadata. For indexing limits, these are the values that would initialize a new or empty database. The command does not open the database; use `index status` for an established policy.
 
