@@ -5,3 +5,4 @@ mod pipeline;
 pub(crate) mod status;
 pub(crate) mod sync;
 pub(crate) mod telemetry;
+pub(crate) mod watch;

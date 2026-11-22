@@ -42,11 +42,11 @@ An Adapter processes one ordered candidate file and emits facts only after their
 
 The physical layer indexes complete appended Records and fingerprints the indexed prefix. A changed prefix triggers a Source rebuild. The domain projection for a changed Source is replaced coherently because later Records can resolve earlier optional fields or add another witness to an existing Item.
 
-Each Source update is transactional. Readers see either the previous committed projection or the new one, never half of a Session contribution. WAL mode lets read commands use a consistent snapshot while `index sync` writes.
+Each Source update is transactional. Readers see either the previous committed projection or the new one, never half of a Session contribution. WAL mode lets read commands use a consistent snapshot while `index sync` or `index watch run` writes.
 
 ## Query contract
 
-Only explicit `index sync` opens the trace index for writes. `session metadata set/delete` write a separate persistent caller-owned store. Schema discovery reads declarations without opening a database. Queries, status, and evidence inspection open the index read-only. Query setup attaches the selected metadata store read-only and installs a connection-local view; user SQL cannot attach arbitrary files or mutate either store. SQL execution retains its time and output budgets.
+Only explicit `index sync` and opt-in `index watch run` open the trace index for writes. `session metadata set/delete` write a separate persistent caller-owned store. Schema discovery reads declarations without opening a database. Queries, status, and evidence inspection open the index read-only. Query setup attaches the selected metadata store read-only and installs a connection-local view; user SQL cannot attach arbitrary files or mutate either store. SQL execution retains its time and output budgets.
 
 The trace SQL surface is `sources`, `records`, `sessions`, `loops`, `items`, `blobs`, `item_search`, and `item_search_terms`. `session_metadata` separately exposes caller-owned data, left-joined by stable Runtime identity; it carries no Runtime Record evidence. The first five publish domain objects. `items.semantic` encodes the domain Semantic as `{role, value, evidence_strength}`; only its top-level TextContent changes representation, becoming a BlobRef resolved through `blobs`. This SQL encoding is an interface choice, not a second domain model. `blobs`, `item_search`, and `item_search_terms` provide demand-driven text access and candidate retrieval without becoming domain entities. Private tables may still be readable because the local caller owns the database, but they carry storage mechanics rather than public meaning.
 

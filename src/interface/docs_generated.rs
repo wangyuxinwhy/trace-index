@@ -248,7 +248,15 @@ mod tests {
                 .find(|region| region.name == name)
                 .expect("region")
         };
-        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 27);
+        assert_eq!(by_name("cli-table").body.lines().count(), 2 + 32);
+        assert!(by_name("cli-table").body.contains("`index watch run`"));
+        assert!(by_name("cli-table").body.contains("`index watch status`"));
+        assert!(by_name("cli-table").body.contains("`index watch install`"));
+        assert!(
+            by_name("cli-table")
+                .body
+                .contains("`index watch uninstall`")
+        );
         assert!(by_name("cli-table").body.contains("`session metadata set`"));
         assert!(by_name("cli-table").body.contains("`session metadata get`"));
         assert!(

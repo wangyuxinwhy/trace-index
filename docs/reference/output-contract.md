@@ -17,7 +17,7 @@ Process and stream behavior:
 - `config check` returns its complete read-only findings on stdout. Error issues make `valid=false` and exit 1; Warning-only reports exit 0 even when `configured_sync_ready=false` because positional `index sync PATHS...` remains valid.
 - `index sync` returns the complete synchronization report on stdout and exits 1 when some Sources fail to read, decode, or index, so callers can inspect both the successful and failed Source results.
 
-Only `index sync` emits progress. Progress is written to stderr and never mixed into the final stdout JSON. `--progress auto|human|ndjson|off` selects the rendering.
+`index sync` emits progress on stderr (`--progress auto|human|ndjson|off`), and `index watch run` emits NDJSON lifecycle events on stderr while returning a final JSON summary on stdout at shutdown. Neither writes diagnostics into the stdout JSON envelope.
 
 ## Bounded query results
 
