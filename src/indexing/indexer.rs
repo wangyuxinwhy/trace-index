@@ -1,22 +1,25 @@
 //! Source-to-domain indexing pipeline.
 //!
 //! Physical Record ingestion stays byte-incremental: an append-only trace does
-//! not need to insert the same Records twice. Domain projection is different:
-//! Loop boundaries, dual-track pairing, and request-versus-steering all depend
-//! on surrounding Records. Whenever a Source changes, its Loops and Items are
-//! atomically replaced from the complete indexed Record prefix.
+//! not need to insert the same Records twice. Domain projection is recomputed
+//! over the complete indexed Record prefix because Loop boundaries, dual-track
+//! pairing, and request-versus-steering depend on surrounding Records; for
+//! append-only updates `sync_session` diffs that projection in place to avoid
+//! rewriting unchanged prefix Loops, Items, and FTS5 rows.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
+use super::pipeline::{
+    MIN_PIPELINE_FILES, index_files_pipelined, is_pipeline_eligible, load_existing_source_paths,
+    pipeline_worker_count,
+};
 use super::telemetry::{IndexPhase, IndexTelemetry, PersistTable, ProgressObserver};
 #[cfg(test)]
 use super::telemetry::{NoopProgress, database_storage_bytes};
@@ -37,12 +40,7 @@ use crate::storage::db::{
 use crate::storage::persist::{clear_projection, write_session};
 use crate::storage::persist_diff::sync_session;
 
-const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
-/// Maximum number of background threads preparing new Sources in parallel
-/// before handing projected facts to the single `SQLite` writer thread.
-const MAX_PIPELINE_WORKERS: usize = 4;
-/// Minimum number of newly discovered Sources before spawning worker threads.
-const MIN_PIPELINE_FILES: usize = 4;
+pub(super) const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 #[path = "contract_tests.rs"]
@@ -86,6 +84,13 @@ pub(crate) fn sync_paths_observed(
     progress: &mut dyn ProgressObserver,
 ) -> Result<IndexReport> {
     index_paths_internal(store, paths, options, telemetry, progress)
+}
+
+pub(super) struct RunSink<'a> {
+    pub(super) telemetry: &'a mut IndexTelemetry,
+    pub(super) progress: &'a mut dyn ProgressObserver,
+    pub(super) adapters: &'a mut BTreeSet<String>,
+    pub(super) report: &'a mut IndexReport,
 }
 
 fn index_paths_internal(
@@ -145,6 +150,12 @@ fn index_paths_internal(
         0
     };
 
+    let mut sink = RunSink {
+        telemetry,
+        progress,
+        adapters: &mut adapters,
+        report: &mut report,
+    };
     if parallel_candidates >= MIN_PIPELINE_FILES {
         index_files_pipelined(
             store,
@@ -153,10 +164,7 @@ fn index_paths_internal(
             worker_count,
             options,
             &mut scratch,
-            telemetry,
-            progress,
-            &mut adapters,
-            &mut report,
+            &mut sink,
         );
     } else {
         for file in &files {
@@ -165,16 +173,15 @@ fn index_paths_internal(
             // here left every later file unindexed while the database still looked
             // complete. Record-level tolerance already exists one layer down.
             scratch.blobs.begin_source();
-            let outcome = index_source(store, file, options, &mut scratch, telemetry, progress);
-            record_source_outcome(
+            let outcome = index_source(
+                store,
                 file,
-                outcome,
-                &mut scratch.blobs,
-                &mut adapters,
-                &mut report,
-                telemetry,
-                progress,
+                options,
+                &mut scratch,
+                sink.telemetry,
+                sink.progress,
             );
+            record_source_outcome(file, outcome, &mut scratch.blobs, &mut sink);
         }
     }
     report.adapters = adapters.into_iter().collect();
@@ -182,48 +189,11 @@ fn index_paths_internal(
     Ok(report)
 }
 
-fn pipeline_worker_count(file_count: usize) -> usize {
-    if file_count < MIN_PIPELINE_FILES {
-        return 1;
-    }
-    thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(MAX_PIPELINE_WORKERS)
-}
-
-fn load_existing_source_paths(store: &Store) -> Result<HashSet<String>> {
-    let mut statement = store
-        .connection()
-        .prepare("SELECT path FROM trace_sources")
-        .context("failed to query existing source paths")?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("failed to inspect existing source paths")?;
-    let mut paths = HashSet::new();
-    for row in rows {
-        paths.insert(row.context("failed to read existing source path")?);
-    }
-    Ok(paths)
-}
-
-fn is_pipeline_eligible(file: &DiscoveredFile, existing_paths: &HashSet<String>) -> bool {
-    let path = file.path.to_string_lossy();
-    if existing_paths.contains(path.as_ref()) {
-        return false;
-    }
-    let alternate = alternate_encoding(&file.path);
-    let alternate_str = alternate.to_string_lossy();
-    !existing_paths.contains(alternate_str.as_ref())
-}
-
-fn record_source_outcome(
+pub(super) fn record_source_outcome(
     file: &DiscoveredFile,
     outcome: Result<SourceIndexResult>,
     blobs: &mut BlobCache,
-    adapters: &mut BTreeSet<String>,
-    report: &mut IndexReport,
-    telemetry: &mut IndexTelemetry,
-    progress: &mut dyn ProgressObserver,
+    sink: &mut RunSink<'_>,
 ) {
     let result = match outcome {
         Ok(result) => {
@@ -233,337 +203,53 @@ fn record_source_outcome(
         Err(error) => {
             blobs.rollback_source();
             let action = if is_unrecognized_source(&error) {
-                report.skipped_files += 1;
+                sink.report.skipped_files += 1;
                 "skipped"
             } else {
-                report.failed_files += 1;
+                sink.report.failed_files += 1;
                 "failed"
             };
-            report.source_results.push(SourceIndexResult {
+            sink.report.source_results.push(SourceIndexResult {
                 path: file.path.display().to_string(),
                 action: action.to_owned(),
                 error: Some(format!("{error:#}")),
                 ..SourceIndexResult::default()
             });
-            telemetry.complete_file();
-            progress.update(
-                telemetry.progress(IndexPhase::Commit, Some(&file.path)),
+            sink.telemetry.complete_file();
+            sink.progress.update(
+                sink.telemetry
+                    .progress(IndexPhase::Commit, Some(&file.path)),
                 false,
             );
             return;
         }
     };
-    adapters.insert(result.adapter.clone());
+    sink.adapters.insert(result.adapter.clone());
     match result.action.as_str() {
-        "unchanged" => report.unchanged_files += 1,
+        "unchanged" => sink.report.unchanged_files += 1,
         "rebuilt" => {
-            report.indexed_files += 1;
-            report.rebuilt_files += 1;
+            sink.report.indexed_files += 1;
+            sink.report.rebuilt_files += 1;
         }
-        _ => report.indexed_files += 1,
+        _ => sink.report.indexed_files += 1,
     }
-    report.indexed_items += result.indexed_items;
-    report.indexed_records += result.indexed_records;
-    report.malformed_records += result.malformed_records;
-    report.oversized_records += result.oversized_records;
+    sink.report.indexed_items += result.indexed_items;
+    sink.report.indexed_records += result.indexed_records;
+    sink.report.malformed_records += result.malformed_records;
+    sink.report.oversized_records += result.oversized_records;
     if result.incomplete_tail {
-        report.incomplete_files += 1;
+        sink.report.incomplete_files += 1;
     }
-    report.source_results.push(result);
-    telemetry.complete_file();
-    progress.update(
-        telemetry.progress(IndexPhase::Commit, Some(&file.path)),
+    sink.report.source_results.push(result);
+    sink.telemetry.complete_file();
+    sink.progress.update(
+        sink.telemetry
+            .progress(IndexPhase::Commit, Some(&file.path)),
         false,
     );
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "coordinates bounded parallel preparation with single-writer SQLite persistence"
-)]
-fn index_files_pipelined(
-    store: &mut Store,
-    files: &[DiscoveredFile],
-    existing_paths: &HashSet<String>,
-    worker_count: usize,
-    options: &IndexOptions,
-    scratch: &mut SyncScratch,
-    telemetry: &mut IndexTelemetry,
-    progress: &mut dyn ProgressObserver,
-    adapters: &mut BTreeSet<String>,
-    report: &mut IndexReport,
-) {
-    let in_flight_limit = worker_count + 1;
-    let (job_tx, job_rx) = mpsc::sync_channel::<usize>(in_flight_limit);
-    let (result_tx, result_rx) =
-        mpsc::sync_channel::<(usize, Result<PreparedNewSource>)>(in_flight_limit);
-    let shared_rx = Mutex::new(job_rx);
-
-    thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let rx = &shared_rx;
-            let tx = result_tx.clone();
-            scope.spawn(move || {
-                let mut worker = WorkerScratch::new();
-                loop {
-                    let index = {
-                        let Ok(guard) = rx.lock() else {
-                            break;
-                        };
-                        guard.recv().ok()
-                    };
-                    let Some(index) = index else {
-                        break;
-                    };
-                    let prepared = prepare_new_source(&files[index], options, &mut worker);
-                    worker.trim_oversized_buffers();
-                    if tx.send((index, prepared)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(result_tx);
-
-        let mut next_dispatch = 0_usize;
-        let mut in_flight = 0_usize;
-        let mut ready: BTreeMap<usize, Result<PreparedNewSource>> = BTreeMap::new();
-
-        for idx in 0..files.len() {
-            if next_dispatch < idx {
-                next_dispatch = idx;
-            }
-            while in_flight < in_flight_limit
-                && next_dispatch < files.len()
-                && is_pipeline_eligible(&files[next_dispatch], existing_paths)
-            {
-                if job_tx.send(next_dispatch).is_err() {
-                    break;
-                }
-                next_dispatch += 1;
-                in_flight += 1;
-            }
-
-            let file = &files[idx];
-            scratch.blobs.begin_source();
-            let outcome = if idx < next_dispatch {
-                let prepared = loop {
-                    if let Some(result) = ready.remove(&idx) {
-                        break result;
-                    }
-                    let Ok((done_idx, result)) = result_rx.recv() else {
-                        break Err(anyhow::anyhow!(
-                            "source preparation worker exited unexpectedly"
-                        ));
-                    };
-                    ready.insert(done_idx, result);
-                };
-                in_flight = in_flight.saturating_sub(1);
-                prepared.and_then(|source| {
-                    persist_prepared_new_source(store, file, &source, &mut scratch.blobs, telemetry)
-                })
-            } else {
-                index_source(store, file, options, scratch, telemetry, progress)
-            };
-            record_source_outcome(
-                file,
-                outcome,
-                &mut scratch.blobs,
-                adapters,
-                report,
-                telemetry,
-                progress,
-            );
-        }
-        drop(job_tx);
-    });
-}
-
-struct WorkerScratch {
-    shell_parser: syntax::ShellParser,
-    record_buffer: Vec<u8>,
-    decompress_buffer: Vec<u8>,
-}
-
-const WORKER_RETAINED_DECOMPRESS_BYTES: usize = 4 * 1024 * 1024;
-const WORKER_RETAINED_RECORD_BYTES: usize = 1024 * 1024;
-
-impl WorkerScratch {
-    fn new() -> Self {
-        Self {
-            shell_parser: syntax::ShellParser::new(),
-            record_buffer: Vec::with_capacity(READ_BUFFER_BYTES),
-            decompress_buffer: Vec::new(),
-        }
-    }
-
-    fn trim_oversized_buffers(&mut self) {
-        if self.decompress_buffer.capacity() > WORKER_RETAINED_DECOMPRESS_BYTES {
-            self.decompress_buffer.clear();
-            self.decompress_buffer
-                .shrink_to(WORKER_RETAINED_DECOMPRESS_BYTES);
-        }
-        if self.record_buffer.capacity() > WORKER_RETAINED_RECORD_BYTES {
-            self.record_buffer.clear();
-            self.record_buffer.shrink_to(WORKER_RETAINED_RECORD_BYTES);
-        }
-    }
-}
-
-struct PreparedRecord {
-    seq: u64,
-    byte_offset: u64,
-    byte_length: u64,
-    raw_hash: String,
-    oversized: bool,
-    facts: RecordFacts,
-}
-
-struct PreparedNewSource {
-    adapter: AdapterKind,
-    indexed_limit: u64,
-    incomplete_tail: bool,
-    fingerprint: String,
-    records: Vec<PreparedRecord>,
-    session: SessionProjection,
-    malformed: u64,
-    oversized: u64,
-    processed_bytes: u64,
-    prepare_duration: Duration,
-    read_duration: Duration,
-    project_duration: Duration,
-}
-
-fn open_and_detect_new_source<'a>(
-    canonical: &Path,
-    options: &IndexOptions,
-    decompress_buffer: &'a mut Vec<u8>,
-) -> Result<(IndexingSource<'a>, AdapterKind, u64, bool)> {
-    let mut source = open_for_indexing(canonical, decompress_buffer)?;
-    let adapter = detect_adapter(
-        &mut source,
-        canonical,
-        options.max_record_bytes.max(MAX_ADAPTER_DETECTION_BYTES),
-    )?;
-    if is_compressed(canonical) && adapter != AdapterKind::Codex {
-        return Err(UnrecognizedSource(format!(
-            "{}: Zstandard input is supported for Codex traces",
-            canonical.display()
-        ))
-        .into());
-    }
-    let logical_size = source.len();
-    let indexed_limit = source.complete_prefix_length()?;
-    let incomplete_tail = indexed_limit < logical_size;
-    Ok((source, adapter, indexed_limit, incomplete_tail))
-}
-
-fn prepare_new_source(
-    discovered: &DiscoveredFile,
-    options: &IndexOptions,
-    worker: &mut WorkerScratch,
-) -> Result<PreparedNewSource> {
-    let prepare_started = Instant::now();
-    let canonical = &discovered.path;
-    let (mut source, adapter, indexed_limit, incomplete_tail) =
-        open_and_detect_new_source(canonical, options, &mut worker.decompress_buffer)?;
-    let prepare_duration = prepare_started.elapsed();
-
-    let mut hasher = prefix_hasher(indexed_limit);
-    let mut reader = source
-        .bounded_reader(indexed_limit)
-        .with_context(|| format!("failed to rewind {}", canonical.display()))?;
-    let mut projector = Projector::new(adapter, options.max_text_bytes, canonical)?;
-    let mut projected_sessions = Vec::new();
-    let mut records = Vec::new();
-    let mut malformed = 0_u64;
-    let mut oversized_count = 0_u64;
-    let mut processed_bytes = 0_u64;
-    let mut read_duration = Duration::ZERO;
-    let mut project_duration = Duration::ZERO;
-    let mut byte_offset = 0_u64;
-    let mut seq = 0_u64;
-
-    loop {
-        let read_started = Instant::now();
-        let read = read_bounded_record_into(
-            &mut reader,
-            options.max_record_bytes,
-            Some(&mut hasher),
-            true,
-            &mut worker.record_buffer,
-        )?;
-        read_duration += read_started.elapsed();
-        let (oversized, byte_length, consumed_bytes, raw_hash) = match read {
-            RecordReadInto::Complete {
-                oversized,
-                byte_length,
-                consumed_bytes,
-                raw_hash,
-            } => (oversized, byte_length, consumed_bytes, raw_hash),
-            RecordReadInto::Incomplete | RecordReadInto::End => break,
-        };
-
-        let project_started = Instant::now();
-        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(&worker.record_buffer));
-        let facts = match &parsed {
-            None => {
-                oversized_count += 1;
-                RecordFacts::oversized()
-            }
-            Some(Err(error)) => {
-                malformed += 1;
-                RecordFacts::malformed(error.to_string())
-            }
-            Some(Ok(value)) => record_facts(adapter, value),
-        };
-        if let Some(Ok(value)) = &parsed {
-            projector.push(seq, value);
-            projected_sessions.extend(projector.drain_completed());
-        }
-        project_duration += project_started.elapsed();
-
-        records.push(PreparedRecord {
-            seq,
-            byte_offset,
-            byte_length,
-            raw_hash,
-            oversized,
-            facts,
-        });
-        processed_bytes += consumed_bytes;
-        byte_offset += consumed_bytes;
-        seq += 1;
-    }
-
-    let project_started = Instant::now();
-    let session = finalize_projected_session(
-        projector,
-        projected_sessions,
-        canonical,
-        &mut worker.shell_parser,
-        options.max_text_bytes,
-    )?;
-    project_duration += project_started.elapsed();
-
-    let fingerprint = hasher.finalize().to_hex().to_string();
-    Ok(PreparedNewSource {
-        adapter,
-        indexed_limit,
-        incomplete_tail,
-        fingerprint,
-        records,
-        session,
-        malformed,
-        oversized: oversized_count,
-        processed_bytes,
-        prepare_duration,
-        read_duration,
-        project_duration,
-    })
-}
-
-fn finalize_projected_session(
+pub(super) fn finalize_projected_session(
     projector: Projector,
     mut projected_sessions: Vec<SessionProjection>,
     canonical: &Path,
@@ -589,106 +275,12 @@ fn finalize_projected_session(
     Ok(session)
 }
 
-fn persist_prepared_new_source(
-    store: &mut Store,
-    discovered: &DiscoveredFile,
-    prepared: &PreparedNewSource,
-    blobs: &mut BlobCache,
-    telemetry: &mut IndexTelemetry,
-) -> Result<SourceIndexResult> {
-    telemetry.record_duration(IndexPhase::Prepare, prepared.prepare_duration);
-    telemetry.record_duration(IndexPhase::Read, prepared.read_duration);
-    telemetry.record_duration(IndexPhase::Project, prepared.project_duration);
-    telemetry.add_processed_bytes(prepared.processed_bytes);
-
-    let canonical = &discovered.path;
-    let path_string = canonical.to_string_lossy().into_owned();
-    let transaction = store
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("failed to start index transaction")?;
-    let replaced_transcript = antigravity_replacement(&transaction, prepared.adapter, canonical)?;
-    let source_id = ensure_source_row(&transaction, None, prepared.adapter, &path_string)?;
-
-    let mut record_ids = HashMap::with_capacity(prepared.records.len());
-    let persist_started = Instant::now();
-    for record in &prepared.records {
-        let started = Instant::now();
-        let record_id = insert_record(
-            &transaction,
-            source_id,
-            record.seq,
-            record.byte_offset,
-            record.byte_length,
-            &record.raw_hash,
-            record.oversized,
-            &record.facts,
-        )?;
-        telemetry.record_persist(PersistTable::TraceRecords, started.elapsed());
-        record_ids.insert(record.seq, record_id);
-        telemetry.count_record();
-    }
-    telemetry.record_duration(IndexPhase::Persist, persist_started.elapsed());
-
-    if let Some(previous) = replaced_transcript {
-        clear_projection(&transaction, previous)?;
-        transaction.execute("DELETE FROM trace_sources WHERE id = ?1", [previous])?;
-    }
-    let items = write_projected_session(
-        &transaction,
-        source_id,
-        &prepared.session,
-        &record_ids,
-        blobs,
-        telemetry,
-    )?;
-
-    let record_count = u64::try_from(prepared.records.len())?;
-    transaction
-        .execute(
-            "UPDATE trace_sources
-                SET adapter = ?2, file_size = ?3, modified_ns = ?4, indexed_bytes = ?5,
-                    indexed_lines = ?6, indexed_fingerprint = ?7,
-                    status = ?8, last_error = NULL, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?1",
-            params![
-                source_id,
-                prepared.adapter.name(),
-                to_sql_i64(discovered.file_size, "file size")?,
-                discovered.modified_ns,
-                to_sql_i64(prepared.indexed_limit, "indexed bytes")?,
-                to_sql_i64(record_count, "indexed lines")?,
-                prepared.fingerprint,
-                source_status(prepared.incomplete_tail),
-            ],
-        )
-        .context("failed to update source state")?;
-
-    let commit_started = Instant::now();
-    transaction.commit().context("failed to commit index")?;
-    telemetry.record_duration(IndexPhase::Commit, commit_started.elapsed());
-
-    Ok(SourceIndexResult {
-        error: None,
-        path: path_string,
-        adapter: prepared.adapter.name().to_owned(),
-        action: "indexed".to_owned(),
-        indexed_records: record_count,
-        indexed_items: items,
-        indexed_bytes: prepared.indexed_limit,
-        file_size: discovered.file_size,
-        malformed_records: prepared.malformed,
-        oversized_records: prepared.oversized,
-        incomplete_tail: prepared.incomplete_tail,
-    })
-}
-
 /// Canonical discovered Source paired with the `stat` metadata already read
 /// during discovery so `index_source` avoids duplicate `realpath`/`stat` calls.
-struct DiscoveredFile {
-    path: PathBuf,
-    file_size: u64,
-    modified_ns: i64,
+pub(super) struct DiscoveredFile {
+    pub(super) path: PathBuf,
+    pub(super) file_size: u64,
+    pub(super) modified_ns: i64,
 }
 
 fn discover_sources(paths: &[PathBuf]) -> Result<(Vec<DiscoveredFile>, u64)> {
@@ -711,8 +303,8 @@ fn discover_sources(paths: &[PathBuf]) -> Result<(Vec<DiscoveredFile>, u64)> {
 }
 
 /// Run-scoped reusable state shared across Sources in one sync.
-struct SyncScratch {
-    blobs: BlobCache,
+pub(super) struct SyncScratch {
+    pub(super) blobs: BlobCache,
     shell_parser: syntax::ShellParser,
     record_buffer: Vec<u8>,
     decompress_buffer: Vec<u8>,
@@ -739,11 +331,171 @@ struct ScanCounts {
     oversized: u64,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the source scan and its bookkeeping deliberately share one SQLite transaction"
-)]
-fn index_source(
+struct ScannedSource {
+    session: SessionProjection,
+    fingerprint: String,
+    line_count: u64,
+    counts: ScanCounts,
+}
+
+struct OpenedSource<'a> {
+    source: IndexingSource<'a>,
+    adapter: AdapterKind,
+    indexed_limit: u64,
+    incomplete_tail: bool,
+}
+
+fn open_source_for_sync<'a>(
+    canonical: &Path,
+    options: &IndexOptions,
+    decompress_buffer: &'a mut Vec<u8>,
+) -> Result<OpenedSource<'a>> {
+    let mut source = open_for_indexing(canonical, decompress_buffer)?;
+    let adapter = detect_adapter(
+        &mut source,
+        canonical,
+        options.max_record_bytes.max(MAX_ADAPTER_DETECTION_BYTES),
+    )?;
+    if is_compressed(canonical) && adapter != AdapterKind::Codex {
+        return Err(UnrecognizedSource(format!(
+            "{}: Zstandard input is supported for Codex traces",
+            canonical.display()
+        ))
+        .into());
+    }
+    let logical_size = source.len();
+    let indexed_limit = source.complete_prefix_length()?;
+    let incomplete_tail = indexed_limit < logical_size;
+    Ok(OpenedSource {
+        source,
+        adapter,
+        indexed_limit,
+        incomplete_tail,
+    })
+}
+
+fn prepare_source_for_scan(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    has_existing_state: bool,
+    reset: bool,
+    incremental_projection: bool,
+    resume_line: u64,
+    telemetry: &mut IndexTelemetry,
+) -> Result<HashMap<u64, i64>> {
+    // A new or reset Source writes its full projection from scratch. An
+    // append-only update to an existing Source keeps its existing Loops and
+    // Items in place until `sync_session` diffs the prefix and rewrites only
+    // the changed tail, avoiding multi-second FTS5/index churn on hot sessions.
+    let clear_started = Instant::now();
+    if has_existing_state && !incremental_projection {
+        clear_projection(transaction, source_id)?;
+    }
+    if reset {
+        transaction
+            .execute(
+                "DELETE FROM trace_records WHERE source_id = ?1",
+                [source_id],
+            )
+            .context("failed to clear records for rebuild")?;
+    }
+    let record_ids = if resume_line > 0 {
+        load_record_ids(transaction, source_id)?
+    } else {
+        HashMap::new()
+    };
+    telemetry.record_duration(IndexPhase::Clear, clear_started.elapsed());
+    Ok(record_ids)
+}
+
+struct SourceUpdate {
+    source_id: i64,
+    has_existing_state: bool,
+    reset: bool,
+    resume_line: u64,
+    action: String,
+    incremental_projection: bool,
+    replaced_transcript: Option<i64>,
+}
+
+enum SourceUpdatePlan {
+    Unchanged(SourceIndexResult),
+    Update(SourceUpdate),
+}
+
+fn plan_source_update(
+    transaction: &Transaction<'_>,
+    discovered: &DiscoveredFile,
+    path_string: &str,
+    opened: &mut OpenedSource<'_>,
+    options: &IndexOptions,
+    telemetry: &mut IndexTelemetry,
+) -> Result<SourceUpdatePlan> {
+    let canonical = &discovered.path;
+    let (state, encoding_changed) =
+        encoding_source_state(transaction, opened.adapter, canonical, path_string)?;
+
+    let reset = decide_reset(
+        &mut opened.source,
+        state.as_ref(),
+        opened.adapter,
+        opened.indexed_limit,
+        options,
+        telemetry,
+    )?;
+    if encoding_changed && reset && !options.rebuild {
+        return Err(UnrecognizedSource(format!(
+            "{} does not preserve the indexed prefix of its sibling encoding; pass --rebuild to replace it",
+            canonical.display()
+        ))
+        .into());
+    }
+    let replaced_transcript = antigravity_replacement(transaction, opened.adapter, canonical)?;
+    if let Some(existing) = state.as_ref()
+        && !reset
+        && replaced_transcript.is_none()
+        && opened.indexed_limit == existing.indexed_bytes
+    {
+        update_unchanged_source_locator(
+            transaction,
+            existing.id,
+            path_string,
+            discovered.file_size,
+            discovered.modified_ns,
+            opened.incomplete_tail,
+        )?;
+        return Ok(SourceUpdatePlan::Unchanged(unchanged_result(
+            path_string.to_owned(),
+            existing,
+            discovered.file_size,
+            opened.incomplete_tail,
+        )));
+    }
+    let resume_line = match (&state, reset) {
+        (Some(existing), false) => existing.indexed_lines,
+        _ => 0,
+    };
+    let action = match (&state, reset, resume_line) {
+        (Some(_), true, _) => "rebuilt",
+        (None, _, _) | (Some(_), false, 0) => "indexed",
+        (Some(_), false, _) => "appended",
+    }
+    .to_owned();
+    let has_existing_state = state.is_some();
+    let source_id = ensure_source_row(transaction, state.as_ref(), opened.adapter, path_string)?;
+    let incremental_projection = !reset && has_existing_state && replaced_transcript.is_none();
+    Ok(SourceUpdatePlan::Update(SourceUpdate {
+        source_id,
+        has_existing_state,
+        reset,
+        resume_line,
+        action,
+        incremental_projection,
+        replaced_transcript,
+    }))
+}
+
+pub(super) fn index_source(
     store: &mut Store,
     discovered: &DiscoveredFile,
     options: &IndexOptions,
@@ -757,13 +509,8 @@ fn index_source(
     let file_size = discovered.file_size;
     let file_modified_ns = discovered.modified_ns;
 
-    // Decided before the file is opened. An unchanged Source needs nothing out
-    // of it, and detecting the adapter costs one open and one record read per
-    // file in the corpus -- five seconds across 1,933 of them -- to arrive at
-    // what the stored row already says. Size and modification time settle
-    // whether anything happened; the format cannot have changed if the bytes
-    // did not. `--rebuild` re-reads and re-detects, which is what to use after
-    // a change to detection itself.
+    // Decided before the file is opened. Size and modification time settle
+    // whether anything happened; `--rebuild` re-reads and re-detects.
     if let Some(existing) = store.source_state(&path_string)?
         && !options.rebuild
         && existing.file_size == file_size
@@ -780,135 +527,209 @@ fn index_source(
         record_buffer,
         decompress_buffer,
     } = scratch;
-    let mut source = open_for_indexing(canonical, decompress_buffer)?;
-    let adapter = detect_adapter(
-        &mut source,
-        canonical,
-        options.max_record_bytes.max(MAX_ADAPTER_DETECTION_BYTES),
-    )?;
-    if is_compressed(canonical) && adapter != AdapterKind::Codex {
-        return Err(UnrecognizedSource(format!(
-            "{}: Zstandard input is supported for Codex traces",
-            canonical.display()
-        ))
-        .into());
-    }
-
-    let logical_size = source.len();
-    let indexed_limit = source.complete_prefix_length()?;
-    let incomplete_tail = indexed_limit < logical_size;
+    let mut opened = open_source_for_sync(canonical, options, decompress_buffer)?;
     telemetry.record_duration(IndexPhase::Prepare, prepare_started.elapsed());
 
     let transaction = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start index transaction")?;
-    let (state, encoding_changed) =
-        encoding_source_state(&transaction, adapter, canonical, &path_string)?;
-
-    let reset = decide_reset(
-        &mut source,
-        state.as_ref(),
-        adapter,
-        indexed_limit,
+    let update = match plan_source_update(
+        &transaction,
+        discovered,
+        &path_string,
+        &mut opened,
         options,
         telemetry,
+    )? {
+        SourceUpdatePlan::Unchanged(result) => {
+            transaction.commit()?;
+            return Ok(result);
+        }
+        SourceUpdatePlan::Update(update) => update,
+    };
+
+    let mut record_ids = prepare_source_for_scan(
+        &transaction,
+        update.source_id,
+        update.has_existing_state,
+        update.reset,
+        update.incremental_projection,
+        update.resume_line,
+        telemetry,
     )?;
-    if encoding_changed && reset && !options.rebuild {
-        return Err(UnrecognizedSource(format!(
-            "{} does not preserve the indexed prefix of its sibling encoding; pass --rebuild to replace it",
-            canonical.display()
-        )).into());
-    }
-    let replaced_transcript = antigravity_replacement(&transaction, adapter, canonical)?;
-    if let Some(existing) = state.as_ref()
-        && !reset
-        && replaced_transcript.is_none()
-        && indexed_limit == existing.indexed_bytes
-    {
-        // A metadata change or encoding switch can leave every published byte
-        // identical. Update the physical locator without rebuilding evidence.
-        transaction.execute(
-            "UPDATE trace_sources
-                SET path = ?2, file_size = ?3, modified_ns = ?4, status = ?5,
-                    last_error = NULL, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?1",
-            params![
-                existing.id,
-                path_string,
-                to_sql_i64(file_size, "file size")?,
-                file_modified_ns,
-                source_status(incomplete_tail),
-            ],
-        )?;
-        transaction.commit()?;
-        return Ok(unchanged_result(
-            path_string,
-            existing,
-            file_size,
-            incomplete_tail,
-        ));
-    }
-    let resume_line = match (&state, reset) {
-        (Some(existing), false) => existing.indexed_lines,
-        _ => 0,
+
+    let mut scanned = scan_and_project_source(&mut ScanContext {
+        transaction: &transaction,
+        source_id: update.source_id,
+        canonical,
+        adapter: opened.adapter,
+        source: &mut opened.source,
+        indexed_limit: opened.indexed_limit,
+        resume_line: update.resume_line,
+        options,
+        record_ids: &mut record_ids,
+        record_buffer,
+        shell_parser,
+        telemetry,
+        progress,
+    })?;
+    let commit = CommitSourceParams {
+        source_id: update.source_id,
+        adapter: opened.adapter,
+        file_size,
+        file_modified_ns,
+        indexed_limit: opened.indexed_limit,
+        incomplete_tail: opened.incomplete_tail,
+        incremental_projection: update.incremental_projection,
+        replaced_transcript: update.replaced_transcript,
     };
-    let action = match (&state, reset, resume_line) {
-        (Some(_), true, _) => "rebuilt",
-        (None, _, _) | (Some(_), false, 0) => "indexed",
-        (Some(_), false, _) => "appended",
-    }
-    .to_owned();
+    persist_and_commit_source(
+        transaction,
+        commit,
+        &mut scanned,
+        &record_ids,
+        blobs,
+        telemetry,
+    )?;
 
-    let source_id = ensure_source_row(&transaction, state.as_ref(), adapter, &path_string)?;
+    Ok(SourceIndexResult {
+        error: None,
+        path: path_string,
+        adapter: opened.adapter.name().to_owned(),
+        action: update.action,
+        indexed_records: scanned.counts.new_records,
+        indexed_items: scanned.counts.items,
+        indexed_bytes: opened.indexed_limit,
+        file_size,
+        malformed_records: scanned.counts.malformed,
+        oversized_records: scanned.counts.oversized,
+        incomplete_tail: opened.incomplete_tail,
+    })
+}
 
-    // A new or reset Source writes its full projection from scratch. An
-    // append-only update to an existing Source keeps its existing Loops and
-    // Items in place until `sync_session` diffs the prefix and rewrites only
-    // the changed tail, avoiding multi-second FTS5/index churn on hot sessions.
-    let incremental_projection = !reset && state.is_some() && replaced_transcript.is_none();
-    let clear_started = Instant::now();
-    if state.is_some() && !incremental_projection {
-        clear_projection(&transaction, source_id)?;
-    }
-    if reset {
-        transaction
-            .execute(
-                "DELETE FROM trace_records WHERE source_id = ?1",
-                [source_id],
-            )
-            .context("failed to clear records for rebuild")?;
-    }
+#[derive(Clone, Copy)]
+struct CommitSourceParams {
+    source_id: i64,
+    adapter: AdapterKind,
+    file_size: u64,
+    file_modified_ns: i64,
+    indexed_limit: u64,
+    incomplete_tail: bool,
+    incremental_projection: bool,
+    replaced_transcript: Option<i64>,
+}
 
-    let mut record_ids = if resume_line > 0 {
-        load_record_ids(&transaction, source_id)?
+fn persist_and_commit_source(
+    transaction: Transaction<'_>,
+    meta: CommitSourceParams,
+    scanned: &mut ScannedSource,
+    record_ids: &HashMap<u64, i64>,
+    blobs: &mut BlobCache,
+    telemetry: &mut IndexTelemetry,
+) -> Result<()> {
+    if let Some(previous) = meta.replaced_transcript {
+        // Replace the old projection only after establishing the new Source.
+        // Failure rolls both operations back together.
+        clear_projection(&transaction, previous)?;
+        transaction.execute("DELETE FROM trace_sources WHERE id = ?1", [previous])?;
+    }
+    scanned.counts.items += if meta.incremental_projection {
+        sync_projected_session(
+            &transaction,
+            meta.source_id,
+            &scanned.session,
+            record_ids,
+            blobs,
+            telemetry,
+        )?
     } else {
-        HashMap::new()
+        write_projected_session(
+            &transaction,
+            meta.source_id,
+            &scanned.session,
+            record_ids,
+            blobs,
+            telemetry,
+        )?
     };
-    telemetry.record_duration(IndexPhase::Clear, clear_started.elapsed());
+    finalize_source_row(
+        &transaction,
+        meta.source_id,
+        meta.adapter,
+        meta.file_size,
+        meta.file_modified_ns,
+        meta.indexed_limit,
+        scanned.line_count,
+        &scanned.fingerprint,
+        meta.incomplete_tail,
+    )?;
+    let commit_started = Instant::now();
+    transaction.commit().context("failed to commit index")?;
+    telemetry.record_duration(IndexPhase::Commit, commit_started.elapsed());
+    Ok(())
+}
 
-    let mut hasher = prefix_hasher(indexed_limit);
-    let mut reader = source
-        .bounded_reader(indexed_limit)
-        .with_context(|| format!("failed to rewind {}", canonical.display()))?;
+struct ScanContext<'a, 'buf, 'connection> {
+    transaction: &'a Transaction<'connection>,
+    source_id: i64,
+    canonical: &'a Path,
+    adapter: AdapterKind,
+    source: &'a mut IndexingSource<'buf>,
+    indexed_limit: u64,
+    resume_line: u64,
+    options: &'a IndexOptions,
+    record_ids: &'a mut HashMap<u64, i64>,
+    record_buffer: &'a mut Vec<u8>,
+    shell_parser: &'a mut syntax::ShellParser,
+    telemetry: &'a mut IndexTelemetry,
+    progress: &'a mut dyn ProgressObserver,
+}
 
-    let mut projector = Projector::new(adapter, options.max_text_bytes, canonical)?;
+fn classify_record(
+    adapter: AdapterKind,
+    parsed: Option<&serde_json::Result<Value>>,
+    persist_record: bool,
+    counts: &mut ScanCounts,
+) -> Option<RecordFacts> {
+    match parsed {
+        None => {
+            counts.oversized += 1;
+            persist_record.then(RecordFacts::oversized)
+        }
+        Some(Err(error)) => {
+            counts.malformed += 1;
+            persist_record.then(|| RecordFacts::malformed(error.to_string()))
+        }
+        Some(Ok(value)) => persist_record.then(|| record_facts(adapter, value)),
+    }
+}
+
+fn scan_and_project_source(ctx: &mut ScanContext<'_, '_, '_>) -> Result<ScannedSource> {
+    let mut hasher = prefix_hasher(ctx.indexed_limit);
+    let mut reader = ctx
+        .source
+        .bounded_reader(ctx.indexed_limit)
+        .with_context(|| format!("failed to rewind {}", ctx.canonical.display()))?;
+
+    let mut projector = Projector::new(ctx.adapter, ctx.options.max_text_bytes, ctx.canonical)?;
     let mut projected_sessions = Vec::new();
     let mut counts = ScanCounts::default();
     let mut byte_offset = 0_u64;
     let mut seq = 0_u64;
 
     loop {
-        let persist_record = seq >= resume_line;
+        let persist_record = seq >= ctx.resume_line;
         let read_started = Instant::now();
         let read = read_bounded_record_into(
             &mut reader,
-            options.max_record_bytes,
+            ctx.options.max_record_bytes,
             Some(&mut hasher),
             persist_record,
-            record_buffer,
+            ctx.record_buffer,
         )?;
-        telemetry.record_duration(IndexPhase::Read, read_started.elapsed());
+        ctx.telemetry
+            .record_duration(IndexPhase::Read, read_started.elapsed());
         let (oversized, byte_length, consumed_bytes, raw_hash) = match read {
             RecordReadInto::Complete {
                 oversized,
@@ -920,35 +741,17 @@ fn index_source(
         };
 
         let project_started = Instant::now();
-        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(record_buffer));
-        let facts = if persist_record {
-            Some(match &parsed {
-                None => {
-                    counts.oversized += 1;
-                    RecordFacts::oversized()
-                }
-                Some(Err(error)) => {
-                    counts.malformed += 1;
-                    RecordFacts::malformed(error.to_string())
-                }
-                Some(Ok(value)) => record_facts(adapter, value),
-            })
-        } else {
-            match &parsed {
-                None => counts.oversized += 1,
-                Some(Err(_)) => counts.malformed += 1,
-                Some(Ok(_)) => {}
-            }
-            None
-        };
-        telemetry.record_duration(IndexPhase::Project, project_started.elapsed());
+        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(ctx.record_buffer));
+        let facts = classify_record(ctx.adapter, parsed.as_ref(), persist_record, &mut counts);
+        ctx.telemetry
+            .record_duration(IndexPhase::Project, project_started.elapsed());
 
         let persist_started = Instant::now();
         if let Some(facts) = facts.as_ref() {
             let started = Instant::now();
             let record_id = insert_record(
-                &transaction,
-                source_id,
+                ctx.transaction,
+                ctx.source_id,
                 seq,
                 byte_offset,
                 byte_length,
@@ -956,75 +759,92 @@ fn index_source(
                 oversized,
                 facts,
             )?;
-            telemetry.record_persist(PersistTable::TraceRecords, started.elapsed());
-            record_ids.insert(seq, record_id);
+            ctx.telemetry
+                .record_persist(PersistTable::TraceRecords, started.elapsed());
+            ctx.record_ids.insert(seq, record_id);
             counts.new_records += 1;
-            telemetry.count_record();
+            ctx.telemetry.count_record();
         }
-        telemetry.record_duration(IndexPhase::Persist, persist_started.elapsed());
+        ctx.telemetry
+            .record_duration(IndexPhase::Persist, persist_started.elapsed());
 
         if let Some(Ok(value)) = &parsed {
             let project_started = Instant::now();
             projector.push(seq, value);
-            telemetry.record_duration(IndexPhase::Project, project_started.elapsed());
-
+            ctx.telemetry
+                .record_duration(IndexPhase::Project, project_started.elapsed());
             projected_sessions.extend(projector.drain_completed());
         }
 
-        telemetry.add_processed_bytes(consumed_bytes);
+        ctx.telemetry.add_processed_bytes(consumed_bytes);
         byte_offset += consumed_bytes;
         seq += 1;
         if seq.is_multiple_of(2048) {
-            progress.update(
-                telemetry.progress(IndexPhase::Persist, Some(canonical)),
+            ctx.progress.update(
+                ctx.telemetry
+                    .progress(IndexPhase::Persist, Some(ctx.canonical)),
                 false,
             );
         }
     }
 
-    projected_sessions.extend(projector.finish());
-    if projected_sessions.len() != 1 {
-        return Err(anyhow::Error::new(UnrecognizedSource(format!(
-            "{} must establish exactly one Session; Adapter projected {}",
-            canonical.display(),
-            projected_sessions.len(),
-        ))));
-    }
-    let mut session = projected_sessions.pop().expect("length checked above");
-    if !session.identity_confirmed {
-        return Err(anyhow::Error::new(UnrecognizedSource(format!(
-            "{} does not contain a structurally confirmed Session identity",
-            canonical.display(),
-        ))));
-    }
-    shell_parser.parse_declared_commands(&mut session, options.max_text_bytes);
-    if let Some(previous) = replaced_transcript {
-        // Replace the old projection only after establishing the new Source.
-        // Failure rolls both operations back together.
-        clear_projection(&transaction, previous)?;
-        transaction.execute("DELETE FROM trace_sources WHERE id = ?1", [previous])?;
-    }
-    counts.items += if incremental_projection {
-        sync_projected_session(
-            &transaction,
-            source_id,
-            &session,
-            &record_ids,
-            blobs,
-            telemetry,
-        )?
-    } else {
-        write_projected_session(
-            &transaction,
-            source_id,
-            &session,
-            &record_ids,
-            blobs,
-            telemetry,
-        )?
-    };
-
+    let session = finalize_projected_session(
+        projector,
+        projected_sessions,
+        ctx.canonical,
+        ctx.shell_parser,
+        ctx.options.max_text_bytes,
+    )?;
     let fingerprint = hasher.finalize().to_hex().to_string();
+    Ok(ScannedSource {
+        session,
+        fingerprint,
+        line_count: seq,
+        counts,
+    })
+}
+
+fn update_unchanged_source_locator(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    path_string: &str,
+    file_size: u64,
+    file_modified_ns: i64,
+    incomplete_tail: bool,
+) -> Result<()> {
+    // A metadata change or encoding switch can leave every published byte
+    // identical. Update the physical locator without rebuilding evidence.
+    transaction.execute(
+        "UPDATE trace_sources
+            SET path = ?2, file_size = ?3, modified_ns = ?4, status = ?5,
+                last_error = NULL, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![
+            source_id,
+            path_string,
+            to_sql_i64(file_size, "file size")?,
+            file_modified_ns,
+            source_status(incomplete_tail),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "checkpoint columns map one-to-one to the trace_sources update statement"
+)]
+fn finalize_source_row(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    adapter: AdapterKind,
+    file_size: u64,
+    file_modified_ns: i64,
+    indexed_limit: u64,
+    line_count: u64,
+    fingerprint: &str,
+    incomplete_tail: bool,
+) -> Result<()> {
     transaction
         .execute(
             "UPDATE trace_sources
@@ -1038,30 +858,13 @@ fn index_source(
                 to_sql_i64(file_size, "file size")?,
                 file_modified_ns,
                 to_sql_i64(indexed_limit, "indexed bytes")?,
-                to_sql_i64(seq, "indexed lines")?,
+                to_sql_i64(line_count, "indexed lines")?,
                 fingerprint,
                 source_status(incomplete_tail),
             ],
         )
         .context("failed to update source state")?;
-
-    let commit_started = Instant::now();
-    transaction.commit().context("failed to commit index")?;
-    telemetry.record_duration(IndexPhase::Commit, commit_started.elapsed());
-
-    Ok(SourceIndexResult {
-        error: None,
-        path: path_string,
-        adapter: adapter.name().to_owned(),
-        action,
-        indexed_records: counts.new_records,
-        indexed_items: counts.items,
-        indexed_bytes: indexed_limit,
-        file_size,
-        malformed_records: counts.malformed,
-        oversized_records: counts.oversized,
-        incomplete_tail,
-    })
+    Ok(())
 }
 
 fn unchanged_result(
@@ -1081,7 +884,7 @@ fn unchanged_result(
     }
 }
 
-fn source_status(incomplete_tail: bool) -> &'static str {
+pub(super) fn source_status(incomplete_tail: bool) -> &'static str {
     if incomplete_tail {
         "partial"
     } else {
@@ -1089,7 +892,7 @@ fn source_status(incomplete_tail: bool) -> &'static str {
     }
 }
 
-fn antigravity_replacement(
+pub(super) fn antigravity_replacement(
     transaction: &Transaction<'_>,
     adapter: AdapterKind,
     path: &Path,
@@ -1125,7 +928,7 @@ fn antigravity_replacement(
     ))))
 }
 
-fn write_projected_session(
+pub(super) fn write_projected_session(
     transaction: &Transaction<'_>,
     source_id: i64,
     session: &SessionProjection,
@@ -1215,7 +1018,7 @@ fn encoding_source_state(
     Ok((alternate, encoding_changed))
 }
 
-fn ensure_source_row(
+pub(super) fn ensure_source_row(
     transaction: &Transaction<'_>,
     state: Option<&SourceState>,
     adapter: AdapterKind,
@@ -1264,7 +1067,7 @@ fn load_record_ids(transaction: &Transaction<'_>, source_id: i64) -> Result<Hash
     clippy::too_many_arguments,
     reason = "physical Record columns map one-to-one to the insert statement"
 )]
-fn insert_record(
+pub(super) fn insert_record(
     transaction: &Transaction<'_>,
     source_id: i64,
     seq: u64,
@@ -1305,7 +1108,7 @@ fn insert_record(
 /// written is simply not readable yet. Both are reported as skipped, leaving
 /// `failed` to mean a trace this tool could not index.
 #[derive(Debug)]
-pub(crate) struct UnrecognizedSource(String);
+pub(crate) struct UnrecognizedSource(pub(super) String);
 
 impl std::fmt::Display for UnrecognizedSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1321,7 +1124,7 @@ pub(crate) fn is_unrecognized_source(error: &anyhow::Error) -> bool {
         .any(<dyn std::error::Error>::is::<UnrecognizedSource>)
 }
 
-fn detect_adapter(
+pub(super) fn detect_adapter(
     source: &mut IndexingSource<'_>,
     path: &Path,
     max_record_bytes: usize,
