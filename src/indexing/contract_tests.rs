@@ -1724,3 +1724,61 @@ fn claude_preserves_structured_output_and_runtime_attachment_facts() {
         .expect("collect Runtime roles");
     assert_eq!(runtime_roles, ["runtime.state", "runtime.notice"]);
 }
+
+#[test]
+fn pipelined_batch_preserves_deterministic_order_and_isolates_unrecognized_sources() {
+    let traces = tempdir().expect("trace directory");
+    let mut paths = Vec::new();
+    for index in 0..6_u32 {
+        let trace = traces.path().join(format!("codex-{index:02}.jsonl"));
+        write_jsonl(
+            &trace,
+            &[
+                json!({"timestamp":"2026-08-20T00:00:00.000Z","type":"session_meta","payload":{"id":format!("session-{index:02}"),"cwd":"/workspace"}}),
+                json!({"timestamp":"2026-08-20T00:00:00.010Z","type":"event_msg","payload":{"type":"task_started","turn_id":"loop-1"}}),
+                json!({"timestamp":"2026-08-20T00:00:00.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("request {index:02}")}]}}),
+                json!({"timestamp":"2026-08-20T00:00:00.200Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":format!("answer {index:02}")}]}}),
+            ],
+        );
+        paths.push(trace);
+    }
+    let stray = traces.path().join("codex-03-stray.jsonl");
+    write_jsonl(&stray, &[json!({"not_a_trace": true})]);
+    paths.push(stray);
+
+    let db_dir = tempdir().expect("database directory");
+    let mut store = Store::open(&db_dir.path().join("index.sqlite")).expect("open index");
+    let report = index_paths(
+        &mut store,
+        &[traces.path().to_path_buf()],
+        &IndexOptions {
+            rebuild: false,
+            max_record_bytes: 16 * 1024 * 1024,
+            max_text_bytes: 64 * 1024,
+        },
+    )
+    .expect("index pipelined batch");
+    assert_eq!(report.indexed_files, 6);
+    assert_eq!(report.skipped_files, 1);
+    assert_eq!(report.failed_files, 0);
+
+    let native_ids = store
+        .connection()
+        .prepare("SELECT native_id FROM sessions ORDER BY session_id")
+        .expect("prepare sessions")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query sessions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect sessions");
+    assert_eq!(
+        native_ids,
+        [
+            "session-00",
+            "session-01",
+            "session-02",
+            "session-03",
+            "session-04",
+            "session-05",
+        ]
+    );
+}
