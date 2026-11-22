@@ -2,6 +2,14 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.3] - 2026-11-22
+
+### Added
+
+- Add opt-in event-driven incremental watching (`trace-index index watch run|status|install|uninstall`). Watches configured `[[roots]]` (or explicit `PATHS`) via OS filesystem notifications (`FSEvents` on macOS, `inotify` on Linux) with per-file debouncing (`--debounce-ms`, `--max-wait-ms`) and a low-frequency incremental safety-net reconcile (`--reconcile-secs`, `0` to disable), while opening `SQLite` only during active batches and enforcing single-watcher exclusivity via stdlib advisory locks.
+- Add opt-in user-level OS background service management (`index watch install` / `uninstall`, supporting macOS `launchd` LaunchAgents and Linux `systemd --user` with `--dry-run` preview). Installing `trace-index` itself never registers background processes.
+- Expose live per-database `watch` state (`active`, `service_installed`, and runtime metadata) in read-only `index status` and `index watch status`, and update Agent-facing Help, bundled documentation, and Skill guidance. Storage Format 4 is unchanged; existing Format 4 indexes need no reindexing.
+
 ## [0.5.2] - 2026-11-22
 
 ### Changed

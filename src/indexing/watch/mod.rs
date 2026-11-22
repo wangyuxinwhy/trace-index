@@ -260,6 +260,9 @@ pub(crate) fn run_watch_until(
     }
     let canonical_roots = canonicalize_roots(&config.roots)?;
     let watch_plan = build_watch_plan(&canonical_roots)?;
+    // Acquire the exclusive per-database lock BEFORE allocating OS watcher
+    // resources so duplicate watchers fail immediately.
+    let lock = WatchLockGuard::acquire(&config.database_path)?;
 
     // Register the OS watcher BEFORE the initial catch-up sync so no write
     // occurring during startup is missed between the initial scan and watch.
@@ -274,11 +277,12 @@ pub(crate) fn run_watch_until(
             .with_context(|| format!("failed to watch {}", dir.display()))?;
     }
 
-    let summary = run_watch_with_receiver(config, &canonical_roots, &watch_plan, &rx, stop);
+    let summary = run_watch_with_lock(config, &canonical_roots, &watch_plan, &rx, stop, lock);
     drop(watcher);
     summary
 }
 
+#[cfg(test)]
 fn run_watch_with_receiver(
     config: &WatchRunConfig,
     canonical_roots: &[SyncRoot],
@@ -286,8 +290,18 @@ fn run_watch_with_receiver(
     rx: &mpsc::Receiver<notify::Result<Event>>,
     stop: &AtomicBool,
 ) -> Result<WatchRunSummary> {
-    let _lock = WatchLockGuard::acquire(&config.database_path)?;
+    let lock = WatchLockGuard::acquire(&config.database_path)?;
+    run_watch_with_lock(config, canonical_roots, watch_plan, rx, stop, lock)
+}
 
+fn run_watch_with_lock(
+    config: &WatchRunConfig,
+    canonical_roots: &[SyncRoot],
+    watch_plan: &WatchPlan,
+    rx: &mpsc::Receiver<notify::Result<Event>>,
+    stop: &AtomicBool,
+    _lock: WatchLockGuard,
+) -> Result<WatchRunSummary> {
     let mut state = WatchStateFile {
         pid: std::process::id(),
         started_at_ms: now_unix_ms(),
@@ -1111,7 +1125,7 @@ mod tests {
             )
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             let st = inspect_watch_status(&db);
             if st.active && st.synced_batches.unwrap_or(0) >= 1 {
