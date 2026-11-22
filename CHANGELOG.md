@@ -2,6 +2,13 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.2] - 2026-11-22
+
+### Changed
+
+- Accelerate incremental `index sync` on active append-only Sources with prefix-preserving domain persistence (`sync_session`). Unchanged Session Items, completed Loops, and unchanged prefix Items of the active tail Loop are preserved in place—reusing existing `loop_id`s, `item_id`s, FTS5 entries, and covering `content_blobs(hash)` index lookups—while rewriting only from the first diverged Item or Loop onward so relative `item_id` ordering and all SQL/FTS5 results remain identical to a full rebuild. Storage Format 4 is unchanged; existing Format 4 indexes need no reindexing.
+- Modularize storage semantic encoding, incremental persistence, the parallel Source preparation pipeline, and the Codex/Claude runtime adapters into focused submodules with zero behavioral change.
+
 ## [0.5.1] - 2026-11-22
 
 ### Changed
