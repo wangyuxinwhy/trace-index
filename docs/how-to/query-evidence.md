@@ -274,6 +274,21 @@ ORDER BY duration_ms DESC;
 
 This query only includes outputs whose Runtime reported a duration. It does not silently treat unknown durations as zero.
 
+When starting from a selective set of tool calls and joining their outputs in the reverse direction (`call LEFT JOIN output`), use unary `+` on `call.item_id` so SQLite's comparison matches the expression index on `json_extract(output.semantic, '$.value.call_item_id')` with an index seek rather than scanning outputs:
+
+```sql
+SELECT call.item_id AS call_item_id,
+       json_extract(call.semantic, '$.value.tool_name') AS tool_name,
+       output.item_id AS output_item_id,
+       json_extract(output.semantic, '$.value.exit_code') AS exit_code
+FROM items AS call
+LEFT JOIN items AS output
+  ON json_extract(output.semantic, '$.value.call_item_id') = +call.item_id
+WHERE json_extract(call.semantic, '$.role') = 'agent.tool_call.shell'
+ORDER BY call.occurred_at DESC
+LIMIT 50;
+```
+
 When output size or completeness matters, read both observation boundaries:
 
 ```sql
