@@ -103,6 +103,25 @@ impl BlobCache {
         }
     }
 
+    /// Looks up an existing Blob id without inserting or compressing on a miss.
+    pub(crate) fn lookup_existing(
+        &mut self,
+        transaction: &Transaction<'_>,
+        content: &BoundedText,
+    ) -> Result<Option<i64>> {
+        if let Some(&id) = self.ids.get(&content.hash) {
+            return Ok(Some(id));
+        }
+        if self.known_complete {
+            return Ok(None);
+        }
+        let Some(id) = lookup_blob_id(transaction, &content.hash)? else {
+            return Ok(None);
+        };
+        self.ids.insert(content.hash, id);
+        Ok(Some(id))
+    }
+
     pub(crate) fn intern(
         &mut self,
         transaction: &Transaction<'_>,

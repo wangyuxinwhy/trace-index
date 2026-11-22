@@ -1,4 +1,4 @@
-//! Persists one affected Session into storage format 1.
+//! Persists one affected Session into `SQLite` storage.
 //!
 //! Adapters use a private projection before publication. This boundary
 //! enforces the five-object model: runtime work cycles become Loops, lifecycle
@@ -9,34 +9,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension as _, Transaction, params};
-use serde::Serialize;
 
 use super::blob::BlobCache;
 use super::db::to_sql_i64;
 use super::search::tokenize_for_term_index;
-use crate::adapters::projection::{
-    BoundedText, ItemDetail, ItemProjection, SessionProjection, SyntaxProjection,
+use super::semantic_encode::{
+    BlobRef, evidence_strength, item_text_sources, normalized_role, session_link_member,
+    stored_semantic_value,
 };
+use crate::adapters::projection::{ItemDetail, ItemProjection, LoopProjection, SessionProjection};
 use crate::adapters::semantic;
-use crate::domain::{
-    ByteRange, Compaction, Completeness, Context as SemanticContext, ContextCategory, Delegation,
-    EvidenceStrength, Instruction, InstructionCategory, Invocation, ItemId, PipelinePosition,
-    Reasoning, Redirect, Semantic, SemanticRole, SemanticValue, SessionId, ShellFragment,
-    ShellStatement, ShellToolCall, SubagentActivity, SubagentReport, Text, ToolCall, ToolOutput,
-};
+use crate::domain::{ItemId, Semantic, SemanticRole, SessionId};
 use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
-
-/// Public SQL access encoding for top-level bounded Semantic text.
-///
-/// The domain model carries `TextContent`; persistence stores that text in
-/// `content_blobs` and serializes `{ "blob_id": ... }` directly inside
-/// `Semantic<BlobRef>` without constructing an intermediate JSON DOM tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-struct BlobRef {
-    blob_id: i64,
-}
 
 pub(crate) fn clear_projection(transaction: &Transaction<'_>, source_id: i64) -> Result<()> {
     transaction
@@ -105,10 +91,47 @@ pub(crate) struct WriteCounts {
     pub(crate) items: u64,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the indexer supplies one complete publication candidate"
-)]
+pub(super) struct ProjectedLoopRow<'a> {
+    pub(super) ordinal: i64,
+    pub(super) native_id: Option<&'a str>,
+    pub(super) start_record_id: i64,
+    pub(super) end_record_id: Option<i64>,
+    pub(super) outcome: Option<&'static str>,
+    pub(super) model: Option<String>,
+    pub(super) usage: Option<String>,
+}
+
+impl<'a> ProjectedLoopRow<'a> {
+    pub(super) fn from_projection(
+        loop_index: usize,
+        projected: &'a LoopProjection,
+        record_ids: &HashMap<u64, i64>,
+    ) -> Result<Self> {
+        let ordinal = i64::try_from(loop_index).context("Loop ordinal exceeds SQLite INTEGER")?;
+        let start_record_id = record_id(record_ids, projected.start_seq, "Loop start")?;
+        let (end_record_id, outcome) = loop_end(projected, record_ids)?;
+        let model = projected
+            .model
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let usage = projected
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        Ok(Self {
+            ordinal,
+            native_id: projected.native_id.as_deref(),
+            start_record_id,
+            end_record_id,
+            outcome,
+            model,
+            usage,
+        })
+    }
+}
+
 pub(crate) fn write_session(
     transaction: &Transaction<'_>,
     source_id: i64,
@@ -133,60 +156,20 @@ pub(crate) fn write_session(
         writer.write(projected_item, None, None)?;
     }
 
-    let next_session_position: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(session_position) + 1, 0)
-               FROM domain_loops
-              WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .context("failed to allocate temporary Loop positions")?;
+    let mut next_session_position = next_loop_session_position(transaction, session_id)?;
     for (loop_index, projected_loop) in session.loops.iter().enumerate() {
-        let source_ordinal =
-            i64::try_from(loop_index).context("Loop ordinal exceeds SQLite INTEGER")?;
-        let session_position = next_session_position
-            .checked_add(source_ordinal)
+        let row = ProjectedLoopRow::from_projection(loop_index, projected_loop, record_ids)?;
+        let loop_id = insert_loop(
+            transaction,
+            source_id,
+            session_id,
+            next_session_position,
+            &row,
+            writer.telemetry,
+        )?;
+        next_session_position = next_session_position
+            .checked_add(1)
             .context("Loop position exceeds SQLite INTEGER")?;
-        let start_record_id = record_id(record_ids, projected_loop.start_seq, "Loop start")?;
-        let (end_record_id, outcome) = loop_end(projected_loop, record_ids)?;
-        let model = projected_loop
-            .model
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let usage = projected_loop
-            .usage
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let started = Instant::now();
-        transaction
-            .prepare_cached(
-                "INSERT INTO domain_loops(
-                 source_id, session_id, ordinal, session_position, native_id,
-                 start_record_id, end_record_id, outcome, model, usage)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )
-            .context("failed to prepare Loop insert")?
-            .execute(params![
-                source_id,
-                session_id,
-                source_ordinal,
-                session_position,
-                projected_loop.native_id,
-                start_record_id,
-                end_record_id,
-                outcome,
-                model,
-                usage
-            ])
-            .context("failed to store Loop")?;
-        writer
-            .telemetry
-            .record_persist(PersistTable::Loops, started.elapsed());
-        writer.telemetry.count_loop();
-        let loop_id = transaction.last_insert_rowid();
 
         let mut loop_position = 0_u64;
         for projected_item in &projected_loop.items {
@@ -204,13 +187,66 @@ pub(crate) fn write_session(
     Ok(counts)
 }
 
+pub(super) fn next_loop_session_position(
+    transaction: &Transaction<'_>,
+    session_id: i64,
+) -> Result<i64> {
+    transaction
+        .query_row(
+            "SELECT COALESCE(MAX(session_position) + 1, 0)
+               FROM domain_loops
+              WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .context("failed to allocate temporary Loop positions")
+}
+
+pub(super) fn insert_loop(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    session_id: i64,
+    session_position: i64,
+    row: &ProjectedLoopRow<'_>,
+    telemetry: &mut IndexTelemetry,
+) -> Result<i64> {
+    let started = Instant::now();
+    transaction
+        .prepare_cached(
+            "INSERT INTO domain_loops(
+                 source_id, session_id, ordinal, session_position, native_id,
+                 start_record_id, end_record_id, outcome, model, usage)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .context("failed to prepare Loop insert")?
+        .execute(params![
+            source_id,
+            session_id,
+            row.ordinal,
+            session_position,
+            row.native_id,
+            row.start_record_id,
+            row.end_record_id,
+            row.outcome,
+            row.model,
+            row.usage,
+        ])
+        .context("failed to store Loop")?;
+    telemetry.record_persist(PersistTable::Loops, started.elapsed());
+    telemetry.count_loop();
+    Ok(transaction.last_insert_rowid())
+}
+
 /// Reorders every Loop after one Source of a multi-Source Session changes.
 ///
 /// Runtime timestamps establish the historical order in which work occurred.
 /// A Source timestamp is the fallback for a Runtime that omits a Loop-start
 /// timestamp; storage identity is only the final deterministic tie-breaker.
 /// The two update passes keep the unique constraint valid throughout.
-fn normalize_loop_positions(transaction: &Transaction<'_>, session_id: i64) -> Result<()> {
+pub(super) fn normalize_loop_positions(
+    transaction: &Transaction<'_>,
+    session_id: i64,
+) -> Result<()> {
     let loops = transaction
         .prepare_cached(
             "SELECT l.id, l.session_position
@@ -347,23 +383,45 @@ fn store_session(
     Ok((session_id, runtime))
 }
 
-struct ItemWriter<'a, 'connection> {
-    transaction: &'a Transaction<'connection>,
+pub(super) struct PendingOutput {
+    pub(super) item_id: i64,
+    pub(super) call_id: String,
+    pub(super) stored_link: Option<i64>,
+}
+
+pub(super) struct ExistingSessionLink {
+    pub(super) target_runtime: String,
+    pub(super) target_native_id: String,
+    pub(super) json_member: String,
+}
+
+pub(super) struct ExistingItem {
+    pub(super) id: i64,
+    pub(super) loop_position: Option<i64>,
+    pub(super) occurred_at: Option<i64>,
+    pub(super) semantic: String,
+    pub(super) call_item_id: Option<i64>,
+    pub(super) record_ids: Vec<i64>,
+    pub(super) session_link: Option<ExistingSessionLink>,
+}
+
+pub(super) struct ItemWriter<'a, 'connection> {
+    pub(super) transaction: &'a Transaction<'connection>,
     source_id: i64,
     session_id: i64,
     runtime: String,
     record_ids: &'a HashMap<u64, i64>,
     blobs: &'a mut BlobCache,
-    telemetry: &'a mut IndexTelemetry,
+    pub(super) telemetry: &'a mut IndexTelemetry,
     call_items: HashMap<String, i64>,
     session_targets: HashMap<String, Option<i64>>,
-    pending_outputs: Vec<(i64, String)>,
+    pending_outputs: Vec<PendingOutput>,
     json_buffer: Vec<u8>,
     item_total: u64,
 }
 
 impl<'a, 'connection> ItemWriter<'a, 'connection> {
-    fn new(
+    pub(super) fn new(
         transaction: &'a Transaction<'connection>,
         source_id: i64,
         session_id: i64,
@@ -388,9 +446,118 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         }
     }
 
+    /// Checks whether an existing persisted Item is semantically and structurally
+    /// identical to `item` at `loop_position`, preserving its `item_id` and
+    /// recording its `ToolCall` / deferred `ToolOutput` linkage when matched.
+    pub(super) fn try_preserve_existing(
+        &mut self,
+        item: &ItemProjection,
+        existing: &ExistingItem,
+        loop_position: Option<i64>,
+    ) -> Result<bool> {
+        if existing.loop_position != loop_position || existing.occurred_at != item.ts_ms {
+            return Ok(false);
+        }
+        let (primary_record_id, secondary_record_id) = item_record_ids(item, self.record_ids)?;
+        if !record_witnesses_match(&existing.record_ids, primary_record_id, secondary_record_id) {
+            return Ok(false);
+        }
+
+        let role = normalized_role(&item.semantic_role, &item.detail)?;
+        let target_session_id =
+            if let Some(target_native_id) = item.linked_session_native_id.as_deref() {
+                let json_member = session_link_member(role)?;
+                let Some(link) = existing.session_link.as_ref() else {
+                    return Ok(false);
+                };
+                if link.target_runtime != self.runtime
+                    || link.target_native_id != target_native_id
+                    || link.json_member != json_member
+                {
+                    return Ok(false);
+                }
+                self.resolve_session_target(target_native_id)?
+                    .map(SessionId)
+            } else {
+                if existing.session_link.is_some() {
+                    return Ok(false);
+                }
+                None
+            };
+
+        let (inline_call_item_id, pending_call_id) = match (&item.detail, role) {
+            (ItemDetail::ToolOutput { call_id, .. }, SemanticRole::ToolOutput) => {
+                if let Some(&call_item_id) = self.call_items.get(call_id) {
+                    (Some(ItemId(call_item_id)), None)
+                } else {
+                    // Out-of-order or unresolved ToolOutput: compare against its
+                    // currently stored link and reconcile in `finish()`.
+                    (existing.call_item_id.map(ItemId), Some(call_id.as_str()))
+                }
+            }
+            _ => (None, None),
+        };
+
+        let (blob_source, _searchable_text) = item_text_sources(item, role);
+        let has_nonempty_text = blob_source
+            .and_then(|content| content.text.as_deref())
+            .is_some_and(|text| !text.is_empty());
+        let blob_ref = match blob_source {
+            Some(content) => {
+                let Some(blob_id) = self.blobs.lookup_existing(self.transaction, content)? else {
+                    return Ok(false);
+                };
+                Some(BlobRef { blob_id })
+            }
+            None => None,
+        };
+
+        let stored_semantic = Semantic {
+            role,
+            value: stored_semantic_value(
+                item,
+                role,
+                blob_ref,
+                target_session_id,
+                inline_call_item_id,
+            )?,
+            evidence_strength: evidence_strength(&item.basis),
+        };
+        crate::domain::validate_semantic_with_text(&stored_semantic, has_nonempty_text)?;
+
+        self.json_buffer.clear();
+        serde_json::to_writer(&mut self.json_buffer, &stored_semantic)?;
+        let semantic_matches = if self.json_buffer.as_slice() == existing.semantic.as_bytes() {
+            true
+        } else if target_session_id.is_some() || pending_call_id.is_some() {
+            // `json_set` from Session-link triggers or deferred ToolOutput linking
+            // appends the updated member at the end of `$.value`.
+            let expected: serde_json::Value = serde_json::from_slice(&self.json_buffer)?;
+            let actual: serde_json::Value = serde_json::from_str(&existing.semantic)?;
+            expected == actual
+        } else {
+            false
+        };
+        if !semantic_matches {
+            return Ok(false);
+        }
+
+        if let ItemDetail::ToolCall { call_id, .. } = &item.detail {
+            self.call_items.insert(call_id.clone(), existing.id);
+        } else if let Some(call_id) = pending_call_id {
+            self.pending_outputs.push(PendingOutput {
+                item_id: existing.id,
+                call_id: call_id.to_owned(),
+                stored_link: existing.call_item_id,
+            });
+        }
+        self.item_total += 1;
+        Ok(true)
+    }
+
     /// Writes one selected Item. Returns false for lifecycle-only projections,
     /// which remain Records and must not consume a Loop position.
-    fn write(
+    pub(super) fn write(
         &mut self,
         item: &ItemProjection,
         loop_id: Option<i64>,
@@ -523,7 +690,11 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         if let ItemDetail::ToolCall { call_id, .. } = &item.detail {
             self.call_items.insert(call_id.clone(), item_id);
         } else if let Some(call_id) = pending_call_id {
-            self.pending_outputs.push((item_id, call_id.to_owned()));
+            self.pending_outputs.push(PendingOutput {
+                item_id,
+                call_id: call_id.to_owned(),
+                stored_link: None,
+            });
         }
     }
 
@@ -577,10 +748,19 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
         Ok(target)
     }
 
-    fn finish(self) -> Result<WriteCounts> {
-        for (item_id, call_id) in self.pending_outputs {
-            if let Some(call_item_id) = self.call_items.get(&call_id) {
-                resolve_tool_output_link(self.transaction, item_id, *call_item_id)?;
+    pub(super) fn finish(self) -> Result<WriteCounts> {
+        for pending in self.pending_outputs {
+            let desired = self.call_items.get(&pending.call_id).copied();
+            if desired == pending.stored_link {
+                continue;
+            }
+            match desired {
+                Some(call_item_id) => {
+                    resolve_tool_output_link(self.transaction, pending.item_id, call_item_id)?;
+                }
+                None => {
+                    clear_tool_output_link(self.transaction, pending.item_id)?;
+                }
             }
         }
         Ok(WriteCounts {
@@ -589,14 +769,10 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
     }
 }
 
-fn session_link_member(role: SemanticRole) -> Result<&'static str> {
-    match role {
-        SemanticRole::AgentDelegation => Ok("child_session_id"),
-        SemanticRole::SubagentActivity => Ok("subagent_session_id"),
-        SemanticRole::SubagentReport => Ok("source_session_id"),
-        _ => {
-            bail!("only delegation, subagent activity, and subagent report may reference a Session")
-        }
+fn record_witnesses_match(existing: &[i64], primary: i64, secondary: Option<i64>) -> bool {
+    match secondary {
+        None => existing == [primary],
+        Some(secondary) => existing == [primary, secondary] || existing == [secondary, primary],
     }
 }
 
@@ -618,11 +794,24 @@ fn resolve_tool_output_link(
     Ok(())
 }
 
+fn clear_tool_output_link(transaction: &Transaction<'_>, item_id: i64) -> Result<()> {
+    transaction
+        .prepare_cached(
+            "UPDATE domain_items
+                SET semantic = json_remove(semantic, '$.value.call_item_id')
+              WHERE id = ?1",
+        )
+        .context("failed to prepare ToolOutput link removal")?
+        .execute(params![item_id])
+        .context("failed to clear ToolOutput call Item")?;
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "a sparse Session parent attribute has one target and one witness"
 )]
-fn store_parent_candidate(
+pub(super) fn store_parent_candidate(
     transaction: &Transaction<'_>,
     session_id: i64,
     source_id: i64,
@@ -657,7 +846,7 @@ fn store_parent_candidate(
     Ok(())
 }
 
-fn normalize_parent_locator(source_locator: &str, locator: &str) -> String {
+pub(super) fn normalize_parent_locator(source_locator: &str, locator: &str) -> String {
     let locator = Path::new(locator);
     let joined = if locator.is_absolute() {
         PathBuf::from(locator)
@@ -674,7 +863,7 @@ fn normalize_parent_locator(source_locator: &str, locator: &str) -> String {
         .into_owned()
 }
 
-fn record_id(record_ids: &HashMap<u64, i64>, seq: u64, fact: &str) -> Result<i64> {
+pub(super) fn record_id(record_ids: &HashMap<u64, i64>, seq: u64, fact: &str) -> Result<i64> {
     record_ids
         .get(&seq)
         .copied()
@@ -697,7 +886,7 @@ fn item_record_ids(
 }
 
 fn loop_end(
-    projected: &crate::adapters::projection::LoopProjection,
+    projected: &LoopProjection,
     record_ids: &HashMap<u64, i64>,
 ) -> Result<(Option<i64>, Option<&'static str>)> {
     let outcome = match projected.outcome {
@@ -717,487 +906,11 @@ fn loop_end(
     Ok((end_record_id, outcome))
 }
 
-/// Selects the Adapter text that backs the public Semantic `TextContent` and
-/// optional full-text search entry without cloning the bounded string.
-///
-/// A Tool Output keeps its text in the typed detail rather than the general
-/// Item preview and is not indexed into conversation search. Every other
-/// text-bearing Semantic value is built from `preview`. Tool arguments and
-/// parsed shell structure remain ordinary typed Semantic data; Blob is not a
-/// generic JSON externalization mechanism.
-fn item_text_sources(
-    item: &ItemProjection,
-    role: SemanticRole,
-) -> (Option<&BoundedText>, Option<&str>) {
-    match role {
-        SemanticRole::AgentToolCall | SemanticRole::AgentToolCallShell => (None, None),
-        SemanticRole::ToolOutput => {
-            let ItemDetail::ToolOutput { output, .. } = &item.detail else {
-                unreachable!("tool output role must carry tool output detail")
-            };
-            let blob = output.as_ref().filter(|content| content.text.is_some());
-            (blob, None)
-        }
-        _ => {
-            let blob = item
-                .preview
-                .as_ref()
-                .filter(|content| content.text.is_some());
-            let searchable_text = blob.and_then(|content| content.text.as_deref());
-            (blob, searchable_text)
-        }
-    }
-}
-
-fn stored_semantic_value(
-    item: &ItemProjection,
-    role: SemanticRole,
-    blob: Option<BlobRef>,
-    target_session_id: Option<SessionId>,
-    call_item_id: Option<ItemId>,
-) -> Result<SemanticValue<BlobRef>> {
-    let has_images = matches!(
-        &item.detail,
-        ItemDetail::Message {
-            has_images: true,
-            ..
-        }
-    );
-    let value = match role {
-        SemanticRole::AgentReasoning => {
-            let ItemDetail::Reasoning { representation } = &item.detail else {
-                unreachable!("reasoning role must carry reasoning detail")
-            };
-            SemanticValue::Reasoning(Reasoning {
-                representation: *representation,
-                text: blob,
-            })
-        }
-        SemanticRole::AgentToolCall | SemanticRole::AgentToolCallShell => {
-            let ItemDetail::ToolCall {
-                name,
-                workdir,
-                args,
-                syntax,
-                ..
-            } = &item.detail
-            else {
-                unreachable!()
-            };
-            let tool_call = ToolCall {
-                tool_name: name.clone(),
-                arguments: args.as_deref().map(semantic_arguments),
-                working_directory: workdir.clone(),
-            };
-            if role == SemanticRole::AgentToolCallShell {
-                SemanticValue::ShellToolCall(ShellToolCall {
-                    tool_call,
-                    shell_fragments: shell_fragments(syntax.as_ref())?,
-                })
-            } else {
-                SemanticValue::ToolCall(tool_call)
-            }
-        }
-        SemanticRole::ToolOutput => {
-            let ItemDetail::ToolOutput { facts, .. } = &item.detail else {
-                unreachable!()
-            };
-            SemanticValue::ToolOutput(ToolOutput {
-                call_item_id,
-                text: blob,
-                exit_code: facts.exit_code,
-                failed: facts.nonzero_exit,
-                duration_ms: facts.duration_ms,
-                runtime_truncated: facts.truncated,
-                runtime_output_tokens: facts.output_tokens,
-            })
-        }
-        SemanticRole::AgentDelegation => SemanticValue::Delegation(Delegation {
-            text: blob,
-            has_images,
-            child_session_id: target_session_id,
-        }),
-        SemanticRole::SubagentActivity => SemanticValue::SubagentActivity(SubagentActivity {
-            text: blob,
-            has_images,
-            subagent_session_id: target_session_id,
-        }),
-        SemanticRole::SubagentReport => SemanticValue::SubagentReport(SubagentReport {
-            text: blob,
-            has_images,
-            source_session_id: target_session_id,
-        }),
-        SemanticRole::RuntimeCompactionSummary => {
-            SemanticValue::Compaction(Compaction { summary: blob })
-        }
-        SemanticRole::RuntimeInstructions => SemanticValue::Instruction(Instruction {
-            text: blob,
-            category: instruction_category(&item.semantic_role),
-        }),
-        SemanticRole::RuntimeContext => SemanticValue::Context(SemanticContext {
-            text: blob,
-            category: context_category(&item.semantic_role),
-            has_images,
-        }),
-        _ => SemanticValue::Text(Text {
-            text: blob,
-            has_images,
-        }),
-    };
-    Ok(value)
-}
-
-/// Publishes complete structured arguments as JSON and complete scalar tool
-/// input as a JSON string. Some Runtime tools, notably Codex web search, record
-/// a plain string rather than a JSON object. Oversized arguments are already
-/// omitted before reaching persistence; the supporting Record remains the
-/// recovery path in that case.
-fn semantic_arguments(text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned()))
-}
-
-fn normalized_role(role: &str, detail: &ItemDetail) -> Result<SemanticRole> {
-    let role = match role {
-        semantic::HUMAN_REQUEST => SemanticRole::HumanRequest,
-        semantic::HUMAN_STEERING => SemanticRole::HumanSteering,
-        semantic::AGENT_COMMENTARY => SemanticRole::AgentCommentary,
-        semantic::AGENT_FINAL_ANSWER => SemanticRole::AgentFinalAnswer,
-        semantic::AGENT_REASONING => SemanticRole::AgentReasoning,
-        semantic::AGENT_TOOL_CALL
-            if matches!(
-                detail,
-                ItemDetail::ToolCall {
-                    syntax: Some(_),
-                    ..
-                }
-            ) =>
-        {
-            SemanticRole::AgentToolCallShell
-        }
-        semantic::AGENT_TOOL_CALL => SemanticRole::AgentToolCall,
-        semantic::AGENT_DELEGATION => SemanticRole::AgentDelegation,
-        semantic::TOOL_OUTPUT => SemanticRole::ToolOutput,
-        semantic::SUBAGENT_ACTIVITY => SemanticRole::SubagentActivity,
-        semantic::SUBAGENT_REPORT => SemanticRole::SubagentReport,
-        semantic::RUNTIME_COMPACTION => SemanticRole::RuntimeCompactionSummary,
-        semantic::RUNTIME_NOTICE
-        | semantic::RUNTIME_ABORT_NOTICE
-        | semantic::RUNTIME_HOOK_OUTPUT => SemanticRole::RuntimeNotice,
-        semantic::RUNTIME_STATE | semantic::RUNTIME_BUDGET | semantic::RUNTIME_FILE_CHANGE => {
-            SemanticRole::RuntimeState
-        }
-        semantic::RUNTIME_INSTRUCTIONS
-        | semantic::RUNTIME_PROJECT_INSTRUCTIONS
-        | semantic::RUNTIME_USER_INSTRUCTIONS
-        | semantic::RUNTIME_SKILL_INSTRUCTIONS
-        | semantic::RUNTIME_PERMISSIONS
-        | semantic::RUNTIME_COLLAB_MODE
-        | semantic::RUNTIME_PLUGINS
-        | semantic::RUNTIME_APPS
-        | semantic::RUNTIME_PERSONALITY
-        | semantic::RUNTIME_TOOL_CATALOG => SemanticRole::RuntimeInstructions,
-        semantic::RUNTIME_SESSION_REFERENCE
-        | semantic::RUNTIME_MEMORY
-        | semantic::RUNTIME_ENV_CONTEXT
-        | semantic::RUNTIME_INTERNAL_CONTEXT
-        | semantic::RUNTIME_SLASH_COMMAND
-        | semantic::RUNTIME_BASH_COMMAND
-        | semantic::RUNTIME_IMAGE_ATTACHMENT
-        | semantic::RUNTIME_IDE_CONTEXT
-        | semantic::RUNTIME_FILE_CONTEXT => SemanticRole::RuntimeContext,
-        semantic::RUNTIME_UNKNOWN => SemanticRole::RuntimeUnknown,
-        _ => bail!("Adapter emitted unmapped semantic role {role:?}"),
-    };
-    Ok(role)
-}
-
-fn instruction_category(role: &str) -> Option<InstructionCategory> {
-    match role {
-        semantic::RUNTIME_PROJECT_INSTRUCTIONS => Some(InstructionCategory::Project),
-        semantic::RUNTIME_USER_INSTRUCTIONS => Some(InstructionCategory::User),
-        semantic::RUNTIME_SKILL_INSTRUCTIONS => Some(InstructionCategory::Skill),
-        semantic::RUNTIME_PERMISSIONS => Some(InstructionCategory::Permission),
-        semantic::RUNTIME_COLLAB_MODE => Some(InstructionCategory::Collaboration),
-        semantic::RUNTIME_PLUGINS => Some(InstructionCategory::Plugin),
-        semantic::RUNTIME_TOOL_CATALOG => Some(InstructionCategory::ToolCatalog),
-        _ => None,
-    }
-}
-
-fn context_category(role: &str) -> Option<ContextCategory> {
-    match role {
-        semantic::RUNTIME_ENV_CONTEXT => Some(ContextCategory::Environment),
-        semantic::RUNTIME_MEMORY => Some(ContextCategory::Memory),
-        semantic::RUNTIME_FILE_CONTEXT => Some(ContextCategory::File),
-        semantic::RUNTIME_SESSION_REFERENCE => Some(ContextCategory::SessionReference),
-        semantic::RUNTIME_INTERNAL_CONTEXT
-        | semantic::RUNTIME_SLASH_COMMAND
-        | semantic::RUNTIME_BASH_COMMAND => Some(ContextCategory::Internal),
-        _ => None,
-    }
-}
-
-fn evidence_strength(basis: &str) -> EvidenceStrength {
-    if basis.split('+').any(semantic::basis_is_heuristic) {
-        EvidenceStrength::Heuristic
-    } else {
-        EvidenceStrength::Structural
-    }
-}
-
-/// Converts a domain `Semantic<TextContent>` into its SQL `Semantic<BlobRef>`
-/// access encoding for contract-equivalence tests.
-#[cfg(test)]
-fn stored_semantic(semantic: &Semantic, blob_id: Option<i64>) -> Result<serde_json::Value> {
-    let blob_ref = |has_text: bool| -> Result<Option<BlobRef>> {
-        match (has_text, blob_id) {
-            (true, Some(blob_id)) => Ok(Some(BlobRef { blob_id })),
-            (false, None) => Ok(None),
-            (true, None) => bail!("text-bearing Semantic value was stored without a Blob"),
-            (false, Some(_)) => bail!("text-bearing Semantic value was not externalized"),
-        }
-    };
-    let value = match &semantic.value {
-        SemanticValue::Text(value) => SemanticValue::Text(Text {
-            text: blob_ref(value.text.is_some())?,
-            has_images: value.has_images,
-        }),
-        SemanticValue::Reasoning(value) => SemanticValue::Reasoning(Reasoning {
-            representation: value.representation,
-            text: blob_ref(value.text.is_some())?,
-        }),
-        SemanticValue::ToolCall(value) => {
-            ensure!(
-                blob_id.is_none(),
-                "text-bearing Semantic value has no text member"
-            );
-            SemanticValue::ToolCall(value.clone())
-        }
-        SemanticValue::ShellToolCall(value) => {
-            ensure!(
-                blob_id.is_none(),
-                "text-bearing Semantic value has no text member"
-            );
-            SemanticValue::ShellToolCall(value.clone())
-        }
-        SemanticValue::ToolOutput(value) => SemanticValue::ToolOutput(ToolOutput {
-            call_item_id: value.call_item_id,
-            text: blob_ref(value.text.is_some())?,
-            exit_code: value.exit_code,
-            failed: value.failed,
-            duration_ms: value.duration_ms,
-            runtime_truncated: value.runtime_truncated,
-            runtime_output_tokens: value.runtime_output_tokens,
-        }),
-        SemanticValue::Delegation(value) => SemanticValue::Delegation(Delegation {
-            text: blob_ref(value.text.is_some())?,
-            has_images: value.has_images,
-            child_session_id: value.child_session_id,
-        }),
-        SemanticValue::SubagentActivity(value) => {
-            SemanticValue::SubagentActivity(SubagentActivity {
-                text: blob_ref(value.text.is_some())?,
-                has_images: value.has_images,
-                subagent_session_id: value.subagent_session_id,
-            })
-        }
-        SemanticValue::SubagentReport(value) => SemanticValue::SubagentReport(SubagentReport {
-            text: blob_ref(value.text.is_some())?,
-            has_images: value.has_images,
-            source_session_id: value.source_session_id,
-        }),
-        SemanticValue::Compaction(value) => SemanticValue::Compaction(Compaction {
-            summary: blob_ref(value.summary.is_some())?,
-        }),
-        SemanticValue::Instruction(value) => SemanticValue::Instruction(Instruction {
-            text: blob_ref(value.text.is_some())?,
-            category: value.category,
-        }),
-        SemanticValue::Context(value) => SemanticValue::Context(SemanticContext {
-            text: blob_ref(value.text.is_some())?,
-            category: value.category,
-            has_images: value.has_images,
-        }),
-    };
-    Ok(serde_json::to_value(Semantic {
-        role: semantic.role,
-        value,
-        evidence_strength: semantic.evidence_strength,
-    })?)
-}
-
-fn shell_fragments(syntax: Option<&SyntaxProjection>) -> Result<Vec<ShellFragment>> {
-    let Some(syntax) = syntax else {
-        return Ok(Vec::new());
-    };
-    let mut fragments = Vec::new();
-    for (fragment_index, fragment) in syntax.fragments.iter().enumerate() {
-        let mut statements = Vec::new();
-        let mut fragment_base = None;
-        for (statement_index, statement) in syntax.statements.iter().enumerate() {
-            if statement.fragment != fragment_index {
-                continue;
-            }
-            let base = *fragment_base.get_or_insert(statement_index);
-            let invocations = syntax
-                .invocations
-                .iter()
-                .filter(|value| value.statement == statement_index)
-                .map(|value| Invocation {
-                    program: value.program.clone(),
-                    argv: value.argv.clone(),
-                })
-                .collect();
-            let redirects = syntax
-                .redirects
-                .iter()
-                .filter(|value| value.statement == statement_index)
-                .map(|value| Redirect {
-                    source_fd: value.source_fd_raw.clone(),
-                    operator: value.operator.clone(),
-                    target: value.target_raw.clone(),
-                    range: ByteRange {
-                        start: u64::from(value.start_byte),
-                        end: u64::from(value.end_byte),
-                    },
-                })
-                .collect();
-            statements.push(ShellStatement {
-                range: ByteRange {
-                    start: u64::from(statement.start_byte),
-                    end: u64::from(statement.end_byte),
-                },
-                parent_position: statement
-                    .parent
-                    .and_then(|value| value.checked_sub(base))
-                    .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
-                connector: statement.shell.as_ref().and_then(|value| {
-                    (value.connector != "first").then(|| value.connector.to_owned())
-                }),
-                pipeline: statement
-                    .shell
-                    .as_ref()
-                    .and_then(|value| value.pipeline_id.zip(value.pipeline_pos))
-                    .map(|(id, position)| PipelinePosition {
-                        id: u64::from(id),
-                        position: u64::from(position),
-                    }),
-                invocations,
-                redirects,
-            });
-        }
-        fragments.push(ShellFragment {
-            text: fragment
-                .content
-                .content()
-                .context("Shell Fragment must retain bounded text")?,
-            completeness: if fragment.parse_status == "parsed" {
-                Completeness::Complete
-            } else {
-                Completeness::Partial
-            },
-            statements,
-        });
-    }
-    ensure!(
-        !fragments.is_empty(),
-        "declared Shell call produced no root fragment"
-    );
-    Ok(fragments)
-}
-
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
 
-    use super::{resolve_tool_output_link, stored_semantic};
-    use crate::domain::{
-        Completeness, EvidenceStrength, Semantic, SemanticRole, SemanticValue, ShellFragment,
-        ShellToolCall, Text, TextContent, ToolCall, ToolOutput,
-    };
-
-    #[test]
-    fn text_capable_value_without_text_does_not_require_a_blob() {
-        let semantic = Semantic {
-            role: SemanticRole::RuntimeNotice,
-            value: SemanticValue::Text(Text {
-                text: None,
-                has_images: true,
-            }),
-            evidence_strength: EvidenceStrength::Structural,
-        };
-
-        let stored = stored_semantic(&semantic, None).expect("store image-only Semantic");
-
-        assert_eq!(stored["role"], "runtime.notice");
-        assert_eq!(stored["value"]["has_images"], true);
-        assert!(stored["value"].get("text").is_none());
-    }
-
-    #[test]
-    fn tool_output_text_is_replaced_by_one_blob_reference() {
-        let semantic = Semantic {
-            role: SemanticRole::ToolOutput,
-            value: SemanticValue::ToolOutput(ToolOutput {
-                call_item_id: None,
-                text: Some(TextContent {
-                    value: "large output".to_owned(),
-                    full_bytes: 12,
-                    estimated_tokens: 3,
-                }),
-                exit_code: None,
-                failed: None,
-                duration_ms: None,
-                runtime_truncated: None,
-                runtime_output_tokens: None,
-            }),
-            evidence_strength: EvidenceStrength::Structural,
-        };
-
-        let stored = stored_semantic(&semantic, Some(42)).expect("store ToolOutput Semantic");
-
-        assert_eq!(
-            stored["value"]["text"],
-            serde_json::json!({ "blob_id": 42 })
-        );
-        assert!(!stored.to_string().contains("large output"));
-    }
-
-    #[test]
-    fn shell_fragment_text_remains_inline() {
-        let semantic = Semantic {
-            role: SemanticRole::AgentToolCallShell,
-            value: SemanticValue::ShellToolCall(ShellToolCall {
-                tool_call: ToolCall {
-                    tool_name: Some("exec_command".to_owned()),
-                    arguments: None,
-                    working_directory: None,
-                },
-                shell_fragments: vec![ShellFragment {
-                    text: TextContent {
-                        value: "echo hello".to_owned(),
-                        full_bytes: 10,
-                        estimated_tokens: 3,
-                    },
-                    completeness: Completeness::Complete,
-                    statements: Vec::new(),
-                }],
-            }),
-            evidence_strength: EvidenceStrength::Structural,
-        };
-
-        let stored = stored_semantic(&semantic, None).expect("store Shell Semantic");
-
-        assert_eq!(
-            stored["value"]["shell_fragments"][0]["text"]["value"],
-            "echo hello"
-        );
-        assert!(
-            stored["value"]["shell_fragments"][0]["text"]
-                .get("blob_id")
-                .is_none()
-        );
-    }
+    use super::resolve_tool_output_link;
 
     #[test]
     fn tool_output_link_update_preserves_the_blob_reference() {

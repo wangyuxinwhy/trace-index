@@ -35,6 +35,7 @@ use crate::storage::db::{
     IndexingPolicy, SourceState, Store, display_database_path, source_state, to_sql_i64,
 };
 use crate::storage::persist::{clear_projection, write_session};
+use crate::storage::persist_diff::sync_session;
 
 const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
 /// Maximum number of background threads preparing new Sources in parallel
@@ -861,15 +862,13 @@ fn index_source(
 
     let source_id = ensure_source_row(&transaction, state.as_ref(), adapter, &path_string)?;
 
-    // A changed Source republishes its complete domain projection. Physical
-    // Records remain incremental; Loops and Items depend on surrounding
-    // Records and are therefore replaced atomically. A new Source has no old
-    // projection to clear. This distinction is essential during a cold bulk
-    // build, where secondary indexes are deferred: clearing every new Source
-    // would scan the growing Item table once per Source and make the build
-    // superlinear.
+    // A new or reset Source writes its full projection from scratch. An
+    // append-only update to an existing Source keeps its existing Loops and
+    // Items in place until `sync_session` diffs the prefix and rewrites only
+    // the changed tail, avoiding multi-second FTS5/index churn on hot sessions.
+    let incremental_projection = !reset && state.is_some() && replaced_transcript.is_none();
     let clear_started = Instant::now();
-    if state.is_some() {
+    if state.is_some() && !incremental_projection {
         clear_projection(&transaction, source_id)?;
     }
     if reset {
@@ -1005,14 +1004,25 @@ fn index_source(
         clear_projection(&transaction, previous)?;
         transaction.execute("DELETE FROM trace_sources WHERE id = ?1", [previous])?;
     }
-    counts.items += write_projected_session(
-        &transaction,
-        source_id,
-        &session,
-        &record_ids,
-        blobs,
-        telemetry,
-    )?;
+    counts.items += if incremental_projection {
+        sync_projected_session(
+            &transaction,
+            source_id,
+            &session,
+            &record_ids,
+            blobs,
+            telemetry,
+        )?
+    } else {
+        write_projected_session(
+            &transaction,
+            source_id,
+            &session,
+            &record_ids,
+            blobs,
+            telemetry,
+        )?
+    };
 
     let fingerprint = hasher.finalize().to_hex().to_string();
     transaction
@@ -1125,6 +1135,27 @@ fn write_projected_session(
 ) -> Result<u64> {
     let persist_started = Instant::now();
     let counts = write_session(
+        transaction,
+        source_id,
+        session,
+        record_ids,
+        blobs,
+        telemetry,
+    )?;
+    telemetry.record_duration(IndexPhase::Persist, persist_started.elapsed());
+    Ok(counts.items)
+}
+
+fn sync_projected_session(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    session: &SessionProjection,
+    record_ids: &HashMap<u64, i64>,
+    blobs: &mut BlobCache,
+    telemetry: &mut IndexTelemetry,
+) -> Result<u64> {
+    let persist_started = Instant::now();
+    let counts = sync_session(
         transaction,
         source_id,
         session,
