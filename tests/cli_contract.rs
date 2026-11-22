@@ -194,7 +194,9 @@ fn config_init_discover_adds_only_standard_roots_that_exist() {
     let directory = tempdir().expect("temporary directory");
     let home = directory.path().join("home");
     let codex = home.join(".codex/sessions");
+    let antigravity = home.join(".gemini/antigravity-cli/brain");
     fs::create_dir_all(&codex).expect("create existing Codex root");
+    fs::create_dir_all(&antigravity).expect("create existing Antigravity root");
     let mut command = Command::new(env!("CARGO_BIN_EXE_trace-index"));
     command
         .env_remove("TRACE_INDEX_CONFIG")
@@ -208,9 +210,11 @@ fn config_init_discover_adds_only_standard_roots_that_exist() {
     let roots = initialized["data"]["config"]["roots"]
         .as_array()
         .expect("effective roots");
-    assert_eq!(roots.len(), 1);
+    assert_eq!(roots.len(), 2);
     assert_eq!(roots[0]["label"], "codex");
     assert_eq!(roots[0]["path"], path_text(&codex));
+    assert_eq!(roots[1]["label"], "antigravity");
+    assert_eq!(roots[1]["path"], path_text(&antigravity));
 }
 
 #[test]

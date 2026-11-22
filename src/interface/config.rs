@@ -666,6 +666,7 @@ fn discover_standard_roots(context: &ResolutionContext) -> Result<Vec<FileRootCo
         ("codex", home.join(".codex/sessions")),
         ("pi", home.join(".pi/agent/sessions")),
         ("claude", home.join(".claude/projects")),
+        ("antigravity", home.join(".gemini/antigravity-cli/brain")),
     ]
     .into_iter()
     .filter(|(_, path)| path.is_dir())

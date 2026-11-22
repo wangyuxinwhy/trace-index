@@ -35,7 +35,7 @@ path = "/absolute/path/to/.codex/sessions"
 path = "/work/selected-traces"
 ```
 
-Roots added by `--discover` carry the diagnostic labels `codex`, `pi`, or `claude`.
+Roots added by `--discover` carry the diagnostic labels `codex`, `pi`, `claude`, or `antigravity`.
 
 `config init` refuses to overwrite an existing file. Before indexing, inspect the resolved database, origins, initial policy, and root paths, then run the read-only root and database-path preflight:
 
@@ -62,7 +62,7 @@ To index only particular files or directories, pass them explicitly. Positional 
 trace-index index sync /path/to/one.jsonl /path/to/session-directory
 ```
 
-To opt in to Antigravity CLI history, pass `~/.gemini/antigravity-cli/brain` as a positional root or add it to the configuration. Format 2 and Format 3 databases remain readable in place but cannot be synchronized by this release. Select a new Format 4 database with `--db` and supply the available roots you want to index. Keep existing Format 2 or Format 3 databases if they contain history whose original Sources are unavailable.
+`config init --discover` includes `~/.gemini/antigravity-cli/brain` when present; on an existing configuration, add that root or pass it as a positional path to opt in to Antigravity CLI history. Format 2 and Format 3 databases remain readable in place but cannot be synchronized by this release. Select a new Format 4 database with `--db` and supply the available roots you want to index. Keep existing Format 2 or Format 3 databases if they contain history whose original Sources are unavailable.
 
 Synchronization is the only operation that updates the index. `schema`, `query`, `record`, and `asset` commands never refresh it implicitly.
 
