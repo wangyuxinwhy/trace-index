@@ -500,6 +500,56 @@ impl CodexProjector {
         self.agent_thread_ids.get(agent_path).cloned()
     }
 
+    /// Returns true when an already-persisted prefix line provably cannot affect
+    /// Codex projection, avoiding `serde_json::Value` DOM allocation on large
+    /// ignored `compacted` (without summary) and `world_state` records.
+    pub(crate) fn can_skip_prefix_record(&self, bytes: &[u8]) -> bool {
+        if !self.session_established {
+            return false;
+        }
+        let head = &bytes[..bytes.len().min(192)];
+        if contains_subslice(head, b"\"compacted\"") {
+            #[derive(serde::Deserialize)]
+            struct CompactedPayload {
+                summary: Option<String>,
+                message: Option<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct CompactedProbe {
+                #[serde(rename = "type")]
+                kind: Option<String>,
+                payload: Option<CompactedPayload>,
+            }
+            if let Ok(probe) = serde_json::from_slice::<CompactedProbe>(bytes)
+                && probe.kind.as_deref() == Some("compacted")
+            {
+                let has_summary = probe.payload.as_ref().is_some_and(|payload| {
+                    payload
+                        .summary
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty())
+                        || payload
+                            .message
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                });
+                return !has_summary;
+            }
+        } else if contains_subslice(head, b"\"world_state\"") {
+            #[derive(serde::Deserialize)]
+            struct KindProbe {
+                #[serde(rename = "type")]
+                kind: Option<String>,
+            }
+            if let Ok(probe) = serde_json::from_slice::<KindProbe>(bytes)
+                && probe.kind.as_deref() == Some("world_state")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn push(&mut self, seq: u64, value: &Value) {
         let record_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = value.get("payload").unwrap_or(&Value::Null);
@@ -1726,4 +1776,10 @@ fn take_matching_context(turn: &mut LoopBuilder, text: &str) -> Option<usize> {
             .is_some_and(|candidate| texts_match(text, candidate))
     })?;
     Some(turn.unpaired_user.remove(position))
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }

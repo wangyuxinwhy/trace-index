@@ -111,7 +111,7 @@ impl ShellParser {
         }
     }
 
-    fn parse_item_command(
+    pub(crate) fn parse_item_command(
         &mut self,
         item: &mut crate::adapters::projection::ItemProjection,
         max_text_bytes: usize,

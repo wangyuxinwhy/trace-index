@@ -18,12 +18,26 @@ use super::blob::BlobCache;
 use super::db::to_sql_i64;
 use super::persist::{
     ExistingItem, ExistingSessionLink, ItemWriter, ProjectedLoopRow, WriteCounts, clear_projection,
-    insert_loop, next_loop_session_position, normalize_loop_positions, normalize_parent_locator,
-    record_id, store_parent_candidate, write_session,
+    extract_existing_call_item_id, insert_loop, next_loop_session_position,
+    normalize_loop_positions, normalize_parent_locator, record_id, store_parent_candidate,
+    write_session,
 };
-use crate::adapters::projection::{ItemProjection, LoopProjection, SessionProjection};
+use crate::adapters::projection::{ItemProjection, SessionProjection};
 use crate::adapters::semantic;
 use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
+use crate::shell::syntax::ShellParser;
+
+/// Context for incremental append-only synchronization.
+pub(crate) struct IncrementalSyncOptions<'a> {
+    /// Record sequence boundary below which the physical byte prefix has been
+    /// cryptographically verified unchanged. Items whose witnesses all lie
+    /// strictly below this sequence may reuse stored `BlobRef` ids and parsed
+    /// shell fragments without re-probing `content_blobs` or re-running
+    /// `tree-sitter`.
+    pub(crate) trusted_prefix_limit: Option<u64>,
+    pub(crate) shell_parser: &'a mut ShellParser,
+    pub(crate) max_text_bytes: usize,
+}
 
 struct ExistingSessionSource {
     session_id: i64,
@@ -77,9 +91,10 @@ struct ExistingProjection {
 pub(crate) fn sync_session(
     transaction: &Transaction<'_>,
     source_id: i64,
-    session: &SessionProjection,
+    session: &mut SessionProjection,
     record_ids: &HashMap<u64, i64>,
     blobs: &mut BlobCache,
+    options: &mut IncrementalSyncOptions<'_>,
     telemetry: &mut IndexTelemetry,
 ) -> Result<WriteCounts> {
     let (runtime, source_locator): (String, String) = transaction
@@ -94,6 +109,9 @@ pub(crate) fn sync_session(
     let Some(existing_session) = existing_session
         .filter(|row| row.runtime == runtime && row.native_id == session.session_uuid)
     else {
+        options
+            .shell_parser
+            .parse_declared_commands(session, options.max_text_bytes);
         clear_projection(transaction, source_id)?;
         return write_session(
             transaction,
@@ -125,27 +143,35 @@ pub(crate) fn sync_session(
         record_ids,
         blobs,
         telemetry,
+    )
+    .with_incremental_context(
+        options.shell_parser,
+        options.max_text_bytes,
+        options.trusted_prefix_limit,
     );
-    let mut rewrite_tail = sync_session_items(&mut writer, &session.items, &mut existing)?;
+    let mut rewrite_tail = sync_session_items(&mut writer, &mut session.items, &mut existing)?;
     let mut next_session_position = next_loop_session_position(transaction, session_id)?;
 
-    for (loop_index, projected_loop) in session.loops.iter().enumerate() {
+    for (loop_index, projected_loop) in session.loops.iter_mut().enumerate() {
         let row = ProjectedLoopRow::from_projection(loop_index, projected_loop, record_ids)?;
         if !rewrite_tail
             && let Some(existing_loop) = existing.loops.get(loop_index)
             && existing_loop.ordinal == row.ordinal
             && existing_loop.start_record_id == row.start_record_id
         {
-            rewrite_tail = sync_existing_loop(
+            if !existing_loop.metadata_matches(&row) {
+                update_loop_metadata(writer.transaction, existing_loop.id, &row, writer.telemetry)?;
+            }
+            let existing_loop_id = existing_loop.id;
+            rewrite_tail = sync_existing_loop_items(
                 &mut writer,
-                existing_loop,
+                existing_loop_id,
                 &existing.loops[loop_index + 1..],
                 existing
                     .loop_items
-                    .get(&existing_loop.id)
+                    .get(&existing_loop_id)
                     .map_or(&[][..], Vec::as_slice),
-                projected_loop,
-                &row,
+                &mut projected_loop.items,
             )?;
             continue;
         }
@@ -165,7 +191,7 @@ pub(crate) fn sync_session(
         next_session_position = next_session_position
             .checked_add(1)
             .context("Loop position exceeds SQLite INTEGER")?;
-        write_loop_items(&mut writer, loop_id, &projected_loop.items)?;
+        write_loop_items(&mut writer, loop_id, &mut projected_loop.items)?;
     }
 
     if !rewrite_tail && existing.loops.len() > session.loops.len() {
@@ -177,23 +203,18 @@ pub(crate) fn sync_session(
     Ok(counts)
 }
 
-fn sync_existing_loop(
+fn sync_existing_loop_items(
     writer: &mut ItemWriter<'_, '_>,
-    existing_loop: &ExistingLoop,
+    existing_loop_id: i64,
     trailing_loops: &[ExistingLoop],
     existing_items: &[ExistingItem],
-    projected_loop: &LoopProjection,
-    row: &ProjectedLoopRow<'_>,
+    projected_loop_items: &mut [ItemProjection],
 ) -> Result<bool> {
-    if !existing_loop.metadata_matches(row) {
-        update_loop_metadata(writer.transaction, existing_loop.id, row, writer.telemetry)?;
-    }
-    let projected_items: Vec<&ItemProjection> = projected_loop
-        .items
-        .iter()
+    let mut projected_items: Vec<&mut ItemProjection> = projected_loop_items
+        .iter_mut()
         .filter(|item| item.semantic_role != semantic::RUNTIME_LIFECYCLE)
         .collect();
-    let matched = match_item_prefix(writer, &projected_items, existing_items, true)?;
+    let matched = match_item_prefix(writer, &mut projected_items, existing_items, true)?;
     if matched == existing_items.len() && matched == projected_items.len() {
         return Ok(false);
     }
@@ -206,12 +227,12 @@ fn sync_existing_loop(
         rewrite_tail = true;
     }
     delete_items(writer.transaction, &existing_items[matched..])?;
-    for (position, item) in projected_items[matched..].iter().enumerate() {
+    for (position, item) in projected_items[matched..].iter_mut().enumerate() {
         let loop_position = to_sql_i64(
             u64::try_from(matched + position).context("Loop position exceeds u64")?,
             "Loop position",
         )?;
-        writer.write(item, Some(existing_loop.id), Some(loop_position))?;
+        writer.write_mut(item, Some(existing_loop_id), Some(loop_position))?;
     }
     Ok(rewrite_tail)
 }
@@ -219,11 +240,11 @@ fn sync_existing_loop(
 fn write_loop_items(
     writer: &mut ItemWriter<'_, '_>,
     loop_id: i64,
-    items: &[ItemProjection],
+    items: &mut [ItemProjection],
 ) -> Result<()> {
     let mut loop_position = 0_u64;
     for projected_item in items {
-        if writer.write(
+        if writer.write_mut(
             projected_item,
             Some(loop_id),
             Some(to_sql_i64(loop_position, "Loop position")?),
@@ -326,14 +347,14 @@ fn sync_session_metadata(
 
 fn sync_session_items(
     writer: &mut ItemWriter<'_, '_>,
-    projected: &[ItemProjection],
+    projected: &mut [ItemProjection],
     existing: &mut ExistingProjection,
 ) -> Result<bool> {
-    let projected_items: Vec<&ItemProjection> = projected
-        .iter()
+    let mut projected_items: Vec<&mut ItemProjection> = projected
+        .iter_mut()
         .filter(|item| item.semantic_role != semantic::RUNTIME_LIFECYCLE)
         .collect();
-    let matched = match_item_prefix(writer, &projected_items, &existing.session_items, false)?;
+    let matched = match_item_prefix(writer, &mut projected_items, &existing.session_items, false)?;
     if matched == existing.session_items.len() && matched == projected_items.len() {
         return Ok(false);
     }
@@ -345,15 +366,15 @@ fn sync_session_items(
         rewrite_tail = true;
     }
     delete_items(writer.transaction, &existing.session_items[matched..])?;
-    for item in &projected_items[matched..] {
-        writer.write(item, None, None)?;
+    for item in &mut projected_items[matched..] {
+        writer.write_mut(item, None, None)?;
     }
     Ok(rewrite_tail)
 }
 
 fn match_item_prefix(
     writer: &mut ItemWriter<'_, '_>,
-    projected: &[&ItemProjection],
+    projected: &mut [&mut ItemProjection],
     existing: &[ExistingItem],
     in_loop: bool,
 ) -> Result<usize> {
@@ -546,8 +567,7 @@ fn load_existing_items(
     let mut loop_items: HashMap<i64, Vec<ExistingItem>> = HashMap::with_capacity(loop_capacity);
     let mut statement = transaction
         .prepare_cached(
-            "SELECT id, loop_id, loop_position, occurred_at, semantic,
-                    json_extract(semantic, '$.value.call_item_id')
+            "SELECT id, loop_id, loop_position, occurred_at, semantic
                FROM domain_items
               WHERE source_id = ?1
               ORDER BY id",
@@ -561,13 +581,13 @@ fn load_existing_items(
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .context("failed to query existing Items")?;
     for row in rows {
-        let (id, loop_id, loop_position, occurred_at, semantic, call_item_id) =
+        let (id, loop_id, loop_position, occurred_at, semantic) =
             row.context("failed to read existing Item")?;
+        let call_item_id = extract_existing_call_item_id(&semantic);
         let item = ExistingItem {
             id,
             loop_position,
@@ -687,7 +707,7 @@ mod tests {
     use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
-    use super::sync_session;
+    use super::{IncrementalSyncOptions, sync_session};
     use crate::adapters::projection::{
         BoundedText, ItemDetail, ItemProjection, LoopProjection, SessionProjection, ToolOutputFacts,
     };
@@ -695,6 +715,7 @@ mod tests {
     use crate::domain::{LoopOutcome, Usage};
     use crate::indexing::telemetry::IndexTelemetry;
     use crate::interface::output::IndexMetrics;
+    use crate::shell::syntax::ShellParser;
     use crate::storage::blob::BlobCache;
     use crate::storage::db::Store;
     use crate::storage::persist::write_session;
@@ -850,10 +871,22 @@ mod tests {
         source_id: i64,
         new_seqs: std::ops::Range<u64>,
         record_ids: &mut HashMap<u64, i64>,
-        session: &SessionProjection,
+        session: &mut SessionProjection,
+    ) -> (u64, IndexMetrics) {
+        run_sync_with_limit(store, source_id, new_seqs, record_ids, session, None)
+    }
+
+    fn run_sync_with_limit(
+        store: &mut Store,
+        source_id: i64,
+        new_seqs: std::ops::Range<u64>,
+        record_ids: &mut HashMap<u64, i64>,
+        session: &mut SessionProjection,
+        trusted_prefix_limit: Option<u64>,
     ) -> (u64, IndexMetrics) {
         let mut blobs = BlobCache::default();
         let mut telemetry = IndexTelemetry::new();
+        let mut shell_parser = ShellParser::new();
         let tx = store.connection_mut().transaction().expect("tx");
         insert_records(&tx, source_id, new_seqs, record_ids);
         let counts = sync_session(
@@ -862,6 +895,11 @@ mod tests {
             session,
             record_ids,
             &mut blobs,
+            &mut IncrementalSyncOptions {
+                trusted_prefix_limit,
+                shell_parser: &mut shell_parser,
+                max_text_bytes: 64 * 1024,
+            },
             &mut telemetry,
         )
         .expect("sync session");
@@ -1051,8 +1089,13 @@ mod tests {
             vec![text_item(7, semantic::HUMAN_REQUEST, "next hello", true)],
         ));
 
-        let (projected_items, metrics) =
-            run_sync(&mut inc_store, source_id, 5..8, &mut record_ids, &appended);
+        let (projected_items, metrics) = run_sync(
+            &mut inc_store,
+            source_id,
+            5..8,
+            &mut record_ids,
+            &mut appended,
+        );
         assert_eq!(projected_items, 8);
         assert_eq!(metrics.writes.items, 3);
         assert_eq!(metrics.writes.loops, 2);
@@ -1127,7 +1170,13 @@ mod tests {
             vec![tool_call_item(4, "late-call")],
         ));
 
-        run_sync(&mut inc_store, source_id, 3..5, &mut record_ids, &updated);
+        run_sync(
+            &mut inc_store,
+            source_id,
+            3..5,
+            &mut record_ids,
+            &mut updated,
+        );
         let linked_call_id: Option<i64> = inc_store
             .connection()
             .query_row(
@@ -1151,8 +1200,13 @@ mod tests {
 
         // Second sync with identical projection must be a complete zero-write no-op even
         // though `json_set` moved `call_item_id` inside the preserved ToolOutput semantic JSON.
-        let (_, noop_metrics) =
-            run_sync(&mut inc_store, source_id, 5..5, &mut record_ids, &updated);
+        let (_, noop_metrics) = run_sync(
+            &mut inc_store,
+            source_id,
+            5..5,
+            &mut record_ids,
+            &mut updated,
+        );
         assert_eq!(noop_metrics.writes.items, 0);
         assert_eq!(noop_metrics.writes.loops, 0);
         assert_eq!(noop_metrics.writes.sessions, 0);
@@ -1200,7 +1254,13 @@ mod tests {
         let mut revised = initial;
         revised.loops[0].items[1] = text_item(3, semantic::AGENT_FINAL_ANSWER, "hello gamma", true);
         revised.loops[0].end_record_seq = Some(3);
-        run_sync(&mut inc_store, source_id, 4..4, &mut record_ids, &revised);
+        run_sync(
+            &mut inc_store,
+            source_id,
+            4..4,
+            &mut record_ids,
+            &mut revised,
+        );
 
         let stale_trigram: i64 = inc_store
             .connection()
@@ -1229,7 +1289,13 @@ mod tests {
 
         // Switching session_uuid falls back cleanly to a full replace.
         revised.session_uuid = "sess-other".to_owned();
-        run_sync(&mut inc_store, source_id, 4..4, &mut record_ids, &revised);
+        run_sync(
+            &mut inc_store,
+            source_id,
+            4..4,
+            &mut record_ids,
+            &mut revised,
+        );
         let session_uuids: Vec<String> = inc_store
             .connection()
             .prepare("SELECT native_id FROM domain_sessions ORDER BY id")
@@ -1239,5 +1305,142 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .expect("collect");
         assert_eq!(session_uuids, vec!["sess-other"]);
+    }
+
+    fn shell_call_item(seq: u64, call_id: &str, cmd: &str) -> ItemProjection {
+        ItemProjection {
+            seq,
+            record_seq: seq,
+            ui_seq: None,
+            ts_ms: Some(1_000 + i64::try_from(seq).expect("seq") * 100),
+            semantic_role: semantic::AGENT_TOOL_CALL.to_owned(),
+            basis: semantic::basis::RECORD_KIND.to_owned(),
+            preview: None,
+            detail: ItemDetail::ToolCall {
+                call_id: call_id.to_owned(),
+                name: Some("exec_command".to_owned()),
+                cmd: Some(cmd.to_owned()),
+                cmd_lang: Some(crate::shell::syntax::lang::SHELL),
+                workdir: Some("/repo".to_owned()),
+                args: Some(format!("{{\"cmd\":\"{cmd}\"}}")),
+                syntax: None,
+            },
+            linked_session_native_id: None,
+            searchable: false,
+        }
+    }
+
+    fn lazy_shell_prefix_items() -> Vec<ItemProjection> {
+        vec![
+            text_item(0, semantic::HUMAN_REQUEST, "hello shell", true),
+            shell_call_item(1, "sh-1", "git status"),
+            tool_output_item(2, "sh-1", "clean"),
+            ItemProjection {
+                seq: 3,
+                record_seq: 3,
+                ui_seq: None,
+                ts_ms: Some(1_300),
+                semantic_role: semantic::RUNTIME_COMPACTION.to_owned(),
+                basis: semantic::basis::RECORD_KIND.to_owned(),
+                preview: Some(BoundedText::bounded("summary text", 256)),
+                detail: ItemDetail::Misc,
+                linked_session_native_id: None,
+                searchable: false,
+            },
+            text_item(4, semantic::AGENT_COMMENTARY, "hello working", true),
+        ]
+    }
+
+    #[test]
+    fn trusted_prefix_sync_preserves_lazy_shell_calls_and_blobs_and_detects_role_changes() {
+        let dir = tempdir().expect("temp dir");
+        let mut inc_store = Store::open(&dir.path().join("inc.sqlite")).expect("open inc");
+        let mut fresh_store = Store::open(&dir.path().join("fresh.sqlite")).expect("open fresh");
+
+        let mut initial = session_fixture(
+            "sess-lazy",
+            Vec::new(),
+            vec![loop_fixture(
+                Some("l0"),
+                0,
+                None,
+                None,
+                lazy_shell_prefix_items(),
+            )],
+        );
+        let mut parser = ShellParser::new();
+        parser.parse_declared_commands(&mut initial, 64 * 1024);
+
+        let (source_id, mut record_ids) =
+            write_initial(&mut inc_store, "/tmp/lazy.jsonl", 5, &initial);
+        let initial_item_ids = query_i64_column(
+            inc_store.connection(),
+            "SELECT id FROM domain_items ORDER BY id",
+        );
+
+        let mut appended_items = lazy_shell_prefix_items();
+        appended_items.push(shell_call_item(5, "sh-2", "cargo test"));
+        appended_items.push(tool_output_item(6, "sh-2", "ok"));
+        let mut appended = session_fixture(
+            "sess-lazy",
+            Vec::new(),
+            vec![loop_fixture(Some("l0"), 0, None, None, appended_items)],
+        );
+
+        let (projected, metrics) = run_sync_with_limit(
+            &mut inc_store,
+            source_id,
+            5..7,
+            &mut record_ids,
+            &mut appended,
+            Some(5),
+        );
+        assert_eq!(projected, 7);
+        assert_eq!(metrics.writes.items, 2, "only the two appended items write");
+        assert!(
+            matches!(
+                &appended.loops[0].items[1].detail,
+                ItemDetail::ToolCall { syntax: None, .. }
+            ),
+            "trusted prefix shell call must be preserved without running tree-sitter"
+        );
+        assert!(
+            matches!(
+                &appended.loops[0].items[5].detail,
+                ItemDetail::ToolCall {
+                    syntax: Some(_),
+                    ..
+                }
+            ),
+            "newly appended shell call must be lazily parsed before persistence"
+        );
+        let after_item_ids = query_i64_column(
+            inc_store.connection(),
+            "SELECT id FROM domain_items ORDER BY id",
+        );
+        assert_eq!(&after_item_ids[..5], initial_item_ids.as_slice());
+
+        // Role change on a prefix item (e.g. unphased commentary promoted to
+        // final_answer by a later record) must STILL be detected and rewritten.
+        appended.loops[0].items[4].semantic_role = semantic::AGENT_FINAL_ANSWER.to_owned();
+        let (_, role_change_metrics) = run_sync_with_limit(
+            &mut inc_store,
+            source_id,
+            7..7,
+            &mut record_ids,
+            &mut appended,
+            Some(7),
+        );
+        assert_eq!(
+            role_change_metrics.writes.items, 3,
+            "promoted prefix item and its two trailing items must rewrite"
+        );
+
+        parser.parse_declared_commands(&mut appended, 64 * 1024);
+        write_initial(&mut fresh_store, "/tmp/lazy.jsonl", 7, &appended);
+        assert_eq!(
+            snapshot_domain(inc_store.connection()),
+            snapshot_domain(fresh_store.connection())
+        );
     }
 }
