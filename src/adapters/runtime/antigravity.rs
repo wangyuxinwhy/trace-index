@@ -13,6 +13,23 @@ use crate::adapters::timestamp::parse_timestamp_ms;
 use crate::domain::{Model, ReasoningRepresentation};
 use crate::shell::syntax::lang;
 
+/// Returns true when `path` is an Antigravity conversation directory
+/// (`.../brain/<conversation-uuid>`).
+///
+/// Discovery uses this to jump straight to `.system_generated/logs` instead of
+/// recursively walking thousands of per-step artifact directories.
+pub(crate) fn conversation_dir(path: &Path) -> bool {
+    let Some(parent_name) = path.parent().and_then(Path::file_name) else {
+        return false;
+    };
+    if parent_name != "brain" {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_uuid)
+}
+
 /// The producer places its conversation UUID in the transcript locator, not
 /// in each payload. The exact layout also excludes chunk copies and artifacts.
 pub(crate) fn transcript(path: &Path) -> Option<(String, bool)> {
@@ -26,20 +43,23 @@ pub(crate) fn transcript(path: &Path) -> Option<(String, bool)> {
     let conversation = generated.parent()?;
     if logs.file_name()? != "logs"
         || generated.file_name()? != ".system_generated"
-        || conversation.parent()?.file_name()? != "brain"
+        || !conversation_dir(conversation)
     {
         return None;
     }
     let id = conversation.file_name()?.to_str()?;
-    (id.len() == 36
+    Some((id.to_ascii_lowercase(), full))
+}
+
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
         && id.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
                 byte == b'-'
             } else {
                 byte.is_ascii_hexdigit()
             }
-        }))
-    .then(|| (id.to_ascii_lowercase(), full))
+        })
 }
 
 pub(crate) fn is_step(value: &Value) -> bool {

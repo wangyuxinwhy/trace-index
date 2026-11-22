@@ -7,8 +7,7 @@
 //! atomically replaced from the complete indexed Record prefix.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -23,9 +22,9 @@ use crate::adapters::adapter::{AdapterKind, Projector, detect_at, record_facts};
 use crate::adapters::projection::{RecordFacts, SessionProjection};
 use crate::adapters::runtime::antigravity;
 use crate::ingest::source::{
-    READ_BUFFER_BYTES, RecordRead, RecordReadInto, alternate_encoding, complete_prefix_length,
-    discover_jsonl_files, fingerprint_prefix, is_compressed, modified_ns, open_for_indexing,
-    prefix_hasher, read_bounded_record, read_bounded_record_into,
+    IndexingSource, READ_BUFFER_BYTES, RecordRead, RecordReadInto, alternate_encoding,
+    discover_jsonl_files, is_compressed, modified_ns, open_for_indexing, prefix_hasher,
+    read_bounded_record, read_bounded_record_into,
 };
 use crate::interface::output::{IndexMetrics, IndexReport, SourceIndexResult};
 use crate::shell::syntax;
@@ -93,14 +92,7 @@ fn index_paths_internal(
         max_published_text_bytes: options.max_text_bytes,
     })?;
     let discover_started = Instant::now();
-    let files = discover_jsonl_files(paths)?;
-    let source_bytes = files.iter().try_fold(0_u64, |total, path| {
-        let bytes = path
-            .metadata()
-            .with_context(|| format!("failed to stat discovered source {}", path.display()))?
-            .len();
-        Ok::<_, anyhow::Error>(total.saturating_add(bytes))
-    })?;
+    let (files, source_bytes) = discover_sources(paths)?;
     telemetry.record_duration(IndexPhase::Discover, discover_started.elapsed());
     telemetry.set_corpus(files.len(), source_bytes);
     progress.update(telemetry.progress(IndexPhase::Prepare, None), true);
@@ -151,13 +143,16 @@ fn index_paths_internal(
                     "failed"
                 };
                 report.source_results.push(SourceIndexResult {
-                    path: file.display().to_string(),
+                    path: file.path.display().to_string(),
                     action: action.to_owned(),
                     error: Some(format!("{error:#}")),
                     ..SourceIndexResult::default()
                 });
                 telemetry.complete_file();
-                progress.update(telemetry.progress(IndexPhase::Commit, Some(file)), false);
+                progress.update(
+                    telemetry.progress(IndexPhase::Commit, Some(&file.path)),
+                    false,
+                );
                 continue;
             }
         };
@@ -179,11 +174,41 @@ fn index_paths_internal(
         }
         report.source_results.push(result);
         telemetry.complete_file();
-        progress.update(telemetry.progress(IndexPhase::Commit, Some(file)), false);
+        progress.update(
+            telemetry.progress(IndexPhase::Commit, Some(&file.path)),
+            false,
+        );
     }
     report.adapters = adapters.into_iter().collect();
 
     Ok(report)
+}
+
+/// Canonical discovered Source paired with the `stat` metadata already read
+/// during discovery so `index_source` avoids duplicate `realpath`/`stat` calls.
+struct DiscoveredFile {
+    path: PathBuf,
+    file_size: u64,
+    modified_ns: i64,
+}
+
+fn discover_sources(paths: &[PathBuf]) -> Result<(Vec<DiscoveredFile>, u64)> {
+    let discovered_paths = discover_jsonl_files(paths)?;
+    let mut files = Vec::with_capacity(discovered_paths.len());
+    let mut source_bytes = 0_u64;
+    for path in discovered_paths {
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("failed to stat discovered source {}", path.display()))?;
+        let file_size = metadata.len();
+        source_bytes = source_bytes.saturating_add(file_size);
+        files.push(DiscoveredFile {
+            path,
+            file_size,
+            modified_ns: modified_ns(&metadata),
+        });
+    }
+    Ok((files, source_bytes))
 }
 
 /// Run-scoped reusable state shared across Sources in one sync.
@@ -191,6 +216,7 @@ struct SyncScratch {
     blobs: BlobCache,
     shell_parser: syntax::ShellParser,
     record_buffer: Vec<u8>,
+    decompress_buffer: Vec<u8>,
 }
 
 impl SyncScratch {
@@ -199,6 +225,7 @@ impl SyncScratch {
             blobs: BlobCache::for_connection(store.connection())?,
             shell_parser: syntax::ShellParser::new(),
             record_buffer: Vec::with_capacity(READ_BUFFER_BYTES),
+            decompress_buffer: Vec::new(),
         })
     }
 }
@@ -219,22 +246,17 @@ struct ScanCounts {
 )]
 fn index_source(
     store: &mut Store,
-    path: &Path,
+    discovered: &DiscoveredFile,
     options: &IndexOptions,
     scratch: &mut SyncScratch,
     telemetry: &mut IndexTelemetry,
     progress: &mut dyn ProgressObserver,
 ) -> Result<SourceIndexResult> {
     let prepare_started = Instant::now();
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    let canonical = &discovered.path;
     let path_string = canonical.to_string_lossy().into_owned();
-    let metadata = canonical
-        .metadata()
-        .with_context(|| format!("failed to stat {}", canonical.display()))?;
-    let file_size = metadata.len();
-    let file_modified_ns = modified_ns(&metadata);
+    let file_size = discovered.file_size;
+    let file_modified_ns = discovered.modified_ns;
 
     // Decided before the file is opened. An unchanged Source needs nothing out
     // of it, and detecting the adapter costs one open and one record read per
@@ -253,13 +275,19 @@ fn index_source(
         return Ok(unchanged_result(path_string, &existing, file_size, false));
     }
 
-    let mut file = open_for_indexing(&canonical)?;
+    let SyncScratch {
+        blobs,
+        shell_parser,
+        record_buffer,
+        decompress_buffer,
+    } = scratch;
+    let mut source = open_for_indexing(canonical, decompress_buffer)?;
     let adapter = detect_adapter(
-        &mut file,
-        &canonical,
+        &mut source,
+        canonical,
         options.max_record_bytes.max(MAX_ADAPTER_DETECTION_BYTES),
     )?;
-    if is_compressed(&canonical) && adapter != AdapterKind::Codex {
+    if is_compressed(canonical) && adapter != AdapterKind::Codex {
         return Err(UnrecognizedSource(format!(
             "{}: Zstandard input is supported for Codex traces",
             canonical.display()
@@ -267,8 +295,8 @@ fn index_source(
         .into());
     }
 
-    let logical_size = file.metadata()?.len();
-    let indexed_limit = complete_prefix_length(&mut file, logical_size)?;
+    let logical_size = source.len();
+    let indexed_limit = source.complete_prefix_length()?;
     let incomplete_tail = indexed_limit < logical_size;
     telemetry.record_duration(IndexPhase::Prepare, prepare_started.elapsed());
 
@@ -277,10 +305,10 @@ fn index_source(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start index transaction")?;
     let (state, encoding_changed) =
-        encoding_source_state(&transaction, adapter, &canonical, &path_string)?;
+        encoding_source_state(&transaction, adapter, canonical, &path_string)?;
 
     let reset = decide_reset(
-        &mut file,
+        &mut source,
         state.as_ref(),
         adapter,
         indexed_limit,
@@ -293,7 +321,7 @@ fn index_source(
             canonical.display()
         )).into());
     }
-    let replaced_transcript = antigravity_replacement(&transaction, adapter, &canonical)?;
+    let replaced_transcript = antigravity_replacement(&transaction, adapter, canonical)?;
     if let Some(existing) = state.as_ref()
         && !reset
         && replaced_transcript.is_none()
@@ -362,12 +390,12 @@ fn index_source(
     };
     telemetry.record_duration(IndexPhase::Clear, clear_started.elapsed());
 
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind {}", canonical.display()))?;
     let mut hasher = prefix_hasher(indexed_limit);
-    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file.take(indexed_limit));
+    let mut reader = source
+        .bounded_reader(indexed_limit)
+        .with_context(|| format!("failed to rewind {}", canonical.display()))?;
 
-    let mut projector = Projector::new(adapter, options.max_text_bytes, &canonical)?;
+    let mut projector = Projector::new(adapter, options.max_text_bytes, canonical)?;
     let mut projected_sessions = Vec::new();
     let mut counts = ScanCounts::default();
     let mut byte_offset = 0_u64;
@@ -381,7 +409,7 @@ fn index_source(
             options.max_record_bytes,
             Some(&mut hasher),
             persist_record,
-            &mut scratch.record_buffer,
+            record_buffer,
         )?;
         telemetry.record_duration(IndexPhase::Read, read_started.elapsed());
         let (oversized, byte_length, consumed_bytes, raw_hash) = match read {
@@ -395,7 +423,7 @@ fn index_source(
         };
 
         let project_started = Instant::now();
-        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(&scratch.record_buffer));
+        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(record_buffer));
         let facts = if persist_record {
             Some(match &parsed {
                 None => {
@@ -451,7 +479,7 @@ fn index_source(
         seq += 1;
         if seq.is_multiple_of(2048) {
             progress.update(
-                telemetry.progress(IndexPhase::Persist, Some(&canonical)),
+                telemetry.progress(IndexPhase::Persist, Some(canonical)),
                 false,
             );
         }
@@ -472,9 +500,7 @@ fn index_source(
             canonical.display(),
         ))));
     }
-    scratch
-        .shell_parser
-        .parse_declared_commands(&mut session, options.max_text_bytes);
+    shell_parser.parse_declared_commands(&mut session, options.max_text_bytes);
     if let Some(previous) = replaced_transcript {
         // Replace the old projection only after establishing the new Source.
         // Failure rolls both operations back together.
@@ -486,7 +512,7 @@ fn index_source(
         source_id,
         &session,
         &record_ids,
-        &mut scratch.blobs,
+        blobs,
         telemetry,
     )?;
 
@@ -617,7 +643,7 @@ fn write_projected_session(
 /// A rollout file only ever grows, so a changed prefix means it was rewritten
 /// and every derived row for it is stale.
 fn decide_reset(
-    file: &mut File,
+    source: &mut IndexingSource<'_>,
     state: Option<&SourceState>,
     adapter: AdapterKind,
     indexed_limit: u64,
@@ -638,7 +664,7 @@ fn decide_reset(
     }
 
     let fingerprint_started = Instant::now();
-    let current = fingerprint_prefix(file, existing.indexed_bytes)?;
+    let current = source.fingerprint_prefix(existing.indexed_bytes)?;
     telemetry.record_duration(IndexPhase::Fingerprint, fingerprint_started.elapsed());
     telemetry.add_fingerprint_bytes(existing.indexed_bytes);
     Ok(current != existing.indexed_fingerprint)
@@ -766,10 +792,14 @@ pub(crate) fn is_unrecognized_source(error: &anyhow::Error) -> bool {
         .any(<dyn std::error::Error>::is::<UnrecognizedSource>)
 }
 
-fn detect_adapter(file: &mut File, path: &Path, max_record_bytes: usize) -> Result<AdapterKind> {
+fn detect_adapter(
+    source: &mut IndexingSource<'_>,
+    path: &Path,
+    max_record_bytes: usize,
+) -> Result<AdapterKind> {
     // An I/O failure here is a real failure: the file may well be a trace we
     // simply could not read. Only the format verdict decides "not ours".
-    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, source);
     match read_bounded_record(&mut reader, max_record_bytes)? {
         RecordRead::Complete(bytes) => {
             let bytes = bytes.as_deref().unwrap_or_default();

@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -13,6 +13,9 @@ use crate::adapters::runtime::antigravity;
 
 pub(crate) const READ_BUFFER_BYTES: usize = 64 * 1024;
 const DECOMPRESS_BUFFER_BYTES: usize = 256 * 1024;
+/// Upper bound for holding a decompressed `.jsonl.zst` archive in the reusable
+/// run-scoped buffer before spilling to an anonymous temporary file on disk.
+const MAX_IN_MEMORY_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn discover_jsonl_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = BTreeSet::new();
@@ -69,26 +72,62 @@ fn collect_jsonl_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
         return Ok(());
     }
 
-    // Antigravity's logs directory also contains chunk copies of its two
-    // transcript projections. Only the producer's consolidated files are
-    // index inputs.
-    let short_transcript = path.join("transcript.jsonl");
-    if antigravity::transcript(&short_transcript).is_some() {
-        for candidate in [short_transcript, path.join("transcript_full.jsonl")] {
-            if candidate.is_file() {
-                collect_jsonl_files(&candidate, files)?;
-            }
+    let canonical_dir = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    collect_canonical_dir(&canonical_dir, files)
+}
+
+fn collect_canonical_dir(dir: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
+    // Antigravity conversation directories hold thousands of per-step artifact
+    // subdirectories under `.system_generated/steps/`. Only the two consolidated
+    // transcripts in `.system_generated/logs/` are valid index inputs.
+    if antigravity::conversation_dir(dir) {
+        let logs = dir.join(".system_generated").join("logs");
+        if fs::symlink_metadata(&logs).is_ok_and(|meta| meta.is_dir()) {
+            collect_antigravity_logs(&logs, files);
         }
         return Ok(());
     }
 
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("failed to read directory {}", path.display()))?
+    // Also short-circuit when the caller passes `.../.system_generated/logs`
+    // directly so chunk copies beside the consolidated transcripts are ignored.
+    let short_transcript = dir.join("transcript.jsonl");
+    if antigravity::transcript(&short_transcript).is_some() {
+        collect_antigravity_logs(dir, files);
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
     {
         let entry = entry?;
-        collect_jsonl_files(&entry.path(), files)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let child = dir.join(entry.file_name());
+        if file_type.is_dir() {
+            collect_canonical_dir(&child, files)?;
+        } else if file_type.is_file() && is_trace_file(&child) {
+            // `dir` is canonical and no symlink was traversed, so `child` is
+            // already canonical without an extra `realpath` syscall.
+            files.insert(child);
+        }
     }
     Ok(())
+}
+
+fn collect_antigravity_logs(logs_dir: &Path, files: &mut BTreeSet<PathBuf>) {
+    for name in ["transcript.jsonl", "transcript_full.jsonl"] {
+        let candidate = logs_dir.join(name);
+        if let Ok(meta) = fs::symlink_metadata(&candidate)
+            && !meta.file_type().is_symlink()
+            && meta.is_file()
+        {
+            files.insert(candidate);
+        }
+    }
 }
 
 pub(crate) fn is_trace_file(path: &Path) -> bool {
@@ -113,33 +152,188 @@ pub(crate) fn alternate_encoding(path: &Path) -> PathBuf {
     }
 }
 
-/// Replay needs a seekable snapshot to find the last complete Record and
-/// compare a published prefix. Decode into an anonymous temporary file so
-/// disk holds the snapshot even for an archive larger than memory.
-pub(crate) fn open_for_indexing(path: &Path) -> Result<File> {
+/// Seekable decoded view of one Source during indexing.
+///
+/// Plain `.jsonl` files stay file-backed with zero copying. Compressed
+/// `.jsonl.zst` archives decode into the caller's reusable buffer up to
+/// [`MAX_IN_MEMORY_DECOMPRESSED_BYTES`] to avoid temporary-file write/read I/O,
+/// spilling transparently to an anonymous temporary file for larger archives so
+/// memory remains strictly bounded.
+pub(crate) enum IndexingSource<'a> {
+    File { file: File, len: u64 },
+    Memory(Cursor<&'a [u8]>),
+}
+
+impl IndexingSource<'_> {
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::File { len, .. } => *len,
+            Self::Memory(cursor) => cursor.get_ref().len() as u64,
+        }
+    }
+
+    pub(crate) fn bounded_reader(&mut self, limit: u64) -> Result<BoundedSourceReader<'_>> {
+        match self {
+            Self::File { file, .. } => {
+                file.seek(SeekFrom::Start(0))?;
+                Ok(BoundedSourceReader::File(BufReader::with_capacity(
+                    READ_BUFFER_BYTES,
+                    file.take(limit),
+                )))
+            }
+            Self::Memory(cursor) => {
+                let end = usize::try_from(limit)?.min(cursor.get_ref().len());
+                Ok(BoundedSourceReader::Memory(Cursor::new(
+                    &cursor.get_ref()[..end],
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn complete_prefix_length(&mut self) -> Result<u64> {
+        match self {
+            Self::Memory(cursor) => Ok(cursor
+                .get_ref()
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| (index + 1) as u64)),
+            Self::File { file, len } => complete_prefix_length_file(file, *len),
+        }
+    }
+
+    pub(crate) fn fingerprint_prefix(&mut self, length: u64) -> Result<String> {
+        match self {
+            Self::Memory(cursor) => {
+                let want = usize::try_from(length)?;
+                let bytes = cursor.get_ref();
+                if want > bytes.len() {
+                    bail!("file ended while fingerprinting an indexed prefix");
+                }
+                let mut hash = prefix_hasher(length);
+                hash.update(&bytes[..want]);
+                Ok(hash.finalize().to_hex().to_string())
+            }
+            Self::File { file, .. } => fingerprint_prefix_file(file, length),
+        }
+    }
+}
+
+impl Read for IndexingSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File { file, .. } => file.read(buf),
+            Self::Memory(cursor) => cursor.read(buf),
+        }
+    }
+}
+
+impl Seek for IndexingSource<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::File { file, .. } => file.seek(pos),
+            Self::Memory(cursor) => cursor.seek(pos),
+        }
+    }
+}
+
+/// Zero-copy `BufRead` view over an [`IndexingSource`] prefix.
+pub(crate) enum BoundedSourceReader<'a> {
+    File(BufReader<Take<&'a mut File>>),
+    Memory(Cursor<&'a [u8]>),
+}
+
+impl Read for BoundedSourceReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(reader) => reader.read(buf),
+            Self::Memory(cursor) => cursor.read(buf),
+        }
+    }
+}
+
+impl BufRead for BoundedSourceReader<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match self {
+            Self::File(reader) => reader.fill_buf(),
+            Self::Memory(cursor) => cursor.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self {
+            Self::File(reader) => reader.consume(amt),
+            Self::Memory(cursor) => cursor.consume(amt),
+        }
+    }
+}
+
+/// Opens a Source for indexing, decoding compressed archives into `scratch`
+/// when they fit within [`MAX_IN_MEMORY_DECOMPRESSED_BYTES`] and spilling
+/// larger archives to an anonymous temporary file.
+pub(crate) fn open_for_indexing<'a>(
+    path: &Path,
+    scratch: &'a mut Vec<u8>,
+) -> Result<IndexingSource<'a>> {
+    open_for_indexing_with_limit(path, scratch, MAX_IN_MEMORY_DECOMPRESSED_BYTES)
+}
+
+fn open_for_indexing_with_limit<'a>(
+    path: &Path,
+    scratch: &'a mut Vec<u8>,
+    max_in_memory: usize,
+) -> Result<IndexingSource<'a>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     if !is_compressed(path) {
-        return Ok(file);
+        let len = file.metadata()?.len();
+        return Ok(IndexingSource::File { file, len });
     }
-    let mut decoded = tempfile::tempfile().context("failed to create a decompression snapshot")?;
+    scratch.clear();
     let mut archive = zstd::stream::read::Decoder::new(file)?;
-    let mut buffer = vec![0_u8; DECOMPRESS_BUFFER_BYTES].into_boxed_slice();
+    let mut chunk = vec![0_u8; DECOMPRESS_BUFFER_BYTES].into_boxed_slice();
+    let mut spilled: Option<(File, u64)> = None;
     loop {
         let count = archive
-            .read(&mut buffer)
+            .read(&mut chunk)
             .with_context(|| format!("failed to decompress {}", path.display()))?;
         if count == 0 {
             break;
         }
-        decoded.write_all(&buffer[..count]).with_context(|| {
-            format!(
-                "failed to write decompression snapshot for {}",
-                path.display()
-            )
-        })?;
+        if let Some((decoded, written)) = spilled.as_mut() {
+            decoded.write_all(&chunk[..count]).with_context(|| {
+                format!(
+                    "failed to write decompression snapshot for {}",
+                    path.display()
+                )
+            })?;
+            *written += u64::try_from(count)?;
+        } else if scratch.len().saturating_add(count) <= max_in_memory {
+            scratch.extend_from_slice(&chunk[..count]);
+        } else {
+            let mut decoded =
+                tempfile::tempfile().context("failed to create a decompression snapshot")?;
+            decoded.write_all(scratch).with_context(|| {
+                format!(
+                    "failed to write decompression snapshot for {}",
+                    path.display()
+                )
+            })?;
+            decoded.write_all(&chunk[..count]).with_context(|| {
+                format!(
+                    "failed to write decompression snapshot for {}",
+                    path.display()
+                )
+            })?;
+            let written = u64::try_from(scratch.len())? + u64::try_from(count)?;
+            scratch.clear();
+            spilled = Some((decoded, written));
+        }
     }
-    decoded.rewind()?;
-    Ok(decoded)
+    if let Some((mut decoded, len)) = spilled {
+        decoded.rewind()?;
+        Ok(IndexingSource::File { file: decoded, len })
+    } else {
+        Ok(IndexingSource::Memory(Cursor::new(scratch.as_slice())))
+    }
 }
 
 /// Opens a reader at a decoded byte offset. Plain Sources seek directly.
@@ -269,7 +463,7 @@ pub(crate) fn prefix_hasher(length: u64) -> blake3::Hasher {
     hasher
 }
 
-pub(crate) fn fingerprint_prefix(file: &mut File, length: u64) -> Result<String> {
+fn fingerprint_prefix_file(file: &mut File, length: u64) -> Result<String> {
     let mut hash = prefix_hasher(length);
     file.seek(SeekFrom::Start(0))?;
     let mut remaining = length;
@@ -286,7 +480,7 @@ pub(crate) fn fingerprint_prefix(file: &mut File, length: u64) -> Result<String>
     Ok(hash.finalize().to_hex().to_string())
 }
 
-pub(crate) fn complete_prefix_length(file: &mut File, file_size: u64) -> Result<u64> {
+fn complete_prefix_length_file(file: &mut File, file_size: u64) -> Result<u64> {
     let mut end = file_size;
     let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
     while end > 0 {
@@ -309,4 +503,70 @@ pub(crate) fn modified_ns(metadata: &fs::Metadata) -> i64 {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Write as _;
+
+    use tempfile::tempdir;
+
+    use super::{IndexingSource, discover_jsonl_files, open_for_indexing_with_limit};
+
+    #[test]
+    fn antigravity_discovery_skips_step_subdirectories_and_prefers_full_transcript() {
+        let root = tempdir().expect("tempdir");
+        let brain = root.path().join("brain");
+        let conv = brain.join("955c79ca-6f59-46b9-8a47-c8ab27227b8a");
+        let logs = conv.join(".system_generated").join("logs");
+        let step_dir = conv.join(".system_generated").join("steps").join("42");
+        fs::create_dir_all(&logs).expect("create logs dir");
+        fs::create_dir_all(&step_dir).expect("create steps dir");
+
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let chunk = logs.join("transcript_chunk_001.jsonl");
+        let stray = step_dir.join("output.jsonl");
+        fs::write(&short, "{}\n").expect("write short");
+        fs::write(&full, "{}\n").expect("write full");
+        fs::write(&chunk, "{}\n").expect("write chunk");
+        fs::write(&stray, "{}\n").expect("write stray");
+
+        let discovered = discover_jsonl_files(&[brain]).expect("discover");
+        assert_eq!(discovered, vec![full.canonicalize().expect("canonical")]);
+    }
+
+    #[test]
+    fn compressed_source_decodes_in_memory_and_spills_past_limit() {
+        let root = tempdir().expect("tempdir");
+        let archive_path = root.path().join("sample.jsonl.zst");
+        let payload = b"{\"line\":1}\n{\"line\":2}\ntrailing";
+        let compressed = zstd::bulk::compress(payload, 3).expect("compress");
+        fs::File::create(&archive_path)
+            .expect("create archive")
+            .write_all(&compressed)
+            .expect("write archive");
+
+        let mut scratch = Vec::new();
+        let mut mem_source =
+            open_for_indexing_with_limit(&archive_path, &mut scratch, 1024).expect("in-memory");
+        assert!(matches!(mem_source, IndexingSource::Memory(_)));
+        assert_eq!(mem_source.len(), payload.len() as u64);
+        assert_eq!(mem_source.complete_prefix_length().expect("prefix len"), 22);
+        let mem_fp = mem_source.fingerprint_prefix(22).expect("mem fingerprint");
+
+        let mut spilled_source =
+            open_for_indexing_with_limit(&archive_path, &mut scratch, 8).expect("spilled");
+        assert!(matches!(spilled_source, IndexingSource::File { .. }));
+        assert_eq!(spilled_source.len(), payload.len() as u64);
+        assert_eq!(
+            spilled_source.complete_prefix_length().expect("prefix len"),
+            22
+        );
+        let file_fp = spilled_source
+            .fingerprint_prefix(22)
+            .expect("file fingerprint");
+        assert_eq!(mem_fp, file_fp);
+    }
 }
