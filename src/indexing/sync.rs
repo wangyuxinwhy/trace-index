@@ -66,6 +66,13 @@ pub fn execute_observed(
     match sync_paths_observed(store, &paths, options, &mut telemetry, progress) {
         Ok(mut report) => {
             restore_secondary_indexes(store, bulk_load, &mut telemetry, progress)?;
+            if !store.is_empty()?
+                && (bulk_load || report.indexed_files > 0 || !store.has_query_planner_stats()?)
+            {
+                let started = Instant::now();
+                store.optimize_query_planner()?;
+                telemetry.record_duration(IndexPhase::BuildIndexes, started.elapsed());
+            }
             progress.finish();
             report.metrics =
                 telemetry.finish(database_bytes_before, database_storage_bytes(store.path()));
