@@ -252,6 +252,98 @@ fn docs_ignore_global_storage_selectors_without_opening_them() {
 }
 
 #[test]
+fn docs_get_supports_section_listing_and_targeted_extraction() {
+    let outline_md = run(&["docs", "get", "reference/public-schema", "--list-sections"]);
+    assert!(outline_md.status.success());
+    let outline_text = String::from_utf8(outline_md.stdout).expect("UTF-8 outline");
+    assert!(outline_text.contains("Semantic SQL encoding"));
+
+    let outline_json = compact_json(&run(&[
+        "docs",
+        "get",
+        "reference/public-schema",
+        "--list-sections",
+        "--output",
+        "json",
+    ]));
+    assert!(
+        outline_json["data"]["sections"]
+            .as_array()
+            .is_some_and(|sections| sections
+                .iter()
+                .any(|s| s["heading"] == "Semantic SQL encoding"))
+    );
+
+    let section_md = run(&[
+        "docs",
+        "get",
+        "reference/public-schema",
+        "--section",
+        "Semantic SQL encoding",
+    ]);
+    assert!(section_md.status.success());
+    let section_text = String::from_utf8(section_md.stdout).expect("UTF-8 section");
+    assert!(section_text.starts_with("## Semantic SQL encoding"));
+    assert!(section_text.contains("call_item_id"));
+    assert!(!section_text.contains("## JSON values are typed domain values"));
+
+    let section_json = compact_json(&run(&[
+        "docs",
+        "get",
+        "reference/public-schema",
+        "--section",
+        "Semantic SQL encoding",
+        "--output",
+        "json",
+    ]));
+    assert!(
+        section_json["data"]["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("## Semantic SQL encoding"))
+    );
+
+    let missing = run(&[
+        "docs",
+        "get",
+        "reference/public-schema",
+        "--section",
+        "does-not-exist",
+    ]);
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8(missing.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("Available sections:"));
+    assert!(stderr.contains("--list-sections"));
+
+    let empty_section = run(&["docs", "get", "reference/public-schema", "--section", ""]);
+    assert!(!empty_section.status.success());
+
+    let conflict = run(&[
+        "docs",
+        "get",
+        "reference/public-schema",
+        "--list-sections",
+        "--section",
+        "Relations",
+    ]);
+    assert_eq!(conflict.status.code(), Some(2));
+
+    let sectionless_outline = run(&["docs", "get", "reference/cli", "--list-sections"]);
+    assert!(sectionless_outline.status.success());
+    assert!(
+        String::from_utf8(sectionless_outline.stdout)
+            .expect("UTF-8")
+            .contains("no subsections")
+    );
+    let sectionless_get = run(&["docs", "get", "reference/cli", "--section", "any"]);
+    assert!(!sectionless_get.status.success());
+    assert!(
+        String::from_utf8(sectionless_get.stderr)
+            .expect("UTF-8")
+            .contains("has no subsections")
+    );
+}
+
+#[test]
 fn ordinary_sync_reuses_the_policy_owned_by_a_non_empty_database() {
     let directory = tempdir().expect("temporary directory");
     let database = directory.path().join("index.sqlite");

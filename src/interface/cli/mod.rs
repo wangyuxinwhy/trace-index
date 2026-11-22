@@ -98,7 +98,7 @@ Query correctly:
   2. Join sessions or loops when Runtime, context, time, or order defines scope.
   3. Read non-text semantic.value members directly; join blobs only for text.
   4. Follow record_ids only for exact Runtime evidence or index-integrity debugging.
-  5. Use schema get before extracting an unfamiliar JSON shape.
+  5. Use schema get for relation columns and docs get <topic> --list-sections / --section <heading> for targeted docs (e.g. docs get reference/public-schema --section 'Semantic SQL encoding' for per-role semantic.value shapes).
 
 Investigation defaults:
   Orient with the conversation spine.
@@ -238,6 +238,17 @@ const DOCS_AFTER_HELP: &str = r"Behavior:
   Reads documentation bundled with this binary without loading configuration or
   opening the database. The global --config and --db selectors are accepted for
   command-tree consistency but have no effect on docs commands.";
+
+const DOCS_GET_AFTER_HELP: &str = r#"Behavior:
+  Reads one bundled documentation topic without loading configuration or opening
+  the database. The global --config and --db selectors are accepted for
+  command-tree consistency but have no effect on docs commands.
+  For long topics, use --list-sections to inspect headings and --section <HEADING>
+  to read only the matching section(s) without truncating output.
+
+Examples:
+  trace-index docs get reference/public-schema --list-sections
+  trace-index docs get reference/public-schema --section "Semantic SQL encoding""#;
 
 const QUERY_RUN_AFTER_HELP: &str = r#"Behavior:
   Runs one read-only statement against the existing index. It never refreshes
@@ -406,7 +417,7 @@ enum DocsCommand {
     List,
 
     /// Get one documentation topic.
-    #[command(after_help = DOCS_AFTER_HELP)]
+    #[command(after_help = DOCS_GET_AFTER_HELP)]
     Get(DocsGetArgs),
 
     /// Search bundled documentation topics.
@@ -425,6 +436,14 @@ struct DocsGetArgs {
     /// Output Markdown directly or return a compact JSON document.
     #[arg(long, value_enum, default_value_t = DocsOutput::Markdown)]
     output: DocsOutput,
+
+    /// Return only matching Markdown heading section(s) (case-insensitive substring match).
+    #[arg(long, value_name = "HEADING", conflicts_with = "list_sections")]
+    section: Option<String>,
+
+    /// List the Markdown section headings in this topic instead of the full body.
+    #[arg(long, conflicts_with = "section")]
+    list_sections: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

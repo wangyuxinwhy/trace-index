@@ -27,6 +27,21 @@ pub struct TopicDocument {
     pub content: Cow<'static, str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SectionSummary {
+    pub level: usize,
+    pub heading: String,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopicSections {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub returned: usize,
+    pub sections: Vec<SectionSummary>,
+}
+
 struct Topic {
     summary: TopicSummary,
     content: &'static str,
@@ -227,18 +242,239 @@ pub fn search(query: &str) -> Result<TopicList> {
 ///
 /// Returns an error when the topic does not exist.
 pub fn get(name: &str) -> Result<TopicDocument> {
-    let Some(topic) = TOPICS.iter().find(|topic| topic.summary.name == name) else {
-        bail!(
-            "documentation topic not found: {name:?}\n\
-             Hint: run `trace-index docs list` to discover valid topic names"
-        );
-    };
+    let topic = find_topic(name)?;
     Ok(TopicDocument {
         name: topic.summary.name,
         title: topic.summary.title,
         media_type: "text/markdown",
         content: markdown_body(topic.content),
     })
+}
+
+/// Lists the Markdown heading sections of one bundled documentation topic.
+///
+/// # Errors
+///
+/// Returns an error when the topic does not exist.
+pub fn list_sections(name: &str) -> Result<TopicSections> {
+    let topic = find_topic(name)?;
+    let body = markdown_body(topic.content);
+    let sections = parse_sections(&body)
+        .into_iter()
+        .map(|section| SectionSummary {
+            level: section.level,
+            heading: section.heading,
+            bytes: section.end - section.start,
+        })
+        .collect::<Vec<_>>();
+    Ok(TopicSections {
+        name: topic.summary.name,
+        title: topic.summary.title,
+        returned: sections.len(),
+        sections,
+    })
+}
+
+/// Renders a compact Markdown outline of one topic's section headings.
+#[must_use]
+pub fn format_sections_markdown(sections: &TopicSections) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!("# {} (`{}`)\n\n", sections.title, sections.name);
+    if sections.sections.is_empty() {
+        out.push_str("(no subsections — run without --list-sections to read the full topic)\n");
+        return out;
+    }
+    for section in &sections.sections {
+        let indent = "  ".repeat(section.level.saturating_sub(2));
+        let hashes = "#".repeat(section.level);
+        let _ = writeln!(
+            out,
+            "{indent}- `{hashes} {}` ({} B)",
+            section.heading, section.bytes
+        );
+    }
+    out
+}
+
+/// Extracts matching Markdown heading section(s) from one bundled topic.
+///
+/// Matches headings case-insensitively by substring. When both a parent heading
+/// and a nested subheading match, the parent slice already covers the child so
+/// nested duplicates are omitted.
+///
+/// # Errors
+///
+/// Returns an error when the topic does not exist, `query` is empty, or no
+/// heading matches `query`.
+pub fn get_section(name: &str, query: &str) -> Result<TopicDocument> {
+    let topic = find_topic(name)?;
+    let body = markdown_body(topic.content);
+    let extracted = extract_sections_from_body(topic.summary.name, &body, query)?;
+    Ok(TopicDocument {
+        name: topic.summary.name,
+        title: topic.summary.title,
+        media_type: "text/markdown",
+        content: Cow::Owned(extracted),
+    })
+}
+
+fn extract_sections_from_body(topic_name: &str, body: &str, query: &str) -> Result<String> {
+    let needle = query.trim().to_lowercase();
+    anyhow::ensure!(
+        !needle.is_empty(),
+        "section heading query must not be empty"
+    );
+
+    let sections = parse_sections(body);
+    if sections.is_empty() {
+        bail!(
+            "documentation topic {topic_name:?} has no subsections\n\
+             Hint: run `trace-index docs get {topic_name}` without `--section` to read the full topic"
+        );
+    }
+
+    let mut matched: Vec<&ParsedSection> = Vec::new();
+    for section in &sections {
+        if !section.heading.to_lowercase().contains(&needle) {
+            continue;
+        }
+        if matched
+            .last()
+            .is_some_and(|prev| section.start >= prev.start && section.end <= prev.end)
+        {
+            continue;
+        }
+        matched.push(section);
+    }
+
+    if matched.is_empty() {
+        let available = sections
+            .iter()
+            .map(|section| section.heading.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "section {query:?} not found in documentation topic {topic_name:?}\n\
+             Available sections: {available}\n\
+             Hint: run `trace-index docs get {topic_name} --list-sections` to inspect headings"
+        );
+    }
+
+    let extracted = matched
+        .iter()
+        .map(|section| body[section.start..section.end].trim_end())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(format!("{extracted}\n"))
+}
+
+fn find_topic(name: &str) -> Result<&'static Topic> {
+    let Some(topic) = TOPICS.iter().find(|topic| topic.summary.name == name) else {
+        bail!(
+            "documentation topic not found: {name:?}\n\
+             Hint: run `trace-index docs list` to discover valid topic names"
+        );
+    };
+    Ok(topic)
+}
+
+struct ParsedSection {
+    level: usize,
+    heading: String,
+    start: usize,
+    end: usize,
+}
+
+fn parse_sections(body: &str) -> Vec<ParsedSection> {
+    let mut raw: Vec<(usize, String, usize)> = Vec::new();
+    let mut active_fence: Option<(char, usize)> = None;
+    let mut offset = 0_usize;
+
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        if let Some((fence_char, fence_len)) = active_fence {
+            if is_closing_fence(trimmed, fence_char, fence_len) {
+                active_fence = None;
+            }
+            offset += line.len();
+            continue;
+        }
+        if let Some(fence) = opening_fence(trimmed) {
+            active_fence = Some(fence);
+            offset += line.len();
+            continue;
+        }
+        if let Some((level, heading)) = parse_atx_heading(trimmed)
+            && level >= 2
+        {
+            raw.push((level, heading.to_owned(), offset));
+        }
+        offset += line.len();
+    }
+
+    let mut sections = Vec::with_capacity(raw.len());
+    for (index, (level, heading, start)) in raw.iter().enumerate() {
+        let end = raw[index + 1..]
+            .iter()
+            .find(|(next_level, _, _)| *next_level <= *level)
+            .map_or(body.len(), |(_, _, next_start)| *next_start);
+        sections.push(ParsedSection {
+            level: *level,
+            heading: heading.clone(),
+            start: *start,
+            end,
+        });
+    }
+    sections
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize)> {
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let stripped = &line[leading_spaces..];
+    let first = stripped.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = stripped.chars().take_while(|&ch| ch == first).count();
+    if count < 3 {
+        return None;
+    }
+    // Per CommonMark, a backtick code fence info string cannot contain backticks
+    // (otherwise the line is an inline code span like ```code```).
+    if first == '`' && stripped[count..].contains('`') {
+        return None;
+    }
+    Some((first, count))
+}
+
+fn is_closing_fence(line: &str, fence_char: char, min_len: usize) -> bool {
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return false;
+    }
+    let stripped = &line[leading_spaces..];
+    let count = stripped.chars().take_while(|&ch| ch == fence_char).count();
+    count >= min_len && stripped[count..].trim().is_empty()
+}
+
+fn parse_atx_heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.bytes().take_while(|&byte| byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line[hashes..].strip_prefix(' ')?.trim();
+    let trimmed = rest.trim_end_matches('#');
+    let title =
+        if trimmed.len() < rest.len() && (trimmed.is_empty() || trimmed.ends_with([' ', '\t'])) {
+            trimmed.trim_end()
+        } else {
+            rest
+        };
+    (!title.is_empty()).then_some((hashes, title))
 }
 
 fn markdown_body(content: &'static str) -> Cow<'static, str> {
@@ -277,7 +513,10 @@ fn normalized_query(query: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get, list, markdown_body, normalize_newlines, search};
+    use super::{
+        extract_sections_from_body, format_sections_markdown, get, get_section, list,
+        list_sections, markdown_body, normalize_newlines, parse_sections, search,
+    };
 
     #[test]
     fn lists_gets_and_searches_bundled_topics() {
@@ -335,5 +574,56 @@ mod tests {
                 .content
                 .starts_with("---")
         );
+    }
+
+    #[test]
+    fn lists_and_extracts_sections_ignoring_fenced_code_comments() {
+        let sample = "# Page\n\n## Alpha\n```bash\n## not a heading\n```\n```inline``` text\nBody A\n\n### Alpha Sub\nSub A\n\n## C#\nBody B\n";
+        let parsed = parse_sections(sample);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].heading, "Alpha");
+        assert_eq!(parsed[0].level, 2);
+        assert_eq!(parsed[1].heading, "Alpha Sub");
+        assert_eq!(parsed[1].level, 3);
+        assert_eq!(parsed[2].heading, "C#");
+
+        // Matching both a parent (`## Alpha`) and its child (`### Alpha Sub`)
+        // must emit the parent slice once without duplicating the child.
+        let dedup = extract_sections_from_body("sample", sample, "alpha").expect("match alpha");
+        assert_eq!(dedup.matches("### Alpha Sub").count(), 1);
+        assert!(!dedup.contains("## C#"));
+
+        let sections = list_sections("reference/public-schema").expect("public-schema sections");
+        assert!(
+            sections
+                .sections
+                .iter()
+                .any(|s| s.heading == "Semantic SQL encoding")
+        );
+        let outline = format_sections_markdown(&sections);
+        assert!(outline.contains("Semantic SQL encoding"));
+
+        let extracted = get_section("reference/public-schema", "semantic sql encoding")
+            .expect("extract Semantic SQL encoding");
+        assert!(extracted.content.starts_with("## Semantic SQL encoding"));
+        assert!(extracted.content.contains("agent.tool_call.shell"));
+        assert!(extracted.content.contains("call_item_id"));
+        assert!(
+            !extracted
+                .content
+                .contains("## JSON values are typed domain values")
+        );
+
+        let err = get_section("reference/public-schema", "nonexistent-heading")
+            .expect_err("unknown section must error");
+        let msg = err.to_string();
+        assert!(msg.contains("Available sections:"));
+        assert!(msg.contains("--list-sections"));
+
+        let no_sections = list_sections("reference/cli").expect("cli sections");
+        assert!(no_sections.sections.is_empty());
+        assert!(format_sections_markdown(&no_sections).contains("no subsections"));
+        let err_empty = get_section("reference/cli", "anything").expect_err("no subsections");
+        assert!(err_empty.to_string().contains("has no subsections"));
     }
 }

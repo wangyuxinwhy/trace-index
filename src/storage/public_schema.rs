@@ -188,6 +188,9 @@ public_view! {
 public_view! {
     /// Individually queryable Agent program facts. `semantic` is the typed
     /// Trace Index meaning; `record_ids` identifies its physical evidence.
+    /// Common filters on `semantic.role`, `occurred_at`,
+    /// `semantic.value.tool_name`, and `semantic.value.call_item_id` are
+    /// index-accelerated.
     pub(crate) const ITEMS = "items" {
         /// Opaque Item reference in this index.
         item_id: i64 = "i.id",
@@ -203,7 +206,9 @@ public_view! {
         record_ids: String = "COALESCE((SELECT json_group_array(record_id) FROM (SELECT record_id FROM item_records WHERE item_id = i.id ORDER BY record_id)), json('[]'))",
         /// Stable SQL encoding `{role, value, evidence_strength}` of Trace
         /// Index's cross-Runtime Semantic. Top-level text members are Blob
-        /// references `{blob_id}` resolved through `blobs`.
+        /// references `{blob_id}` resolved through `blobs`. Inspect exact
+        /// per-role `semantic.value` members with
+        /// `docs get reference/public-schema --section "Semantic SQL encoding"`.
         semantic: String = "i.semantic",
     }
     from "FROM domain_items i";

@@ -22,7 +22,7 @@ trace-index schema get items --compact
 - `records`: Boundary-complete physical Records. Raw bytes remain in the Source and can be read with `record inspect`.
 - `sessions`: Runtime-maintained logical Agent contexts. Arrays and nested optional attributes are JSON values belonging to the Session object.
 - `loops`: Outer Agent execution lifecycles. Some Adapters group Items by input when the Runtime does not expose confirmed boundaries. A missing `end` means no ending has been observed. An `end` without outcome means the boundary is known and the Runtime did not state a result.
-- `items`: Individually queryable Agent program facts. `semantic` is the typed Trace Index meaning; `record_ids` identifies its physical evidence.
+- `items`: Individually queryable Agent program facts. `semantic` is the typed Trace Index meaning; `record_ids` identifies its physical evidence. Common filters on `semantic.role`, `occurred_at`, `semantic.value.tool_name`, and `semantic.value.call_item_id` are index-accelerated.
 - `blobs`: Bounded Semantic text addressable through Item BlobRef values. Blob rows are access data, not independent trace facts.
 - `item_search`: Trigram candidate index over explicitly documented Item semantic text. `rowid` is the matching `items.item_id`; query with `trigram_query('...')` and exact-check candidate text via `blobs`.
 - `item_search_terms`: Term-oriented candidate index (Format 4+) over pre-tokenized Item semantic text (2+ character CJK terms, words, and split code identifiers) with `bm25()` ranking. `rowid` is the matching `items.item_id`; query with `search_query('...')` and exact-check candidate text via `blobs`.
