@@ -174,10 +174,23 @@ fn run_docs(command: DocsCommand) -> Result<()> {
         DocsCommand::List => print_envelope(&docs::list()),
         DocsCommand::Search { query } => print_envelope(&docs::search(&query)?),
         DocsCommand::Get(args) => {
-            let document = docs::get(&args.topic)?;
-            match args.output {
-                DocsOutput::Markdown => print_markdown(&document.content),
-                DocsOutput::Json => print_envelope(&document),
+            if args.list_sections {
+                let sections = docs::list_sections(&args.topic)?;
+                match args.output {
+                    DocsOutput::Markdown => {
+                        print_markdown(&docs::format_sections_markdown(&sections))
+                    }
+                    DocsOutput::Json => print_envelope(&sections),
+                }
+            } else {
+                let document = match args.section.as_deref() {
+                    Some(section) => docs::get_section(&args.topic, section)?,
+                    None => docs::get(&args.topic)?,
+                };
+                match args.output {
+                    DocsOutput::Markdown => print_markdown(&document.content),
+                    DocsOutput::Json => print_envelope(&document),
+                }
             }
         }
     }

@@ -7,7 +7,7 @@ description: Compact JSON, Markdown docs, stderr, and process exit codes.
 
 Machine-readable commands write one compact JSON envelope followed by one newline to stdout. The result is under `data`; fields documented as optional can be omitted.
 
-`docs get` writes Markdown by default. `docs get <TOPIC> --output json` returns the document in the same JSON envelope.
+`docs get` writes Markdown by default (`--list-sections` lists headings and `--section <HEADING>` extracts matching sections without printing the full page). `--output json` returns the document or section list in the same JSON envelope.
 
 Process and stream behavior:
 

@@ -11,6 +11,8 @@ At the start of each trace-analysis task, run `trace-index --help` once. Its hel
 
 ```bash
 trace-index docs list
+trace-index docs get <TOPIC> --list-sections
+trace-index docs get <TOPIC> --section "<HEADING>"
 trace-index schema list
 trace-index schema get <RELATION> --compact
 ```
@@ -46,7 +48,7 @@ Read `semantic.role` with these stable meanings:
 - `runtime.compaction_summary`: A Runtime-produced summary that replaces earlier context.
 - `runtime.unknown`: Meaningful bounded Runtime content whose more specific stable role is not yet known.
 
-Inspect the Item schema before extracting JSON. `semantic.role` selects the type of `semantic.value`; do not assume every value has a `text` field. Report a judgment whose `semantic.evidence_strength` is `heuristic` more cautiously than one marked `structural`. When a claim depends on an exact Runtime field that the Semantic contract does not publish, follow `record_ids` and inspect the supporting Record instead of assuming the Item contains a Runtime payload copy.
+Inspect the Item schema (`schema get items`) and nested shapes (`docs get reference/public-schema --section "Semantic SQL encoding"`) before extracting JSON. `semantic.role` selects the type of `semantic.value`; do not assume every value has a `text` field. Report a judgment whose `semantic.evidence_strength` is `heuristic` more cautiously than one marked `structural`. When a claim depends on an exact Runtime field that the Semantic contract does not publish, follow `record_ids` and inspect the supporting Record instead of assuming the Item contains a Runtime payload copy.
 
 In the public SQL encoding, top-level domain TextContent is not inline. `semantic.value.text`, or `semantic.value.summary` for `runtime.compaction_summary`, is a `BlobRef {blob_id}`. Inspect `schema get blobs` before the first text query, then join that id to `blobs.blob_id` only when the query needs `text`, `full_bytes`, or `estimated_tokens`. Start from `items`; a standalone Blob row is access data and has no published domain meaning. Compare the UTF-8 byte length of `blobs.text` with `blobs.full_bytes` before treating it as the whole Source text. On Tool Outputs, `runtime_truncated` and `runtime_output_tokens` describe an earlier Runtime boundary and must not be conflated with the Blob's Source-text boundary.
 

@@ -160,7 +160,7 @@ ORDER BY c.score, i.item_id
 LIMIT 20;
 ```
 
-Older Format 2 and Format 3 databases can still be queried read-only without `item_search_terms`; use `item_search(trigram_query('...'))` or structural narrowing on those indexes. Note that an inner `LIMIT` inside `candidates` bounds top-ranked hits *before* outer filters; widen or omit the inner `LIMIT` when adding selective Session, role, or case-sensitive `instr()` predicates in the outer `WHERE`.
+Older Format 2 and Format 3 databases can still be queried read-only without `item_search_terms`; use `item_search(trigram_query('...'))` or structural narrowing on those indexes. To match alternative term groups (`OR` semantics), combine separate `item_search_terms(search_query('...'))` selects with `UNION ALL` and deduplicate by `item_id` (e.g., `GROUP BY item_id` or `UNION`); `bm25()` scores are computed per query, so confirm combined candidates against exact Blob text. Note that an inner `LIMIT` inside `candidates` bounds top-ranked hits *before* outer filters; widen or omit the inner `LIMIT` when adding selective Session, role, or case-sensitive `instr()` predicates in the outer `WHERE`.
 
 ## Retrieve trigram candidates, then exact-check Blob text
 
