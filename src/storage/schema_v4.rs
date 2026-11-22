@@ -552,6 +552,14 @@ mod tests {
                FROM domain_items
               WHERE json_extract(semantic, '$.role') = 'tool.output'
                 AND json_extract(semantic, '$.value.call_item_id') = 42",
+            "EXPLAIN QUERY PLAN
+             SELECT c.id, o.id
+               FROM domain_items c
+               LEFT JOIN domain_items o
+                 ON json_extract(o.semantic, '$.value.call_item_id') = +c.id
+              WHERE json_extract(c.semantic, '$.role') = 'agent.tool_call.shell'
+              ORDER BY c.occurred_at DESC
+              LIMIT 50",
         ] {
             let plan = connection
                 .prepare(sql)
@@ -561,8 +569,9 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("collect call_item_id plan");
             assert!(
-                plan.iter().any(|step| step.contains("items_call_item_id")),
-                "expected items_call_item_id in plan for `{sql}`: {plan:?}"
+                plan.iter()
+                    .any(|step| step.contains("SEARCH") && step.contains("items_call_item_id")),
+                "expected SEARCH on items_call_item_id in plan for `{sql}`: {plan:?}"
             );
         }
 
