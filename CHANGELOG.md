@@ -2,6 +2,19 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.4] - 2026-11-22
+
+### Added
+
+- Add `--list-sections` and `--section <HEADING>` to `trace-index docs get` (both Markdown and JSON outputs) so Agents and humans can inspect topic outlines and read specific sections without triggering output truncation on long reference pages.
+- Include the standard Antigravity CLI trace root (`~/.gemini/antigravity-cli/brain`, label `antigravity`) in `trace-index config init --discover` alongside Codex, Pi, and Claude Code.
+
+### Changed
+
+- Maintain `SQLite` query-planner statistics (`sqlite_stat1`) via bounded `PRAGMA analysis_limit = 400; PRAGMA optimize(0x10002);` after non-empty synchronizations (cold builds, updated syncs, and one-time backfill for existing Format 4 databases without `sqlite_stat1`), accelerating reverse `INNER JOIN` queries on `items` by orders of magnitude with sub-millisecond steady-state overhead. Storage Format 4 is unchanged; existing Format 4 indexes gain statistics automatically on their next sync without reindexing.
+- Surface direct discovery hints for `docs get reference/public-schema --section 'Semantic SQL encoding'`, `--list-sections`, exact index-accelerated `items` JSON paths, and `item_search_terms(search_query('...'))` `OR` combination in root Help, `schema get items`, bundled docs, and the `trace-index` Skill.
+- Retry transient `launchctl bootstrap` exit-5 (`EIO`) races during macOS `index watch install` hot reloads after `bootout`.
+
 ## [0.5.3] - 2026-11-22
 
 ### Added
