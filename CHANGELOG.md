@@ -2,6 +2,20 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.5] - 2026-11-23
+
+### Added
+
+- Add a reproducible multi-runtime performance benchmark harness (`scripts/bench.py`) supporting deterministic synthetic corpus generation (Codex, Claude Code, Pi, Antigravity), read-only live database query/status benchmarking, isolated CoW/copy append-only benchmarking, and A/B comparison tables.
+
+### Changed
+
+- Accelerate append-only incremental `index sync` and `index watch` updates on large active Sources with zero Storage Format change and bit-for-bit identical output:
+  - Move append-only prefix verification, file scanning, JSON parsing, and Session projection outside `TransactionBehavior::Immediate`, cutting `SQLite` write-lock hold time by 7.5x–11.8x on large rollouts while verifying the existing prefix digest in one sequential read pass.
+  - Defer `tree-sitter-bash` shell command parsing until an Item is written or diverges from its persisted prefix row, and verify unchanged prefix Items in O(1) without repeated `content_blobs` B-tree lookups or JSON re-serialization.
+  - Skip full `serde_json::Value` DOM allocation during verified prefix scans for provably ignored Antigravity (`GENERIC`/`CHECKPOINT`) and Codex (`world_state`, summary-less `compacted`) records.
+- Optimize `index status` `observed_roles` aggregation over `items_role_occurred` using a dense `source_id -> adapter` lookup table, adapter bitmask, and active-role run caching (~1.23x faster end-to-end on a 4.2 GiB / 2.34M-item index with identical output). Storage Format 4 is unchanged; existing Format 4 indexes require no reindexing.
+
 ## [0.5.4] - 2026-11-22
 
 ### Added
