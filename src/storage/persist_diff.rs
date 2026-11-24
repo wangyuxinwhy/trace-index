@@ -23,6 +23,7 @@ use super::persist::{
     write_session,
 };
 use crate::adapters::projection::{ItemProjection, SessionProjection};
+use crate::adapters::runtime::antigravity::AntigravityTailDelta;
 use crate::adapters::semantic;
 use crate::indexing::telemetry::{IndexTelemetry, PersistTable};
 use crate::shell::syntax::ShellParser;
@@ -201,6 +202,167 @@ pub(crate) fn sync_session(
     let counts = writer.finish()?;
     normalize_loop_positions(transaction, session_id)?;
     Ok(counts)
+}
+
+/// Commits an O(tail) Antigravity append delta without loading historical
+/// Loops, Items, or Record ids for the verified prefix.
+///
+/// Returns `Ok(None)` when the stored Session linkage does not match
+/// `("antigravity", expected_session_uuid)`, allowing the caller to fall back
+/// cleanly to the full transactional path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tail commit threads the transaction, delta, new record map, caches, and telemetry"
+)]
+pub(crate) fn append_antigravity_tail(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    expected_session_uuid: &str,
+    delta: &mut AntigravityTailDelta,
+    new_record_ids: &HashMap<u64, i64>,
+    blobs: &mut BlobCache,
+    shell_parser: &mut ShellParser,
+    max_text_bytes: usize,
+    telemetry: &mut IndexTelemetry,
+) -> Result<Option<WriteCounts>> {
+    let Some(existing_session) = load_existing_session_source(transaction, source_id)?
+        .filter(|row| row.runtime == "antigravity" && row.native_id == expected_session_uuid)
+    else {
+        return Ok(None);
+    };
+    let session_id = existing_session.session_id;
+    let tail_loop = load_existing_tail_loop(transaction, source_id)?;
+
+    let mut writer = ItemWriter::new(
+        transaction,
+        source_id,
+        session_id,
+        existing_session.runtime,
+        new_record_ids,
+        blobs,
+        telemetry,
+    )
+    .with_incremental_context(shell_parser, max_text_bytes, None);
+
+    let next_ordinal = if let Some((tail_loop_id, tail_ordinal, existing_model)) = tail_loop {
+        if let Some(model) = delta.leading_loop_model.as_ref() {
+            let model_json = serde_json::to_string(model)?;
+            if existing_model.as_deref() != Some(model_json.as_str()) {
+                update_loop_model(
+                    writer.transaction,
+                    tail_loop_id,
+                    &model_json,
+                    writer.telemetry,
+                )?;
+            }
+        }
+        if !delta.leading_items.is_empty() {
+            let mut next_position = next_item_loop_position(writer.transaction, tail_loop_id)?;
+            for item in &mut delta.leading_items {
+                if writer.write_mut(item, Some(tail_loop_id), Some(next_position))? {
+                    next_position = next_position
+                        .checked_add(1)
+                        .context("Loop position exceeds SQLite INTEGER")?;
+                }
+            }
+        }
+        tail_ordinal
+            .checked_add(1)
+            .context("Loop ordinal exceeds SQLite INTEGER")?
+    } else {
+        for item in &mut delta.leading_items {
+            writer.write_mut(item, None, None)?;
+        }
+        0
+    };
+
+    let added_loops = !delta.new_loops.is_empty();
+    if added_loops {
+        let mut next_session_position = next_loop_session_position(transaction, session_id)?;
+        for (offset, projected_loop) in delta.new_loops.iter_mut().enumerate() {
+            let ordinal = next_ordinal
+                .checked_add(i64::try_from(offset).context("Loop offset exceeds SQLite INTEGER")?)
+                .context("Loop ordinal exceeds SQLite INTEGER")?;
+            let ordinal_usize = usize::try_from(ordinal).context("Loop ordinal is negative")?;
+            let row =
+                ProjectedLoopRow::from_projection(ordinal_usize, projected_loop, new_record_ids)?;
+            let loop_id = insert_loop(
+                transaction,
+                source_id,
+                session_id,
+                next_session_position,
+                &row,
+                writer.telemetry,
+            )?;
+            next_session_position = next_session_position
+                .checked_add(1)
+                .context("Loop position exceeds SQLite INTEGER")?;
+            write_loop_items(&mut writer, loop_id, &mut projected_loop.items)?;
+        }
+    }
+
+    let _ = writer.finish()?;
+    if added_loops {
+        normalize_loop_positions(transaction, session_id)?;
+    }
+
+    let total_items: i64 = transaction
+        .prepare_cached("SELECT COUNT(*) FROM domain_items WHERE source_id = ?1")
+        .context("failed to prepare Source Item count")?
+        .query_row([source_id], |row| row.get(0))
+        .context("failed to count Source Items")?;
+    Ok(Some(WriteCounts {
+        items: u64::try_from(total_items).context("Source Item count is negative")?,
+    }))
+}
+
+fn load_existing_tail_loop(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+) -> Result<Option<(i64, i64, Option<String>)>> {
+    transaction
+        .prepare_cached(
+            "SELECT id, ordinal, model
+               FROM domain_loops
+              WHERE source_id = ?1
+              ORDER BY ordinal DESC
+              LIMIT 1",
+        )
+        .context("failed to prepare tail Loop lookup")?
+        .query_row([source_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+        .context("failed to load tail Loop")
+}
+
+fn next_item_loop_position(transaction: &Transaction<'_>, loop_id: i64) -> Result<i64> {
+    transaction
+        .prepare_cached(
+            "SELECT COALESCE(MAX(loop_position) + 1, 0)
+               FROM domain_items
+              WHERE loop_id = ?1",
+        )
+        .context("failed to prepare next Loop Item position query")?
+        .query_row([loop_id], |row| row.get(0))
+        .context("failed to read next Loop Item position")
+}
+
+fn update_loop_model(
+    transaction: &Transaction<'_>,
+    loop_id: i64,
+    model_json: &str,
+    telemetry: &mut IndexTelemetry,
+) -> Result<()> {
+    let started = Instant::now();
+    transaction
+        .prepare_cached("UPDATE domain_loops SET model = ?2 WHERE id = ?1")
+        .context("failed to prepare Loop model update")?
+        .execute(params![loop_id, model_json])
+        .context("failed to update Loop model")?;
+    telemetry.record_persist(PersistTable::Loops, started.elapsed());
+    telemetry.count_loop();
+    Ok(())
 }
 
 fn sync_existing_loop_items(

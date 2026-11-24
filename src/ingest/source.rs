@@ -13,6 +13,7 @@ use crate::adapters::runtime::antigravity;
 
 pub(crate) const READ_BUFFER_BYTES: usize = 64 * 1024;
 const DECOMPRESS_BUFFER_BYTES: usize = 256 * 1024;
+const PREFIX_VERIFY_BUFFER_BYTES: usize = 256 * 1024;
 /// Upper bound for holding a decompressed `.jsonl.zst` archive in the reusable
 /// run-scoped buffer before spilling to an anonymous temporary file on disk.
 const MAX_IN_MEMORY_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
@@ -173,18 +174,29 @@ impl IndexingSource<'_> {
     }
 
     pub(crate) fn bounded_reader(&mut self, limit: u64) -> Result<BoundedSourceReader<'_>> {
+        self.bounded_reader_from(0, limit)
+    }
+
+    pub(crate) fn bounded_reader_from(
+        &mut self,
+        start: u64,
+        limit: u64,
+    ) -> Result<BoundedSourceReader<'_>> {
+        let span = limit.saturating_sub(start);
         match self {
             Self::File { file, .. } => {
-                file.seek(SeekFrom::Start(0))?;
+                file.seek(SeekFrom::Start(start))?;
                 Ok(BoundedSourceReader::File(BufReader::with_capacity(
                     READ_BUFFER_BYTES,
-                    file.take(limit),
+                    file.take(span),
                 )))
             }
             Self::Memory(cursor) => {
-                let end = usize::try_from(limit)?.min(cursor.get_ref().len());
+                let bytes = cursor.get_ref();
+                let start_idx = usize::try_from(start)?.min(bytes.len());
+                let end_idx = usize::try_from(limit)?.min(bytes.len()).max(start_idx);
                 Ok(BoundedSourceReader::Memory(Cursor::new(
-                    &cursor.get_ref()[..end],
+                    &bytes[start_idx..end_idx],
                 )))
             }
         }
@@ -214,6 +226,41 @@ impl IndexingSource<'_> {
                 Ok(hash.finalize().to_hex().to_string())
             }
             Self::File { file, .. } => fingerprint_prefix_file(file, length),
+        }
+    }
+
+    /// Verifies that `[0..old_len]` still matches `expected_fingerprint` while
+    /// seeding a whole-prefix `BLAKE3` hasher for `new_len` in one sequential
+    /// chunked read pass.
+    ///
+    /// Returns `Ok(Some(full_hasher))` positioned logically at byte `old_len`
+    /// when the prefix is intact, or `Ok(None)` if the prefix was rewritten.
+    pub(crate) fn verify_and_seed_prefix(
+        &mut self,
+        old_len: u64,
+        expected_fingerprint: &str,
+        new_len: u64,
+    ) -> Result<Option<blake3::Hasher>> {
+        match self {
+            Self::Memory(cursor) => {
+                let want = usize::try_from(old_len)?;
+                let bytes = cursor.get_ref();
+                if want > bytes.len() {
+                    return Ok(None);
+                }
+                let prefix = &bytes[..want];
+                let mut verify = prefix_hasher(old_len);
+                verify.update(prefix);
+                if verify.finalize().to_hex().as_str() != expected_fingerprint {
+                    return Ok(None);
+                }
+                let mut full = prefix_hasher(new_len);
+                full.update(prefix);
+                Ok(Some(full))
+            }
+            Self::File { file, .. } => {
+                verify_and_seed_prefix_file(file, old_len, expected_fingerprint, new_len)
+            }
         }
     }
 }
@@ -520,7 +567,7 @@ fn fingerprint_prefix_file(file: &mut File, length: u64) -> Result<String> {
     let mut hash = prefix_hasher(length);
     file.seek(SeekFrom::Start(0))?;
     let mut remaining = length;
-    let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
+    let mut buffer = vec![0_u8; PREFIX_VERIFY_BUFFER_BYTES].into_boxed_slice();
     while remaining > 0 {
         let want = usize::try_from(remaining.min(buffer.len() as u64))?;
         let count = file.read(&mut buffer[..want])?;
@@ -531,6 +578,34 @@ fn fingerprint_prefix_file(file: &mut File, length: u64) -> Result<String> {
         remaining -= u64::try_from(count)?;
     }
     Ok(hash.finalize().to_hex().to_string())
+}
+
+fn verify_and_seed_prefix_file(
+    file: &mut File,
+    old_len: u64,
+    expected_fingerprint: &str,
+    new_len: u64,
+) -> Result<Option<blake3::Hasher>> {
+    let mut verify = prefix_hasher(old_len);
+    let mut full = prefix_hasher(new_len);
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = old_len;
+    let mut buffer = vec![0_u8; PREFIX_VERIFY_BUFFER_BYTES].into_boxed_slice();
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64))?;
+        let count = file.read(&mut buffer[..want])?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let chunk = &buffer[..count];
+        verify.update(chunk);
+        full.update(chunk);
+        remaining -= u64::try_from(count)?;
+    }
+    if verify.finalize().to_hex().as_str() != expected_fingerprint {
+        return Ok(None);
+    }
+    Ok(Some(full))
 }
 
 fn complete_prefix_length_file(file: &mut File, file_size: u64) -> Result<u64> {
@@ -621,5 +696,63 @@ mod tests {
             .fingerprint_prefix(22)
             .expect("file fingerprint");
         assert_eq!(mem_fp, file_fp);
+    }
+
+    #[test]
+    fn verify_and_seed_prefix_matches_full_fingerprint_and_rejects_mutation() {
+        use std::io::Read as _;
+
+        let root = tempdir().expect("tempdir");
+        let trace = root.path().join("tail.jsonl");
+        let prefix = b"{\"line\":1}\n{\"line\":2}\n";
+        let tail = b"{\"line\":3}\n{\"line\":4}\n";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(tail);
+        fs::write(&trace, &combined).expect("write trace");
+
+        let old_len = prefix.len() as u64;
+        let new_len = combined.len() as u64;
+
+        let mut scratch = Vec::new();
+        let mut file_src =
+            open_for_indexing_with_limit(&trace, &mut scratch, 1024).expect("open file");
+        let expected_old = file_src.fingerprint_prefix(old_len).expect("old fp");
+        let expected_new = file_src.fingerprint_prefix(new_len).expect("new fp");
+
+        let mut seeded = file_src
+            .verify_and_seed_prefix(old_len, &expected_old, new_len)
+            .expect("verify file")
+            .expect("prefix should verify");
+        let mut tail_reader = file_src
+            .bounded_reader_from(old_len, new_len)
+            .expect("tail reader");
+        let mut read_tail = Vec::new();
+        tail_reader.read_to_end(&mut read_tail).expect("read tail");
+        assert_eq!(read_tail, tail);
+        seeded.update(&read_tail);
+        assert_eq!(seeded.finalize().to_hex().to_string(), expected_new);
+
+        assert!(
+            file_src
+                .verify_and_seed_prefix(old_len, "deadbeef", new_len)
+                .expect("mismatch check")
+                .is_none()
+        );
+
+        let mut mem_src = IndexingSource::Memory(std::io::Cursor::new(&combined));
+        let mut mem_seeded = mem_src
+            .verify_and_seed_prefix(old_len, &expected_old, new_len)
+            .expect("verify memory")
+            .expect("memory prefix should verify");
+        let mut mem_tail = Vec::new();
+        mem_src
+            .bounded_reader_from(old_len, new_len)
+            .expect("mem tail reader")
+            .read_to_end(&mut mem_tail)
+            .expect("read mem tail");
+        assert_eq!(mem_tail, tail);
+        mem_seeded.update(&mem_tail);
+        assert_eq!(mem_seeded.finalize().to_hex().to_string(), expected_new);
     }
 }

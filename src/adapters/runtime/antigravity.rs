@@ -99,6 +99,102 @@ pub(crate) struct AntigravityProjector {
     max_text_bytes: usize,
 }
 
+/// Incremental tail projection emitted by [`AntigravityTailProjector`] for
+/// Records appended after a cryptographically verified indexed prefix.
+#[derive(Debug, Default)]
+pub(crate) struct AntigravityTailDelta {
+    /// Latest model observed in `PLANNER_RESPONSE` steps before the first new
+    /// `USER_INPUT` in the tail (applies to the existing tail Loop when one
+    /// exists in storage).
+    pub(crate) leading_loop_model: Option<Model>,
+    /// Items emitted before the first new `USER_INPUT` in the tail (append to
+    /// the existing tail Loop, or as Session-level Items if no Loop exists).
+    pub(crate) leading_items: Vec<ItemProjection>,
+    /// New Loops opened by `USER_INPUT` steps in the appended tail.
+    pub(crate) new_loops: Vec<LoopProjection>,
+}
+
+/// Tail-only Antigravity projector for append-only updates.
+///
+/// Antigravity projection is strictly append-only (no cross-Loop mutations, no
+/// `call_id` pairing, and no dual-track UI pairing), so projecting only newly
+/// appended Records produces a delta that commits bit-identically to a full
+/// prefix replay.
+#[derive(Debug)]
+pub(crate) struct AntigravityTailProjector {
+    delta: AntigravityTailDelta,
+    max_text_bytes: usize,
+}
+
+trait StepTarget {
+    fn open_loop(&mut self, projected_loop: LoopProjection);
+    fn set_active_loop_model(&mut self, model: Model);
+    fn push_item(&mut self, item: ItemProjection);
+}
+
+impl StepTarget for AntigravityProjector {
+    fn open_loop(&mut self, projected_loop: LoopProjection) {
+        self.session.loops.push(projected_loop);
+    }
+
+    fn set_active_loop_model(&mut self, model: Model) {
+        if let Some(active) = self.session.loops.last_mut() {
+            active.model = Some(model);
+        }
+    }
+
+    fn push_item(&mut self, item: ItemProjection) {
+        if let Some(active) = self.session.loops.last_mut() {
+            active.items.push(item);
+        } else {
+            self.session.items.push(item);
+        }
+    }
+}
+
+impl StepTarget for AntigravityTailProjector {
+    fn open_loop(&mut self, projected_loop: LoopProjection) {
+        self.delta.new_loops.push(projected_loop);
+    }
+
+    fn set_active_loop_model(&mut self, model: Model) {
+        if let Some(active) = self.delta.new_loops.last_mut() {
+            active.model = Some(model);
+        } else {
+            self.delta.leading_loop_model = Some(model);
+        }
+    }
+
+    fn push_item(&mut self, item: ItemProjection) {
+        if let Some(active) = self.delta.new_loops.last_mut() {
+            active.items.push(item);
+        } else {
+            self.delta.leading_items.push(item);
+        }
+    }
+}
+
+impl AntigravityTailProjector {
+    pub(crate) fn new(max_text_bytes: usize) -> Self {
+        Self {
+            delta: AntigravityTailDelta::default(),
+            max_text_bytes,
+        }
+    }
+
+    pub(crate) fn push(&mut self, seq: u64, value: &Value) {
+        if !is_step(value) {
+            return;
+        }
+        let max_text_bytes = self.max_text_bytes;
+        project_step(self, seq, value, max_text_bytes);
+    }
+
+    pub(crate) fn finish(self) -> AntigravityTailDelta {
+        self.delta
+    }
+}
+
 impl AntigravityProjector {
     pub(crate) fn new(session_uuid: String, max_text_bytes: usize) -> Self {
         Self {
@@ -165,84 +261,78 @@ impl AntigravityProjector {
             self.session.identity_confirmed = true;
             self.session.start_seq = seq;
         }
-        let step = Step {
-            seq,
-            value,
-            max_text_bytes: self.max_text_bytes,
-        };
-        match (string(value, "source"), string(value, "type")) {
-            (Some("USER_EXPLICIT"), Some("USER_INPUT")) => {
-                // The persisted log gives an explicit input but omits the
-                // outer execution id and terminal event. Partition on input
-                // for navigation, marking the request classification heuristic.
-                self.session.loops.push(LoopProjection {
-                    native_id: None,
-                    start_seq: seq,
-                    end_record_seq: None,
-                    outcome: None,
-                    model: None,
-                    usage: None,
-                    items: vec![step.message(semantic::HUMAN_REQUEST, basis::NO_MARKER)],
-                });
-            }
-            (Some("MODEL"), Some("PLANNER_RESPONSE")) => self.planner_response(&step),
-            (Some("SYSTEM" | "SYSTEM_SDK"), Some("SYSTEM_MESSAGE"))
-                if string(value, "content").is_some() =>
-            {
-                self.push_item(step.message(semantic::RUNTIME_UNKNOWN, basis::NATIVE_SUBTYPE));
-            }
-            (Some("SYSTEM"), Some("ERROR_MESSAGE")) => {
-                let mut item = step.message(semantic::RUNTIME_NOTICE, basis::NATIVE_SUBTYPE);
-                if item.preview.is_none() {
-                    item.preview = step.blob("error");
-                }
-                self.push_item(item);
-            }
-            // Generic display rows and checkpoints have no reliable call
-            // identity or explicit readable-summary contract in this Source.
-            _ => {}
-        }
+        let max_text_bytes = self.max_text_bytes;
+        project_step(self, seq, value, max_text_bytes);
     }
+}
 
-    fn planner_response(&mut self, step: &Step<'_>) {
-        if let Some(active) = self.session.loops.last_mut()
-            && let Some(model) = string(step.value, "model")
-        {
-            active.model = Some(Model {
-                id: model.to_owned(),
-                effort: None,
-                context_window: None,
+fn project_step(target: &mut impl StepTarget, seq: u64, value: &Value, max_text_bytes: usize) {
+    let step = Step {
+        seq,
+        value,
+        max_text_bytes,
+    };
+    match (string(value, "source"), string(value, "type")) {
+        (Some("USER_EXPLICIT"), Some("USER_INPUT")) => {
+            // The persisted log gives an explicit input but omits the
+            // outer execution id and terminal event. Partition on input
+            // for navigation, marking the request classification heuristic.
+            target.open_loop(LoopProjection {
+                native_id: None,
+                start_seq: seq,
+                end_record_seq: None,
+                outcome: None,
+                model: None,
+                usage: None,
+                items: vec![step.message(semantic::HUMAN_REQUEST, basis::NO_MARKER)],
             });
         }
-        if let Some(thinking) = step.blob("thinking") {
-            self.push_item(step.item(
-                semantic::AGENT_REASONING,
-                basis::NATIVE_SUBTYPE,
-                Some(thinking),
-                ItemDetail::Reasoning {
-                    representation: ReasoningRepresentation::Full,
-                },
-            ));
+        (Some("MODEL"), Some("PLANNER_RESPONSE")) => project_planner_response(target, &step),
+        (Some("SYSTEM" | "SYSTEM_SDK"), Some("SYSTEM_MESSAGE"))
+            if string(value, "content").is_some() =>
+        {
+            target.push_item(step.message(semantic::RUNTIME_UNKNOWN, basis::NATIVE_SUBTYPE));
         }
-        if string(step.value, "content").is_some() {
-            self.push_item(
-                step.message(semantic::AGENT_COMMENTARY, basis::PHASE_FALLBACK_COMMENTARY),
-            );
-        }
-        if let Some(calls) = step.value.get("tool_calls").and_then(Value::as_array) {
-            for (position, call) in calls.iter().enumerate() {
-                if let Some(name) = string(call, "name") {
-                    self.push_item(step.tool_call(position, call, name));
-                }
+        (Some("SYSTEM"), Some("ERROR_MESSAGE")) => {
+            let mut item = step.message(semantic::RUNTIME_NOTICE, basis::NATIVE_SUBTYPE);
+            if item.preview.is_none() {
+                item.preview = step.blob("error");
             }
+            target.push_item(item);
         }
+        // Generic display rows and checkpoints have no reliable call
+        // identity or explicit readable-summary contract in this Source.
+        _ => {}
     }
+}
 
-    fn push_item(&mut self, item: ItemProjection) {
-        if let Some(active) = self.session.loops.last_mut() {
-            active.items.push(item);
-        } else {
-            self.session.items.push(item);
+fn project_planner_response(target: &mut impl StepTarget, step: &Step<'_>) {
+    if let Some(model) = string(step.value, "model") {
+        target.set_active_loop_model(Model {
+            id: model.to_owned(),
+            effort: None,
+            context_window: None,
+        });
+    }
+    if let Some(thinking) = step.blob("thinking") {
+        target.push_item(step.item(
+            semantic::AGENT_REASONING,
+            basis::NATIVE_SUBTYPE,
+            Some(thinking),
+            ItemDetail::Reasoning {
+                representation: ReasoningRepresentation::Full,
+            },
+        ));
+    }
+    if string(step.value, "content").is_some() {
+        target
+            .push_item(step.message(semantic::AGENT_COMMENTARY, basis::PHASE_FALLBACK_COMMENTARY));
+    }
+    if let Some(calls) = step.value.get("tool_calls").and_then(Value::as_array) {
+        for (position, call) in calls.iter().enumerate() {
+            if let Some(name) = string(call, "name") {
+                target.push_item(step.tool_call(position, call, name));
+            }
         }
     }
 }
