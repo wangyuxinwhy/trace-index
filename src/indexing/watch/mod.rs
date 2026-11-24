@@ -683,9 +683,15 @@ impl PathFilter {
             }
         }
         // Inside an Antigravity conversation tree, ignore thousands of non-transcript
-        // files under `.system_generated/steps/` and artifacts.
+        // files under `.system_generated/steps/` and artifacts, and skip compact
+        // `transcript.jsonl` notifications whenever sibling `transcript_full.jsonl`
+        // already exists on disk (which always shadows it during discovery).
         if is_inside_antigravity_brain(path) {
-            return antigravity::transcript(path).is_some();
+            return match antigravity::transcript(path) {
+                Some((_, true)) => true,
+                Some((_, false)) => !path.with_file_name("transcript_full.jsonl").is_file(),
+                None => false,
+            };
         }
         true
     }
@@ -891,6 +897,35 @@ mod tests {
         assert!(filter.accepts(&PathBuf::from(
             "/tmp/brain/12345678-1234-1234-1234-123456789abc/.system_generated/logs/transcript.jsonl"
         )));
+    }
+
+    #[test]
+    fn path_filter_skips_antigravity_short_transcript_when_full_sibling_exists() {
+        let dir = tempdir().expect("tempdir");
+        let logs = dir
+            .path()
+            .join("brain")
+            .join("12345678-1234-1234-1234-123456789abc")
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).expect("create logs dir");
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        std::fs::write(&short, "{}\n").expect("write short");
+
+        let db = dir.path().join("index.sqlite");
+        let filter = PathFilter::new(&db, &[], &BTreeSet::new());
+        assert!(
+            filter.accepts(&short),
+            "short transcript must be accepted while no full sibling exists"
+        );
+
+        std::fs::write(&full, "{}\n").expect("write full");
+        assert!(
+            !filter.accepts(&short),
+            "short transcript must be skipped once transcript_full.jsonl exists"
+        );
+        assert!(filter.accepts(&full));
     }
 
     #[test]
