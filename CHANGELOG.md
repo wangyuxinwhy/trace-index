@@ -2,6 +2,15 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.5.6] - 2026-11-24
+
+### Changed
+
+- Add a true `O(tail)` append-only fast path for Antigravity transcripts (`PR #32`):
+  - Verify `[0..indexed_bytes]` cryptographically in a single 256 KiB chunked pass while seeding the new whole-prefix `BLAKE3` hasher, then read and project only newly appended tail Records into a compact tail delta without re-parsing historical prefix lines or loading existing `trace_records`, `domain_loops`, `domain_items`, or `item_records` rows.
+  - Produces bit-identical database state to a full `--rebuild` and falls back cleanly to a transactional rebuild on any prefix modification, truncation, or concurrent state change; accelerates hot 34.3 MB Antigravity single-step appends by **4.1x** wall / **5.5x** sync / **16.4x** persist under Normal QoS and **7.3x–37.7x** wall / **23x–35.5x** persist under macOS Background QoS (`index watch`).
+- Skip redundant `index watch` notifications for Antigravity compact `transcript.jsonl` files when a sibling `transcript_full.jsonl` already exists on disk (`PR #33`), avoiding wasted database opens and shadow rejections during active conversations. Storage Format 4 is unchanged; existing Format 4 indexes require no reindexing.
+
 ## [0.5.5] - 2026-11-23
 
 ### Added
