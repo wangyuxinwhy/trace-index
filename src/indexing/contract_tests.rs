@@ -1945,3 +1945,318 @@ fn append_only_fast_path_matches_full_rebuild_and_recovers_from_prefix_rewrite()
     assert_eq!(rebuilt.rebuilt_files, 1);
     assert_eq!(rebuilt.source_results[0].action, "rebuilt");
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotRecord {
+    seq: i64,
+    byte_offset: i64,
+    byte_length: i64,
+    raw_hash: String,
+    ts_ms: Option<i64>,
+    native_type: Option<String>,
+    parse_status: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotItem {
+    loop_ordinal: Option<i64>,
+    loop_position: Option<i64>,
+    occurred_at: Option<i64>,
+    semantic: String,
+    witness_seqs: Vec<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FullDbSnapshot {
+    sources: Vec<(String, i64, i64, String, String)>,
+    records: Vec<SnapshotRecord>,
+    loops: Vec<(i64, i64, Option<String>, i64)>,
+    items: Vec<SnapshotItem>,
+    search_hits: Vec<String>,
+    term_hits: Vec<String>,
+}
+
+fn snapshot_antigravity_items(conn: &Connection) -> Vec<SnapshotItem> {
+    let raw_items: Vec<(i64, SnapshotItem)> = conn
+        .prepare(
+            "SELECT i.id, l.ordinal, i.loop_position, i.occurred_at, i.semantic
+               FROM domain_items i
+               LEFT JOIN domain_loops l ON l.id = i.loop_id
+              ORDER BY i.id",
+        )
+        .expect("prep items")
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                SnapshotItem {
+                    loop_ordinal: r.get(1)?,
+                    loop_position: r.get(2)?,
+                    occurred_at: r.get(3)?,
+                    semantic: r.get(4)?,
+                    witness_seqs: Vec::new(),
+                },
+            ))
+        })
+        .expect("query items")
+        .collect::<Result<_, _>>()
+        .expect("collect items");
+    raw_items
+        .into_iter()
+        .map(|(id, mut item)| {
+            item.witness_seqs = conn
+                .prepare(
+                    "SELECT r.seq FROM item_records ir
+                       JOIN trace_records r ON r.id = ir.record_id
+                      WHERE ir.item_id = ?1 ORDER BY r.seq",
+                )
+                .expect("prep witnesses")
+                .query_map([id], |r| r.get(0))
+                .expect("query witnesses")
+                .collect::<Result<_, _>>()
+                .expect("collect witnesses");
+            item
+        })
+        .collect()
+}
+
+fn snapshot_antigravity_db(store: &Store) -> FullDbSnapshot {
+    let conn = store.connection();
+    let sources = conn
+        .prepare(
+            "SELECT adapter, indexed_bytes, indexed_lines, indexed_fingerprint, status
+               FROM trace_sources ORDER BY id",
+        )
+        .expect("prep sources")
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .expect("query sources")
+        .collect::<Result<_, _>>()
+        .expect("collect sources");
+    let records = conn
+        .prepare(
+            "SELECT seq, byte_offset, byte_length, raw_hash, ts_ms, native_type, parse_status
+               FROM trace_records ORDER BY seq",
+        )
+        .expect("prep records")
+        .query_map([], |r| {
+            Ok(SnapshotRecord {
+                seq: r.get(0)?,
+                byte_offset: r.get(1)?,
+                byte_length: r.get(2)?,
+                raw_hash: r.get(3)?,
+                ts_ms: r.get(4)?,
+                native_type: r.get(5)?,
+                parse_status: r.get(6)?,
+            })
+        })
+        .expect("query records")
+        .collect::<Result<_, _>>()
+        .expect("collect records");
+    let loops = conn
+        .prepare(
+            "SELECT l.ordinal, l.session_position, l.model, r.seq
+               FROM domain_loops l
+               JOIN trace_records r ON r.id = l.start_record_id
+              ORDER BY l.ordinal",
+        )
+        .expect("prep loops")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("query loops")
+        .collect::<Result<_, _>>()
+        .expect("collect loops");
+    let search_hits = conn
+        .prepare(
+            "SELECT b.text FROM item_search s
+               JOIN domain_items i ON i.id = s.rowid
+               JOIN content_blobs b ON b.id = json_extract(i.semantic, '$.value.text.blob_id')
+              WHERE item_search MATCH trigram_query('verify_tail')
+              ORDER BY i.id",
+        )
+        .expect("prep fts")
+        .query_map([], |r| r.get(0))
+        .expect("query fts")
+        .collect::<Result<_, _>>()
+        .expect("collect fts");
+    let term_hits = conn
+        .prepare(
+            "SELECT b.text FROM item_search_terms s
+               JOIN domain_items i ON i.id = s.rowid
+               JOIN content_blobs b ON b.id = json_extract(i.semantic, '$.value.text.blob_id')
+              WHERE item_search_terms MATCH search_query('verify_tail')
+              ORDER BY i.id",
+        )
+        .expect("prep terms")
+        .query_map([], |r| r.get(0))
+        .expect("query terms")
+        .collect::<Result<_, _>>()
+        .expect("collect terms");
+    FullDbSnapshot {
+        sources,
+        records,
+        loops,
+        items: snapshot_antigravity_items(conn),
+        search_hits,
+        term_hits,
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "end-to-end Antigravity tail equivalence test exercises 0-loop, model update, shell parse, new loop, noise-only, and prefix-rewrite fallback"
+)]
+fn antigravity_tail_append_matches_full_rebuild_across_all_step_shapes() {
+    use std::io::Write as _;
+
+    let traces = tempdir().expect("trace dir");
+    let logs = traces
+        .path()
+        .join("brain")
+        .join("11111111-2222-3333-4444-555555555555")
+        .join(".system_generated")
+        .join("logs");
+    fs::create_dir_all(&logs).expect("create logs dir");
+    let trace = logs.join("transcript_full.jsonl");
+
+    // Stage 1: Session starts with 0 Loops (session-level SYSTEM_MESSAGE only).
+    write_jsonl(
+        &trace,
+        &[json!({
+            "step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "status": "DONE", "created_at": "2026-11-24T01:00:00Z",
+            "content": "boot verify_tail context"
+        })],
+    );
+    let db_dir = tempdir().expect("db dir");
+    let mut inc = Store::open(&db_dir.path().join("inc.sqlite")).expect("open inc");
+    let opts = options(false);
+    let r1 = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("stage 1");
+    assert_eq!(r1.indexed_files, 1);
+
+    // Stage 2: Append another 0-loop PLANNER_RESPONSE (model ignored!) + first USER_INPUT (Loop 0).
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&trace)
+        .expect("open append");
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-11-24T01:00:01Z",
+            "model": "ignored-before-loop", "content": "pre-loop verify_tail note"
+        })
+    )
+    .expect("append pre-loop planner");
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 2, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-11-24T01:00:02Z",
+            "content": "run verify_tail loop 0"
+        })
+    )
+    .expect("append user 0");
+    let r2 = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("stage 2");
+    assert_eq!(r2.source_results[0].action, "appended");
+
+    // Stage 3: Append PLANNER_RESPONSE updating Loop 0 model + reasoning + shell run_command.
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-11-24T01:00:03Z",
+            "model": "gemini-2.5", "thinking": "inspecting shell",
+            "content": "running verify_tail cmd",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cargo test --locked && echo ok", "Cwd": "/repo"}}]
+        })
+    )
+    .expect("append planner loop 0");
+    let r3 = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("stage 3");
+    assert_eq!(r3.source_results[0].action, "appended");
+
+    // Stage 4: Append noise-only GENERIC + CHECKPOINT (0 new items, 2 new records).
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-24T01:00:04Z", "content": "noise"})
+    )
+    .expect("append generic");
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 5, "source": "SYSTEM", "type": "CHECKPOINT", "status": "DONE", "created_at": "2026-11-24T01:00:05Z", "content": "ckpt"})
+    )
+    .expect("append checkpoint");
+    let r4 = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("stage 4");
+    assert_eq!(r4.source_results[0].action, "appended");
+    assert_eq!(r4.indexed_records, 2);
+
+    // Stage 5: Update Loop 0 model again, then open Loop 1 + ERROR_MESSAGE + Loop 1 PLANNER_RESPONSE.
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-11-24T01:00:06Z",
+            "model": "gemini-3.0", "content": "wrap loop 0 verify_tail"
+        })
+    )
+    .expect("append loop 0 model update");
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 7, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": "2026-11-24T01:00:07Z",
+            "content": "start verify_tail loop 1"
+        })
+    )
+    .expect("append user 1");
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 8, "source": "SYSTEM", "type": "ERROR_MESSAGE",
+            "status": "ERROR", "created_at": "2026-11-24T01:00:08Z",
+            "error": "transient failure"
+        })
+    )
+    .expect("append error");
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 9, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "created_at": "2026-11-24T01:00:09Z",
+            "model": "gemini-3.1", "content": "done verify_tail loop 1"
+        })
+    )
+    .expect("append loop 1 answer");
+    let r5 = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("stage 5");
+    assert_eq!(r5.source_results[0].action, "appended");
+
+    // Compare full DB state against a clean fresh build of the exact same trace.
+    let mut fresh = Store::open(&db_dir.path().join("fresh.sqlite")).expect("open fresh");
+    let rf = index_paths(&mut fresh, std::slice::from_ref(&trace), &opts).expect("fresh build");
+    assert_eq!(r5.indexed_items, rf.indexed_items);
+    assert_eq!(
+        snapshot_antigravity_db(&inc),
+        snapshot_antigravity_db(&fresh)
+    );
+
+    // Mutate one byte inside the prefix while growing the file -> must fall back to rebuild.
+    let raw = fs::read_to_string(&trace).expect("read trace");
+    let mutated = format!(
+        "{}{}\n",
+        raw.replacen("boot verify_tail context", "boot verify_tail mutated", 1),
+        json!({"step_index": 10, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-24T01:00:10Z"})
+    );
+    fs::write(&trace, mutated).expect("write mutated");
+    let rebuilt = index_paths(&mut inc, std::slice::from_ref(&trace), &opts).expect("rebuild");
+    assert_eq!(rebuilt.rebuilt_files, 1);
+    assert_eq!(rebuilt.source_results[0].action, "rebuilt");
+}

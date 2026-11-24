@@ -38,7 +38,7 @@ use crate::storage::db::{
     IndexingPolicy, SourceState, Store, display_database_path, source_state, to_sql_i64,
 };
 use crate::storage::persist::{clear_projection, write_session};
-use crate::storage::persist_diff::{IncrementalSyncOptions, sync_session};
+use crate::storage::persist_diff::{IncrementalSyncOptions, append_antigravity_tail, sync_session};
 
 pub(super) const MAX_ADAPTER_DETECTION_BYTES: usize = 1024 * 1024;
 
@@ -731,6 +731,22 @@ fn try_index_append_only_source(
         );
     }
 
+    if opened.adapter == AdapterKind::Antigravity && existing.indexed_lines > 0 {
+        return try_index_antigravity_tail(
+            store,
+            discovered,
+            path_string,
+            existing,
+            opened,
+            options,
+            blobs,
+            shell_parser,
+            record_buffer,
+            telemetry,
+            progress,
+        );
+    }
+
     let Some(prepared) = scan_append_only_off_lock(
         &discovered.path,
         opened,
@@ -799,6 +815,250 @@ fn try_update_unchanged_tail(
         discovered.file_size,
         opened.incomplete_tail,
     )))
+}
+
+struct PreparedAntigravityTail {
+    session_uuid: String,
+    delta: antigravity::AntigravityTailDelta,
+    new_records: Vec<PreparedAppendRecord>,
+    fingerprint: String,
+    line_count: u64,
+    counts: ScanCounts,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "O(tail) Antigravity append path threads caller scratch buffers and telemetry without reallocating"
+)]
+fn try_index_antigravity_tail(
+    store: &mut Store,
+    discovered: &DiscoveredFile,
+    path_string: &str,
+    existing: &SourceState,
+    opened: &mut OpenedSource<'_>,
+    options: &IndexOptions,
+    blobs: &mut BlobCache,
+    shell_parser: &mut syntax::ShellParser,
+    record_buffer: &mut Vec<u8>,
+    telemetry: &mut IndexTelemetry,
+    progress: &mut dyn ProgressObserver,
+) -> Result<Option<SourceIndexResult>> {
+    let Some(prepared) = scan_antigravity_tail_off_lock(
+        &discovered.path,
+        opened,
+        existing,
+        options,
+        record_buffer,
+        telemetry,
+        progress,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    commit_antigravity_tail(
+        store,
+        discovered,
+        path_string,
+        existing,
+        opened,
+        *prepared,
+        blobs,
+        shell_parser,
+        options.max_text_bytes,
+        telemetry,
+    )
+}
+
+fn scan_antigravity_tail_off_lock(
+    canonical: &Path,
+    opened: &mut OpenedSource<'_>,
+    existing: &SourceState,
+    options: &IndexOptions,
+    record_buffer: &mut Vec<u8>,
+    telemetry: &mut IndexTelemetry,
+    progress: &mut dyn ProgressObserver,
+) -> Result<Option<Box<PreparedAntigravityTail>>> {
+    let Some((session_uuid, _full)) = antigravity::transcript(canonical) else {
+        return Ok(None);
+    };
+    let fingerprint_started = Instant::now();
+    let Some(mut full_hasher) = opened.source.verify_and_seed_prefix(
+        existing.indexed_bytes,
+        &existing.indexed_fingerprint,
+        opened.indexed_limit,
+    )?
+    else {
+        telemetry.record_duration(IndexPhase::Fingerprint, fingerprint_started.elapsed());
+        telemetry.add_fingerprint_bytes(existing.indexed_bytes);
+        return Ok(None);
+    };
+    telemetry.record_duration(IndexPhase::Fingerprint, fingerprint_started.elapsed());
+    telemetry.add_fingerprint_bytes(existing.indexed_bytes);
+
+    let mut reader = opened
+        .source
+        .bounded_reader_from(existing.indexed_bytes, opened.indexed_limit)
+        .with_context(|| format!("failed to seek tail of {}", canonical.display()))?;
+    let mut projector = antigravity::AntigravityTailProjector::new(options.max_text_bytes);
+    let mut new_records = Vec::new();
+    let mut counts = ScanCounts::default();
+    let mut byte_offset = existing.indexed_bytes;
+    let mut seq = existing.indexed_lines;
+
+    loop {
+        let read_started = Instant::now();
+        let read = read_bounded_record_into(
+            &mut reader,
+            options.max_record_bytes,
+            Some(&mut full_hasher),
+            true,
+            record_buffer,
+        )?;
+        telemetry.record_duration(IndexPhase::Read, read_started.elapsed());
+        let RecordReadInto::Complete {
+            oversized,
+            byte_length,
+            consumed_bytes,
+            raw_hash,
+        } = read
+        else {
+            break;
+        };
+
+        let project_started = Instant::now();
+        let parsed = (!oversized).then(|| serde_json::from_slice::<Value>(record_buffer));
+        let facts = classify_record(AdapterKind::Antigravity, parsed.as_ref(), true, &mut counts);
+        if let Some(Ok(value)) = &parsed {
+            projector.push(seq, value);
+        }
+        if let Some(facts) = facts {
+            new_records.push(PreparedAppendRecord {
+                seq,
+                byte_offset,
+                byte_length,
+                raw_hash,
+                oversized,
+                facts,
+            });
+            counts.new_records += 1;
+        }
+        telemetry.record_duration(IndexPhase::Project, project_started.elapsed());
+
+        telemetry.add_processed_bytes(consumed_bytes);
+        byte_offset += consumed_bytes;
+        seq += 1;
+        if seq.is_multiple_of(2048) {
+            progress.update(
+                telemetry.progress(IndexPhase::Project, Some(canonical)),
+                false,
+            );
+        }
+    }
+
+    if byte_offset != opened.indexed_limit {
+        return Ok(None);
+    }
+
+    let fingerprint = full_hasher.finalize().to_hex().to_string();
+    Ok(Some(Box::new(PreparedAntigravityTail {
+        session_uuid,
+        delta: projector.finish(),
+        new_records,
+        fingerprint,
+        line_count: seq,
+        counts,
+    })))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tail commit receives the off-lock delta alongside store caches and telemetry"
+)]
+fn commit_antigravity_tail(
+    store: &mut Store,
+    discovered: &DiscoveredFile,
+    path_string: &str,
+    existing: &SourceState,
+    opened: &OpenedSource<'_>,
+    mut prepared: PreparedAntigravityTail,
+    blobs: &mut BlobCache,
+    shell_parser: &mut syntax::ShellParser,
+    max_text_bytes: usize,
+    telemetry: &mut IndexTelemetry,
+) -> Result<Option<SourceIndexResult>> {
+    let transaction = store
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start index transaction")?;
+    if !source_state_matches_snapshot(source_state(&transaction, path_string)?.as_ref(), existing)
+        || antigravity_replacement(&transaction, opened.adapter, &discovered.path)?.is_some()
+    {
+        return Ok(None);
+    }
+
+    let persist_started = Instant::now();
+    let mut new_record_ids = HashMap::with_capacity(prepared.new_records.len());
+    for record in &prepared.new_records {
+        let started = Instant::now();
+        let record_id = insert_record(
+            &transaction,
+            existing.id,
+            record.seq,
+            record.byte_offset,
+            record.byte_length,
+            &record.raw_hash,
+            record.oversized,
+            &record.facts,
+        )?;
+        telemetry.record_persist(PersistTable::TraceRecords, started.elapsed());
+        new_record_ids.insert(record.seq, record_id);
+        telemetry.count_record();
+    }
+    let Some(write_counts) = append_antigravity_tail(
+        &transaction,
+        existing.id,
+        &prepared.session_uuid,
+        &mut prepared.delta,
+        &new_record_ids,
+        blobs,
+        shell_parser,
+        max_text_bytes,
+        telemetry,
+    )?
+    else {
+        return Ok(None);
+    };
+    telemetry.record_duration(IndexPhase::Persist, persist_started.elapsed());
+
+    finalize_source_row(
+        &transaction,
+        existing.id,
+        opened.adapter,
+        discovered.file_size,
+        discovered.modified_ns,
+        opened.indexed_limit,
+        prepared.line_count,
+        &prepared.fingerprint,
+        opened.incomplete_tail,
+    )?;
+    let commit_started = Instant::now();
+    transaction.commit().context("failed to commit index")?;
+    telemetry.record_duration(IndexPhase::Commit, commit_started.elapsed());
+
+    Ok(Some(SourceIndexResult {
+        error: None,
+        path: path_string.to_owned(),
+        adapter: opened.adapter.name().to_owned(),
+        action: "appended".to_owned(),
+        indexed_records: prepared.counts.new_records,
+        indexed_items: write_counts.items,
+        indexed_bytes: opened.indexed_limit,
+        file_size: discovered.file_size,
+        malformed_records: prepared.counts.malformed,
+        oversized_records: prepared.counts.oversized,
+        incomplete_tail: opened.incomplete_tail,
+    }))
 }
 
 #[allow(
