@@ -25,6 +25,6 @@ Blob access is demand-driven. Role counts, timelines, Loop usage, tool duration,
 
 The deterministic text estimator is deliberately separate from model usage. It estimates corpus size with one stable rule over complete Source text. `loops.usage` instead preserves normalized token counts reported by model executions. The two values answer different questions and must not be compared as if they shared a tokenizer or observation boundary.
 
-Full-text search is bounded by scope rather than by size alone: only Semantic text explicitly selected by the Item contract enters `item_search` and `item_search_terms`. Tool output is not included. A search miss therefore means no indexed candidate was found, not that every raw Record value was scanned.
+Full-text search is bounded by scope rather than by size alone: only Semantic text explicitly selected by the Item contract enters `item_search`. Tool output is not included. A search miss therefore means no indexed candidate was found, not that every raw Record value was scanned.
 
 This is why base64 image payloads are not returned as ordinary model text. The normal representation carries media type, encoded and decoded sizes, hash, and a Record/JSON-Pointer reference. The Agent can inspect that reference and explicitly extract the image when visual evidence is actually needed.

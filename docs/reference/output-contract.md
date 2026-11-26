@@ -9,27 +9,27 @@ Machine-readable commands write one compact JSON envelope followed by one newlin
 
 `docs get` writes Markdown by default (`--list-sections` lists headings and `--section <HEADING>` extracts matching sections without printing the full page). `--output json` returns the document or section list in the same JSON envelope.
 
-`query run` writes the JSON envelope by default (`--format json`) and also supports `--format tsv` for tab-separated tabular output on stdout (detailed under [Bounded query results](#bounded-query-results)).
+`query run` and `query template run` write the JSON envelope by default (`--format json`) and also support `--format tsv` for tab-separated tabular output on stdout (detailed under [Bounded query results](#bounded-query-results)). `query template run --render` opens the index read-only to resolve typed parameters without executing the SQL, returning a JSON envelope containing `template`, `origin`, `sql`, `params`, `default_limit`, and optional `resolved`.
 
 Process and stream behavior:
 
 - Success exits 0 and writes the result to stdout.
 - A command-shape or Clap argument error exits 2 and writes usage to stderr.
 - A runtime error normally exits 1, writes a diagnostic to stderr, and leaves stdout empty.
-- `config check` returns its complete read-only findings on stdout. Error issues make `valid=false` and exit 1; Warning-only reports exit 0 even when `configured_sync_ready=false` because positional `index sync PATHS...` remains valid.
+- `config check` returns its complete read-only findings on stdout (including configured roots, database path ancestry, existing database Storage Format compatibility, metadata store, and user SQL templates). Error issues make `valid=false` and exit 1; Warning-only reports exit 0 even when `configured_sync_ready=false` because positional `index sync PATHS...` remains valid.
 - `index sync` returns the complete synchronization report on stdout and exits 1 when some Sources fail to read, decode, or index, so callers can inspect both the successful and failed Source results.
 
 `index sync` emits progress on stderr (`--progress auto|human|ndjson|off`), and `index watch run` emits NDJSON lifecycle events on stderr while returning a final JSON summary on stdout at shutdown. Neither writes diagnostics into the stdout JSON envelope.
 
 ## Bounded query results
 
-`query run` bounds execution time, row count, cell size, and serialized row bytes. Its report includes `complete`, optional `incomplete_reason`, optional `hint`, and `cells_truncated`. `complete` states whether every result row was returned; `incomplete_reason` is `row_limit` or `output_budget`. When `complete` is false, `hint` explains why only part of the result was returned and suggests a next query shape. An incomplete report is a successful bounded observation, not an exhaustive result.
+`query run` and `query template run` bound execution time, row count (templates supply a `default_limit` unless `--limit` is passed explicitly), cell size, and serialized row bytes. Their JSON reports include `complete`, optional `incomplete_reason`, optional `hint`, and `cells_truncated`. `complete` states whether every result row was returned; `incomplete_reason` is `row_limit` or `output_budget`. When `complete` is false, `hint` explains why only part of the result was returned and suggests a next query shape. An incomplete report is a successful bounded observation, not an exhaustive result.
 
 `cells_truncated` is a separate boundary. A nonzero value means that many returned text or blob cells contain only a UTF-8-safe prefix because they reached `--max-cell-bytes`; the row set can still have `complete=true`. In that case `hint` explains how to retrieve selected values without mistaking prefixes for complete evidence.
 
-When `--format tsv` is passed to `query run`:
+When `--format tsv` is passed to `query run` or `query template run`:
 
-- Stdout begins with a header row of `SELECT` column names in projection order (even when zero rows match), followed by one physical line per returned row.
+- Stdout begins with a header row of `SELECT` column names in projection order (even when zero rows match), followed by one physical line per returned row. Template JSON envelope fields (`template`, `origin`, `resolved`) are omitted in TSV mode.
 - Column names and cell strings escape `\`, tab (`\t`), LF (`\n`), and CR (`\r`) as `\\`, `\t`, `\n`, and `\r` (not RFC 4180 quoting), so every line keeps `columns - 1` tab delimiters. Note that JSON strings selected as text cells will have their backslashes escaped a second time.
 - SQL `NULL` and empty string `""` both render as an empty field; use `--format json` or explicit SQL (`IS NULL`, `COALESCE`) when distinguishing absent values from empty strings matters.
 - SQLite `BLOB` cells serialize as compact JSON (`{"byte_length":...,"encoding":"hex","value":"..."}`) and are then TSV-escaped.

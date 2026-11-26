@@ -31,11 +31,12 @@ trace-index index sync
 trace-index index status
 ```
 
-Discover the version-matched domain model and SQL contract before querying:
+Discover the version-matched domain model, built-in SQL templates, and public SQL contract before querying:
 
 ```bash
 trace-index --help
-trace-index docs get start-here
+trace-index query template run recent-sessions --format tsv
+trace-index query template list
 trace-index schema list
 trace-index schema get items --compact
 trace-index query run \
@@ -46,9 +47,10 @@ Read commands never synchronize or mutate the index. Check `index status` for co
 
 ## For Agents
 
-Root Help establishes the complete conceptual model needed to query correctly. Conditional workflows, exact Semantic value shapes, and search mechanics are available through bundled, version-matched documentation:
+Root Help establishes the complete conceptual model and built-in SQL template catalog needed to query correctly. Conditional workflows, exact Semantic value shapes, and search mechanics are available through bundled, version-matched documentation:
 
 ```bash
+trace-index query template list
 trace-index docs list
 trace-index docs get how-to/query-evidence
 trace-index docs get how-to/search-literals

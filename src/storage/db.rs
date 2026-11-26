@@ -463,7 +463,7 @@ fn register_query_functions(connection: &Connection, storage_format: u32) -> Res
                 ));
             }
             let literal = context.get::<String>(0)?;
-            make_trigram_query(&literal).map_err(|message| {
+            make_trigram_query(&literal, storage_format).map_err(|message| {
                 rusqlite::Error::UserFunctionError(
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into(),
                 )
@@ -531,12 +531,20 @@ fn register_query_functions(connection: &Connection, storage_format: u32) -> Res
         .context("failed to register blob_text SQL function")
 }
 
-fn make_trigram_query(literal: &str) -> std::result::Result<String, &'static str> {
+fn make_trigram_query(
+    literal: &str,
+    storage_format: u32,
+) -> std::result::Result<String, &'static str> {
     let characters = literal.chars().collect::<Vec<_>>();
     if characters.len() < 3 {
+        if storage_format == 4 {
+            return Err("trigram_query requires at least 3 Unicode characters; \
+                 use item_search_terms(search_query('...')) for 2+ character words or CJK terms, \
+                 or narrow by source, session, role, or time and use instr()");
+        }
         return Err("trigram_query requires at least 3 Unicode characters; \
-             use item_search_terms(search_query('...')) for 2+ character words or CJK terms, \
-             or narrow by source, session, role, or time and use instr()");
+             narrow by source, session, role, or time and use instr(), \
+             or rebuild the index as Storage Format 5 to use item_search(search_query('...'))");
     }
 
     Ok(characters
@@ -672,14 +680,18 @@ mod tests {
     #[test]
     fn builds_escaped_overlapping_trigram_queries() {
         assert_eq!(
-            make_trigram_query("智能体使用").expect("trigram query"),
+            make_trigram_query("智能体使用", 4).expect("trigram query"),
             "\"智能体\" AND \"能体使\" AND \"体使用\""
         );
         assert_eq!(
-            make_trigram_query("a\"bc").expect("escaped trigram query"),
+            make_trigram_query("a\"bc", 4).expect("escaped trigram query"),
             "\"a\"\"b\" AND \"\"\"bc\""
         );
-        assert!(make_trigram_query("中文").is_err());
+        let err_v4 = make_trigram_query("中文", 4).expect_err("short literal on Format 4");
+        assert!(err_v4.contains("item_search_terms"));
+        let err_v3 = make_trigram_query("中文", 3).expect_err("short literal on Format 3");
+        assert!(!err_v3.contains("item_search_terms"));
+        assert!(err_v3.contains("Storage Format 5"));
     }
 
     #[test]

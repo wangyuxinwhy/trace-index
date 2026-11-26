@@ -5,7 +5,7 @@ description: Public relations and their evidence semantics.
 
 # Public SQL Schema
 
-Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` plus `item_search_terms` for candidate retrieval. The caller-owned `session_metadata` relation adds uninterpreted JSON associations. It is independent of Runtime evidence and is not another trace domain object.
+Trace Index publishes Source, Record, Session, Loop, and Item as five read-only domain relations. It also publishes `blobs` for demand-driven text access and `item_search` for candidate retrieval. The caller-owned `session_metadata` relation adds uninterpreted JSON associations. It is independent of Runtime evidence and is not another trace domain object.
 
 Discover the exact names, columns, SQLite types, nullability, and descriptions from the running binary:
 
@@ -162,9 +162,9 @@ Use SQLite JSON functions for direct projection. For example, `json_each(source_
 
 ## Text retrieval
 
-`item_search` (trigram) and `item_search_terms` (pre-tokenized terms, split code identifiers, and CJK bigrams with `bm25()` ranking) are candidate indexes, not domain objects. Both index only Semantic text explicitly selected for retrieval; Runtime bookkeeping and tool output are not implicitly covered. Their `text` columns are contentless FTS `MATCH` operands, not readable copies of the text: selecting `text` returns `NULL`. Candidate output is `rowid`. Join that id to `items.item_id`, obtain the BlobRef selected by `semantic.role`, join `blobs`, and exact-check `blobs.text` because both candidate indexes are case-folded and broader than exact literal matching.
+`item_search` is the canonical FTS5 candidate index (Format 5+), not a domain object. It pre-tokenizes selected Semantic text into words, underscore-delimited segments, split code identifiers (`camelCase` / `snake_case`), and 2+ character CJK bigrams, supporting trailing `prefix*` queries on ≥4-character ASCII tokens and `bm25(item_search)` ranking. Runtime bookkeeping and tool output are not implicitly covered. Its `text` column is a contentless FTS `MATCH` operand, not a readable copy of the text: selecting `text` returns `NULL`. Candidate output is `rowid`. On Format 5+, queries against `item_search` must use `search_query('...')` (raw `MATCH` and `trigram_query('...')` are rejected with a hint). Join `rowid` to `items.item_id`, obtain the BlobRef selected by `semantic.role`, join `blobs`, and exact-check `blobs.text` because candidate retrieval is case-folded and broader than exact literal matching. Older Format 2, Format 3, and Format 4 databases remain readable in place (their `item_search` uses legacy `trigram_query('...')`, and Format 4 also exposes legacy `item_search_terms(search_query('...'))`).
 
-`blobs`, `item_search`, and `item_search_terms` are public because they provide access capabilities that the five domain relations do not provide cheaply: demand-driven large-text reads and indexed candidate retrieval. Search results still take their meaning and provenance from `items` and `records`.
+`blobs` and `item_search` are public because they provide access capabilities that the five domain relations do not provide cheaply: demand-driven large-text reads and indexed candidate retrieval. Search results still take their meaning and provenance from `items` and `records`.
 
 ## Public contract and private storage
 

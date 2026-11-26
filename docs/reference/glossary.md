@@ -37,7 +37,7 @@ An outer Agent execution lifecycle inside a Session. A Loop starts from the Adap
 
 ## Public Relation
 
-A stable SQL View or virtual table exposed through the bounded Query Plane. Five Public Relations publish the domain objects; `blobs`, `item_search`, and `item_search_terms` provide text access without adding domain entities. Storage tables remain readable for index-integrity debugging, but their names and shapes are implementation details.
+A stable SQL View or virtual table exposed through the bounded Query Plane. Five Public Relations publish the domain objects; `blobs` and `item_search` provide text access without adding domain entities. Storage tables remain readable for index-integrity debugging, but their names and shapes are implementation details.
 
 ## Query Plane
 

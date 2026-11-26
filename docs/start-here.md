@@ -28,15 +28,16 @@ Synchronization is explicit. Read commands never refresh or modify the index. `i
 
 ## 3. Discover the current contract
 
-Run the version-matched help once, then discover relation and column names:
+Run the version-matched help once, then discover available SQL templates, relations, and column names:
 
 ```bash
 trace-index --help
+trace-index query template list
 trace-index schema list
 trace-index schema get items blobs --compact
 ```
 
-Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions. `schema get` accepts one or more relation names in one call. The bundled help, documentation, and schema describe the running binary; do not substitute names remembered from another version.
+Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions. `schema get` accepts one or more relation names in one call. The bundled help, documentation, templates, and schema describe the running binary; do not substitute names remembered from another version.
 
 ## 4. Understand the five objects
 
@@ -54,18 +55,25 @@ Item ──cites──> one or more physical Records
 - `loops` identifies outer execution lifecycles inside Sessions.
 - `items` contains the individually queryable facts produced in those contexts.
 
-`blobs`, `item_search`, and `item_search_terms` are additional access relations. `blobs` resolves bounded Semantic text by id; `item_search` and `item_search_terms` retrieve candidates over selected text. None of them is another domain object.
+`blobs` and `item_search` are additional access relations. `blobs` resolves bounded Semantic text by id; `item_search` retrieves text-search candidates over selected Semantic text. Neither is another domain object.
 
-## 5. Read Items in a Loop
+## 5. Read Items in a Session or Loop
 
-Items in a Loop have a zero-based `loop_position`:
+For common navigation, start with a built-in SQL template and `--format tsv` (pass `--render` to inspect the exact SQL and bound parameters before customizing with `query run`):
 
 ```bash
-trace-index query run --stdin <<'SQL'
+trace-index query template run recent-sessions --format tsv
+trace-index query template run session-transcript -p session=1 --format tsv
+```
+
+For custom SQL, Items in a Loop have a zero-based `loop_position`:
+
+```bash
+trace-index query run --params-json '{"loop_id":1}' --stdin <<'SQL'
 SELECT loop_position,
        semantic
 FROM items
-WHERE loop_id = 1
+WHERE loop_id = :loop_id
 ORDER BY loop_position;
 SQL
 ```
@@ -117,16 +125,20 @@ Use `semantic` directly for roles and non-text values; such queries should not a
 
 ## 7. Search text, then confirm it
 
-Two contentless search access relations generate candidate `item_id` values (`rowid`):
+For most text searches, start with the built-in `search-sessions` and `search-items` templates:
 
-- Use `item_search_terms(search_query('...'))` for words, split code identifiers (`camelCase` / `snake_case`), multi-word queries, or 2+ character CJK terms, with optional `bm25(item_search_terms)` ranking.
-- Use `item_search(trigram_query('...'))` for 3+ character literal substrings or punctuation-bearing literals.
+```bash
+trace-index query template run search-sessions -p query='needle phrase' --format tsv
+trace-index query template run search-items -p query='needle phrase' -p contains='needle phrase' --format tsv
+```
+
+In custom SQL on Storage Format 5+, `item_search(search_query('...'))` is the single contentless FTS5 access relation that generates candidate `item_id` values (`rowid`) over words, underscore segments, split code identifiers (`camelCase` / `snake_case`), 2+ character CJK terms, and trailing `prefix*` lookups (≥4 ASCII characters), with optional `bm25(item_search)` ranking:
 
 ```sql
 WITH candidates AS MATERIALIZED (
   SELECT rowid AS item_id,
-         bm25(item_search_terms) AS score
-  FROM item_search_terms(search_query('needle phrase'))
+         bm25(item_search) AS score
+  FROM item_search(search_query('needle phrase'))
 )
 SELECT i.item_id,
        json_extract(i.semantic, '$.role') AS role,
@@ -146,9 +158,9 @@ LIMIT 20;
 
 Search retrieval is case-folded and intentionally broader than exact literal matching. A candidate is not proof of a match: join `rowid` to `items.item_id`, select the BlobRef defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()`.
 
-Both search relations cover only semantic text explicitly selected by the Item contract. For single-character literals or punctuation shorter than three characters, first narrow with `sessions`, `loops`, or `semantic.role`, then join the referenced Blobs and scan that smaller text set with `instr()`.
+`item_search` covers only semantic text explicitly selected by the Item contract (tool output is not indexed). For single-character or punctuation-only literals, first narrow with `sessions`, `loops`, or `semantic.role`, then join the referenced Blobs and scan that smaller text set with `instr()`.
 
-When the input contains only partial natural-language clues, use several literal anchors, compare compact candidate Sessions against the supplied scope, and expand only supported candidates. Do not dump every hit; preserve ambiguity when the available evidence does not identify one Session. The complete funnel and bounded SQL patterns are in `trace-index docs get how-to/search-literals`.
+When the input contains only partial natural-language clues, use several literal anchors, compare compact candidate Sessions against the supplied scope, and expand only supported candidates. Do not dump every hit; preserve ambiguity when the available evidence does not identify one Session. The complete funnel, Format 2/3/4 read-only compatibility notes, and bounded SQL patterns are in `trace-index docs get how-to/search-literals`.
 
 ## 8. Follow an Item to physical evidence
 

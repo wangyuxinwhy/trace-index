@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-/// Produces space-separated normalized tokens for `item_search_terms`.
+/// Produces space-separated normalized tokens for `item_search` (Format 5+).
 ///
 /// - Contiguous CJK runs of length >= 2 emit overlapping 2-grams in source
 ///   order so FTS5 `detail='full'` preserves exact character adjacency for 3+
@@ -73,7 +73,7 @@ pub(crate) fn tokenize_for_term_index(text: &str) -> String {
 }
 
 /// Converts a user search string into an FTS5 `MATCH` expression for
-/// `item_search_terms`.
+/// `item_search` (Format 5+, or legacy Format 4 `item_search_terms`).
 ///
 /// Whitespace-separated chunks and punctuation-delimited code segments are
 /// joined with `AND` so identifier sub-tokens never break phrase adjacency.
@@ -209,8 +209,8 @@ fn emit_ascii_ident_run(run: &str, out: &mut String) {
         if segment.is_empty() {
             continue;
         }
-        // Preserve each underscore-delimited segment verbatim (e.g. `gy_AlphaMind_Agent`
-        // emits `alphamind`, and `thread_7t_context` preserves `7t` before digit splitting).
+        // Preserve each underscore-delimited segment verbatim (e.g. `pkg_CoreEngine_Worker`
+        // emits `coreengine`, and `slot_7t_context` preserves `7t` before digit splitting).
         let seg_lower = segment.to_ascii_lowercase();
         if seg_lower.len() >= 2 && seg_lower != lower && emitted_extras.insert(seg_lower.clone()) {
             push_token(out, &seg_lower);
@@ -320,8 +320,8 @@ mod tests {
             "sqlite sq lite 覆盖 盖索 索引"
         );
         assert_eq!(
-            tokenize_for_term_index("gy_AlphaMind_Agent thread_7t_context"),
-            "gy_alphamind_agent gy alphamind agent alpha mind thread_7t_context thread 7t context"
+            tokenize_for_term_index("pkg_CoreEngine_Worker slot_7t_context"),
+            "pkg_coreengine_worker pkg coreengine worker core engine slot_7t_context slot 7t context"
         );
     }
 
