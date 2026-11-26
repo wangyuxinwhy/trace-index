@@ -7,7 +7,7 @@ description: Query indexed agent traces with trace-index when investigating sess
 
 <!-- generated: skill-version — run `UPDATE_DOCS=1 cargo test generated_documentation` to refresh -->
 
-> Version contract: written for `trace-index 0.6.0`. If `trace-index --version` differs, follow the installed binary's `--help` and refresh this skill with `trace-index docs get skill`.
+> Version contract: written for `trace-index 0.6.1`. If `trace-index --version` differs, follow the installed binary's `--help` and refresh this skill with `trace-index docs get skill`.
 
 <!-- /generated -->
 
