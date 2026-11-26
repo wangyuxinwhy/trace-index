@@ -120,13 +120,14 @@ fn collect_canonical_dir(dir: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()
 }
 
 fn collect_antigravity_logs(logs_dir: &Path, files: &mut BTreeSet<PathBuf>) {
-    for name in ["transcript.jsonl", "transcript_full.jsonl"] {
+    for name in ["transcript_full.jsonl", "transcript.jsonl"] {
         let candidate = logs_dir.join(name);
         if let Ok(meta) = fs::symlink_metadata(&candidate)
             && !meta.file_type().is_symlink()
             && meta.is_file()
         {
             files.insert(candidate);
+            return;
         }
     }
 }

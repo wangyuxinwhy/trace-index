@@ -2260,3 +2260,115 @@ fn antigravity_tail_append_matches_full_rebuild_across_all_step_shapes() {
     assert_eq!(rebuilt.rebuilt_files, 1);
     assert_eq!(rebuilt.source_results[0].action, "rebuilt");
 }
+
+#[test]
+fn multi_file_incremental_sync_uses_bulk_source_state_preload() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let traces = tempdir().expect("trace directory");
+    let mut paths = Vec::new();
+    for idx in 0..5 {
+        let trace = traces.path().join(format!("codex-{idx}.jsonl"));
+        write_jsonl(
+            &trace,
+            &[
+                json!({"type":"session_meta","payload":{"id":format!("bulk-session-{idx}"),"cwd":"/workspace"}}),
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"loop-1"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":format!("hello {idx}")}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+            ],
+        );
+        paths.push(trace);
+    }
+
+    let db_dir = tempdir().expect("temporary index directory");
+    let db_path = db_dir.path().join("index.sqlite");
+    {
+        let mut store = Store::open(&db_path).expect("open index");
+        let initial =
+            index_paths(&mut store, &[traces.path().to_path_buf()], &options(false)).expect("seed");
+        assert_eq!(initial.indexed_files, 5);
+        assert_eq!(initial.unchanged_files, 0);
+    }
+
+    // Reopen a fresh connection (empty prepared-statement cache) and run a
+    // pure no-op multi-file sync. Only the single bulk `load_all_source_states`
+    // query should ever touch `trace_sources.path` — zero per-file lookups.
+    {
+        let mut store = Store::open(&db_path).expect("reopen index");
+        let trace_source_path_reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&trace_source_path_reads);
+        store
+            .connection()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name: "trace_sources",
+                    column_name: "path",
+                } = context.action
+                {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }))
+            .expect("install trace_sources read counter");
+
+        let noop = index_paths(&mut store, &[traces.path().to_path_buf()], &options(false))
+            .expect("no-op sync");
+        assert_eq!(noop.discovered_files, 5);
+        assert_eq!(noop.unchanged_files, 5);
+        assert_eq!(noop.indexed_files, 0);
+        assert_eq!(
+            trace_source_path_reads.load(Ordering::Relaxed),
+            1,
+            "multi-file no-op sync should prepare only the single bulk source_state query"
+        );
+    }
+
+    // Mutate a mixed batch (>= MIN_PIPELINE_FILES): 4 unchanged, 1 appended, 1 brand-new.
+    {
+        use std::io::Write as _;
+        let mut appended = fs::OpenOptions::new()
+            .append(true)
+            .open(&paths[2])
+            .expect("open codex-2 for append");
+        writeln!(
+            appended,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"loop-2"}})
+        )
+        .expect("append loop-2 start");
+        writeln!(
+            appended,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"follow-up"}})
+        )
+        .expect("append loop-2 request");
+        writeln!(
+            appended,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done-2"}})
+        )
+        .expect("append loop-2 end");
+
+        let brand_new = traces.path().join("codex-5.jsonl");
+        write_jsonl(
+            &brand_new,
+            &[
+                json!({"type":"session_meta","payload":{"id":"bulk-session-5","cwd":"/workspace"}}),
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"loop-1"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"hello 5"}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+            ],
+        );
+
+        let mut store = Store::open(&db_path).expect("reopen for mixed sync");
+        let mixed = index_paths(&mut store, &[traces.path().to_path_buf()], &options(false))
+            .expect("mixed sync");
+        assert_eq!(mixed.discovered_files, 6);
+        assert_eq!(mixed.unchanged_files, 4);
+        assert_eq!(mixed.indexed_files, 2);
+        assert_eq!(count(store.connection(), "sessions"), 6);
+        assert_eq!(count(store.connection(), "loops"), 7);
+    }
+}

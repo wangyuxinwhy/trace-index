@@ -7,7 +7,7 @@
 //! append-only updates `sync_session` diffs that projection in place to avoid
 //! rewriting unchanged prefix Loops, Items, and FTS5 rows.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -17,8 +17,7 @@ use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params}
 use serde_json::Value;
 
 use super::pipeline::{
-    MIN_PIPELINE_FILES, index_files_pipelined, is_pipeline_eligible, load_existing_source_paths,
-    pipeline_worker_count,
+    MIN_PIPELINE_FILES, index_files_pipelined, is_pipeline_eligible, pipeline_worker_count,
 };
 use super::telemetry::{IndexPhase, IndexTelemetry, PersistTable, ProgressObserver};
 #[cfg(test)]
@@ -136,15 +135,20 @@ fn index_paths_internal(
     let mut adapters = BTreeSet::new();
     let mut scratch = SyncScratch::new(store)?;
     let worker_count = pipeline_worker_count(files.len());
-    let existing_paths = if worker_count > 1 && !options.rebuild {
-        load_existing_source_paths(store)?
+    let existing_sources = if files.len() >= MIN_PIPELINE_FILES && !options.rebuild {
+        let preload_started = Instant::now();
+        let states = store.load_all_source_states()?;
+        telemetry.record_duration(IndexPhase::Prepare, preload_started.elapsed());
+        Some(states)
     } else {
-        HashSet::new()
+        None
     };
-    let parallel_candidates = if worker_count > 1 && !options.rebuild {
+    let parallel_candidates = if worker_count > 1
+        && let Some(existing_sources) = existing_sources.as_ref()
+    {
         files
             .iter()
-            .filter(|file| is_pipeline_eligible(file, &existing_paths))
+            .filter(|file| is_pipeline_eligible(file, existing_sources))
             .count()
     } else {
         0
@@ -156,11 +160,13 @@ fn index_paths_internal(
         adapters: &mut adapters,
         report: &mut report,
     };
-    if parallel_candidates >= MIN_PIPELINE_FILES {
+    if parallel_candidates >= MIN_PIPELINE_FILES
+        && let Some(existing_sources) = existing_sources.as_ref()
+    {
         index_files_pipelined(
             store,
             &files,
-            &existing_paths,
+            existing_sources,
             worker_count,
             options,
             &mut scratch,
@@ -177,6 +183,7 @@ fn index_paths_internal(
                 store,
                 file,
                 options,
+                existing_sources.as_ref(),
                 &mut scratch,
                 sink.telemetry,
                 sink.progress,
@@ -509,6 +516,7 @@ pub(super) fn index_source(
     store: &mut Store,
     discovered: &DiscoveredFile,
     options: &IndexOptions,
+    existing_sources: Option<&HashMap<String, SourceState>>,
     scratch: &mut SyncScratch,
     telemetry: &mut IndexTelemetry,
     progress: &mut dyn ProgressObserver,
@@ -521,8 +529,14 @@ pub(super) fn index_source(
 
     // Decided before the file is opened. Size and modification time settle
     // whether anything happened; `--rebuild` re-reads and re-detects.
-    let existing_before = store.source_state(&path_string)?;
-    if let Some(existing) = existing_before.as_ref()
+    let owned_existing;
+    let existing_before: Option<&SourceState> = if let Some(states) = existing_sources {
+        states.get(&path_string)
+    } else {
+        owned_existing = store.source_state(&path_string)?;
+        owned_existing.as_ref()
+    };
+    if let Some(existing) = existing_before
         && !options.rebuild
         && existing.file_size == file_size
         && existing.complete
@@ -547,7 +561,7 @@ pub(super) fn index_source(
     // probes for verified-prefix Items. Any prefix rewrite or concurrent state
     // change falls through cleanly to the standard transactional path below.
     if !options.rebuild
-        && let Some(existing) = existing_before.as_ref()
+        && let Some(existing) = existing_before
         && existing.adapter == opened.adapter.name()
         && existing.indexed_bytes > 0
         && existing.indexed_bytes <= opened.indexed_limit
