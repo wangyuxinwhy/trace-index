@@ -1,11 +1,11 @@
 //! Deterministic, zero-`unsafe` pre-tokenization for mixed CJK, English, and
 //! source-code full-text search over `SQLite` FTS5 `unicode61`.
 //!
-//! `item_search_terms` uses `SQLite`'s built-in `unicode61` tokenizer with
-//! `tokenchars '_'` and `detail = 'full'`. Pre-tokenizing in Rust at write time
-//! and applying the matching transformation in the `search_query()` SQL helper
-//! provides 2-character CJK recall, adjacent CJK phrase matching, code
-//! identifier splitting (`camelCase`, `PascalCase`, `snake_case`), multi-word
+//! `item_search` (Format 5+) uses `SQLite`'s built-in `unicode61` tokenizer with
+//! `tokenchars '_'` and `detail = 'full'`. Pre-tokenizing in Rust at write time and applying the matching transformation in the
+//! `search_query()` SQL helper provides 2-character CJK recall, adjacent CJK
+//! phrase matching, code identifier splitting (`camelCase`, `PascalCase`,
+//! `snake_case`, underscore segments), prefix queries (`foo*`), multi-word
 //! queries, and native `bm25()` ranking without C FTS5 extensions or `unsafe`.
 
 use std::collections::HashSet;
@@ -89,9 +89,8 @@ pub(crate) fn make_term_search_query(query: &str) -> std::result::Result<String,
 
     if clauses.is_empty() {
         return Err(
-            "search_query requires at least one 2+ character word, identifier, or CJK term; \
-             for 3+ char symbols or substrings use item_search(trigram_query('...')), \
-             or narrow structurally and scan blobs with instr()",
+            "search_query requires at least one 2+ character word, identifier, prefix (4+ chars with trailing '*'), or CJK term; \
+             narrow structurally and scan blobs with instr() for single characters or punctuation literals",
         );
     }
 
@@ -145,7 +144,16 @@ fn collect_chunk_clauses(chunk: &str, clauses: &mut Vec<String>, seen: &mut Hash
                 }
             }
             let lower = chunk[start..end].to_ascii_lowercase();
-            if lower.len() >= 2 {
+            let wants_prefix = chars.peek().is_some_and(|&(_, next)| next == '*');
+            if wants_prefix {
+                chars.next();
+            }
+            if wants_prefix && lower.len() >= 4 {
+                let clause = format!("{}*", quote_fts_phrase(&lower));
+                if seen.insert(clause.clone()) {
+                    clauses.push(clause);
+                }
+            } else if lower.len() >= 2 {
                 let phrase = quote_fts_phrase(&lower);
                 if seen.insert(phrase.clone()) {
                     clauses.push(phrase);
@@ -195,17 +203,24 @@ fn emit_ascii_ident_run(run: &str, out: &mut String) {
         push_token(out, &lower);
     }
 
+    let mut emitted_extras: HashSet<String> = HashSet::new();
     let mut sub_tokens: Vec<String> = Vec::new();
     for segment in run.split('_') {
         if segment.is_empty() {
             continue;
+        }
+        // Preserve each underscore-delimited segment verbatim (e.g. `gy_AlphaMind_Agent`
+        // emits `alphamind`, and `thread_7t_context` preserves `7t` before digit splitting).
+        let seg_lower = segment.to_ascii_lowercase();
+        if seg_lower.len() >= 2 && seg_lower != lower && emitted_extras.insert(seg_lower.clone()) {
+            push_token(out, &seg_lower);
         }
         split_camel_and_digits(segment, &mut sub_tokens);
     }
 
     if sub_tokens.len() > 1 || (sub_tokens.len() == 1 && sub_tokens[0] != lower) {
         for token in sub_tokens {
-            if token.len() >= 2 && token != lower {
+            if token.len() >= 2 && token != lower && emitted_extras.insert(token.clone()) {
                 push_token(out, &token);
             }
         }
@@ -304,6 +319,10 @@ mod tests {
             tokenize_for_term_index("SQLite 覆盖索引"),
             "sqlite sq lite 覆盖 盖索 索引"
         );
+        assert_eq!(
+            tokenize_for_term_index("gy_AlphaMind_Agent thread_7t_context"),
+            "gy_alphamind_agent gy alphamind agent alpha mind thread_7t_context thread 7t context"
+        );
     }
 
     #[test]
@@ -325,8 +344,8 @@ mod tests {
             "\"sqlite\" AND \"索引\""
         );
         assert_eq!(
-            make_term_search_query("src/storage/schema_v4.rs").expect("path query"),
-            "\"src\" AND \"storage\" AND \"schema_v4\" AND \"rs\""
+            make_term_search_query("src/storage/schema_v5.rs").expect("path query"),
+            "\"src\" AND \"storage\" AND \"schema_v5\" AND \"rs\""
         );
         assert_eq!(
             make_term_search_query("--max-output-bytes").expect("flag query"),
@@ -335,6 +354,10 @@ mod tests {
         assert_eq!(
             make_term_search_query("occurred_at").expect("snake_case exact"),
             "\"occurred_at\""
+        );
+        assert_eq!(
+            make_term_search_query("a1b2c3*").expect("prefix query"),
+            "\"a1b2c3\"*"
         );
         assert!(make_term_search_query("   ->  ").is_err());
         assert!(make_term_search_query("索").is_err());

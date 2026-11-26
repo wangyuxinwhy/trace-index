@@ -124,7 +124,7 @@ impl Store {
                  PRAGMA cache_size = -{PAGE_CACHE_KIB};"
             ))
             .context("failed to configure SQLite")?;
-        register_query_functions(&connection)?;
+        register_query_functions(&connection, STORAGE_FORMAT)?;
 
         let mut store = Self {
             connection,
@@ -184,13 +184,13 @@ impl Store {
                  PRAGMA cache_size = -{PAGE_CACHE_KIB};"
             ))
             .context("failed to configure read-only SQLite connection")?;
-        register_query_functions(&connection)?;
-
         let store = Self {
             connection,
             path: canonical,
         };
-        let version = store.validate_schema()?;
+        let version = store.storage_format()?;
+        register_query_functions(&store.connection, version)?;
+        store.validate_schema()?;
         store.connect_public_virtual_tables(version)?;
         Ok(store)
     }
@@ -420,10 +420,10 @@ impl Store {
 
     fn validate_schema(&self) -> Result<u32> {
         let version = self.storage_format()?;
-        // Format 4 compresses Semantic Blobs and adds `item_search_terms`.
-        // Format 2 and Format 3 still expose the earlier public relations and
-        // can be queried read-only in place without reindexing.
-        if !matches!(version, 2 | 3 | STORAGE_FORMAT) {
+        // Format 5 promotes term-oriented FTS5 search into the single
+        // `item_search` relation and drops the redundant trigram table.
+        // Formats 2, 3, and 4 remain read-only queryable in place.
+        if !matches!(version, 2 | 3 | 4 | STORAGE_FORMAT) {
             bail!(
                 "storage format {version} does not match current format {STORAGE_FORMAT}; \
                 create a new index database and reindex the source JSONL files"
@@ -435,7 +435,7 @@ impl Store {
     }
 
     fn connect_public_virtual_tables(&self, storage_format: u32) -> Result<()> {
-        let sql = if storage_format >= 4 {
+        let sql = if storage_format == 4 {
             "SELECT rowid FROM item_search WHERE 0;
              SELECT rowid FROM item_search_terms WHERE 0;"
         } else {
@@ -447,12 +447,21 @@ impl Store {
     }
 }
 
-fn register_query_functions(connection: &Connection) -> Result<()> {
+fn register_query_functions(connection: &Connection, storage_format: u32) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8
         | FunctionFlags::SQLITE_DETERMINISTIC
         | FunctionFlags::SQLITE_INNOCUOUS;
     connection
-        .create_scalar_function("trigram_query", 1, flags, |context| {
+        .create_scalar_function("trigram_query", 1, flags, move |context| {
+            if storage_format >= 5 {
+                return Err(rusqlite::Error::UserFunctionError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "trigram_query() was removed in Storage Format 5; use item_search(search_query('...')) for word, identifier, prefix ('foo*'), or 2+ char CJK searches, or narrow structurally and scan blobs with instr()",
+                    )
+                    .into(),
+                ));
+            }
             let literal = context.get::<String>(0)?;
             make_trigram_query(&literal).map_err(|message| {
                 rusqlite::Error::UserFunctionError(
@@ -462,7 +471,18 @@ fn register_query_functions(connection: &Connection) -> Result<()> {
         })
         .context("failed to register trigram_query SQL function")?;
     connection
-        .create_scalar_function("search_query", 1, flags, |context| {
+        .create_scalar_function("search_query", 1, flags, move |context| {
+            if storage_format < 4 {
+                return Err(rusqlite::Error::UserFunctionError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "search_query() requires Storage Format 4 or 5 (this database is Format {storage_format}); use item_search(trigram_query('...')) or rebuild as Format {STORAGE_FORMAT}"
+                        ),
+                    )
+                    .into(),
+                ));
+            }
             let query = context.get::<String>(0)?;
             make_term_search_query(&query).map_err(|message| {
                 rusqlite::Error::UserFunctionError(
@@ -964,14 +984,17 @@ mod tests {
     }
 
     #[test]
-    fn opens_format_3_database_read_only_without_item_search_terms() {
+    fn opens_format_3_and_format_4_databases_read_only() {
         let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("format3.sqlite");
-        let store = Store::open(&database).expect("create index");
+        let format3_db = directory.path().join("format3.sqlite");
+        let store = Store::open(&format3_db).expect("create index");
         store
             .connection()
             .execute_batch(
-                "DROP TABLE item_search_terms;
+                "DROP TABLE item_search;
+                 CREATE VIRTUAL TABLE item_search USING fts5(
+                     text, content = '', tokenize = 'trigram', detail = 'none', contentless_delete = 1
+                 );
                  DROP VIEW blobs;
                  CREATE VIEW blobs AS
                  SELECT b.id AS \"blob_id\",
@@ -986,15 +1009,35 @@ mod tests {
             .expect("downgrade fixture to format 3 shape");
         drop(store);
 
-        let reader = Store::open_read_only(&database).expect("open format 3 database read-only");
-        assert_eq!(reader.storage_format().expect("format"), 3);
-        let text: String = reader
+        let reader3 = Store::open_read_only(&format3_db).expect("open format 3 database read-only");
+        assert_eq!(reader3.storage_format().expect("format"), 3);
+        let text: String = reader3
             .connection()
             .query_row("SELECT text FROM blobs WHERE blob_id = 1", [], |row| {
                 row.get(0)
             })
             .expect("read format 3 blob");
         assert_eq!(text, "legacy format 3 text");
+
+        let format4_db = directory.path().join("format4.sqlite");
+        let store4 = Store::open(&format4_db).expect("create index");
+        store4
+            .connection()
+            .execute_batch(
+                "DROP TABLE item_search;
+                 CREATE VIRTUAL TABLE item_search USING fts5(
+                     text, content = '', tokenize = 'trigram', detail = 'none', contentless_delete = 1
+                 );
+                 CREATE VIRTUAL TABLE item_search_terms USING fts5(
+                     text, content = '', tokenize = 'unicode61 tokenchars ''_''', detail = 'full', contentless_delete = 1
+                 );
+                 PRAGMA user_version = 4;",
+            )
+            .expect("downgrade fixture to format 4 shape");
+        drop(store4);
+
+        let reader4 = Store::open_read_only(&format4_db).expect("open format 4 database read-only");
+        assert_eq!(reader4.storage_format().expect("format"), 4);
     }
 
     #[test]

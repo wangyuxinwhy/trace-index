@@ -308,7 +308,18 @@ pub(crate) fn render_template(
         );
     }
     let resolved = resolve_template_params(&entry.parsed.header, raw_params, store)?;
-    let sql = render_nodes(&entry.parsed.nodes, &resolved.active_flags);
+    let mut sql = render_nodes(&entry.parsed.nodes, &resolved.active_flags);
+    // Built-in search templates natively target Format 5's `item_search`;
+    // when opened read-only against a Format 4 database, route seamlessly to
+    // Format 4's `item_search_terms` so users do not have to rebuild first.
+    if storage_format == 4 && matches!(entry.origin, TemplateOrigin::Builtin) {
+        sql = sql
+            .replace(
+                "item_search(search_query(",
+                "item_search_terms(search_query(",
+            )
+            .replace("bm25(item_search)", "bm25(item_search_terms)");
+    }
     let used_params = collect_referenced_params(store, &sql, &resolved.bound)?;
     Ok(TemplateRenderReport {
         template: entry.parsed.header.name.clone(),

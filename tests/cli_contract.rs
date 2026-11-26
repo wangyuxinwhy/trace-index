@@ -440,7 +440,7 @@ fn root_help_teaches_the_current_control_plane_and_model() {
         "The Agent response marked as final for a Loop.",
         "Instructions injected by the Runtime or harness, not Human input.",
         "Domain Relations: sources, records, sessions, loops, items",
-        "Access Relations: blobs, item_search, item_search_terms",
+        "Access Relations: blobs, item_search",
         "Start from items and select facts with semantic.role",
         "Investigation defaults:",
         "Orient with the conversation spine.",
@@ -614,7 +614,6 @@ fn sync_schema_and_query_form_one_machine_readable_workflow() {
             "items",
             "blobs",
             "item_search",
-            "item_search_terms",
             "session_metadata"
         ]
     );
@@ -696,14 +695,14 @@ fn text_search_returns_candidates_that_can_be_exact_checked() {
     let directory = tempdir().expect("temporary directory");
     let (database, _, _) = index_fixture(
         directory.path(),
-        "needle phrase for search 和索引 CamelCaseId",
+        "needle phrase for search 和索引 CamelCaseId a1b2c3d4e5",
     );
     let result = compact_json(&run(&[
         "--db",
         path_text(&database),
         "query",
         "run",
-        "SELECT json_extract(i.semantic, '$.role') AS role FROM item_search JOIN items AS i ON i.item_id = item_search.rowid JOIN blobs AS b ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id') WHERE item_search MATCH trigram_query('needle phrase') AND instr(b.text, 'needle phrase') > 0",
+        "SELECT json_extract(i.semantic, '$.role') AS role FROM item_search JOIN items AS i ON i.item_id = item_search.rowid JOIN blobs AS b ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id') WHERE item_search MATCH search_query('needle phrase') AND instr(b.text, 'needle phrase') > 0",
     ]));
     assert_eq!(result["data"]["returned"], 1);
     assert_eq!(result["data"]["rows"][0]["role"], "human.request");
@@ -713,7 +712,7 @@ fn text_search_returns_candidates_that_can_be_exact_checked() {
         path_text(&database),
         "query",
         "run",
-        "SELECT json_extract(i.semantic, '$.role') AS role, bm25(item_search_terms) AS score FROM item_search_terms(search_query('索引 camel')) JOIN items AS i ON i.item_id = item_search_terms.rowid JOIN blobs AS b ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id') WHERE instr(b.text, '索引') > 0 ORDER BY score",
+        "SELECT json_extract(i.semantic, '$.role') AS role, bm25(item_search) AS score FROM item_search(search_query('索引 camel a1b2c3*')) JOIN items AS i ON i.item_id = item_search.rowid JOIN blobs AS b ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id') WHERE instr(b.text, '索引') > 0 ORDER BY score",
     ]));
     assert_eq!(term_result["data"]["returned"], 1);
     assert_eq!(term_result["data"]["rows"][0]["role"], "human.request");
@@ -1036,11 +1035,7 @@ fn error_recovery_hints_point_to_public_contract_discovery() {
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("item_search(trigram_query('...'))"),
-            "missing trigram_query hint for `{fts_sql}`: {stderr}"
-        );
-        assert!(
-            stderr.contains("item_search_terms(search_query('...'))"),
+            stderr.contains("item_search(search_query('...'))"),
             "missing search_query hint for `{fts_sql}`: {stderr}"
         );
         assert!(stderr.contains("how-to/search-literals"));

@@ -52,7 +52,7 @@ SELECT
     json_extract(i.semantic, '$.evidence_strength') AS evidence_strength,
     b.full_bytes,
     substr(b.text, 1, :max_chars) AS preview
-FROM item_search_terms(search_query(:query)) AS fts
+FROM item_search(search_query(:query)) AS fts
 JOIN items AS i ON i.item_id = fts.rowid
 JOIN sessions AS s ON s.session_id = i.session_id
 LEFT JOIN blobs AS b
@@ -79,4 +79,4 @@ WHERE i.item_id = fts.rowid
 -- #if contains
   AND instr(lower(COALESCE(b.text, '')), lower(:contains)) > 0
 -- #endif
-ORDER BY bm25(item_search_terms), i.item_id
+ORDER BY bm25(item_search), i.item_id

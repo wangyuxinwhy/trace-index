@@ -2065,12 +2065,12 @@ fn snapshot_antigravity_db(store: &Store) -> FullDbSnapshot {
         .expect("query loops")
         .collect::<Result<_, _>>()
         .expect("collect loops");
-    let search_hits = conn
+    let search_hits: Vec<String> = conn
         .prepare(
             "SELECT b.text FROM item_search s
                JOIN domain_items i ON i.id = s.rowid
                JOIN content_blobs b ON b.id = json_extract(i.semantic, '$.value.text.blob_id')
-              WHERE item_search MATCH trigram_query('verify_tail')
+              WHERE item_search MATCH search_query('verify_tail')
               ORDER BY i.id",
         )
         .expect("prep fts")
@@ -2078,19 +2078,7 @@ fn snapshot_antigravity_db(store: &Store) -> FullDbSnapshot {
         .expect("query fts")
         .collect::<Result<_, _>>()
         .expect("collect fts");
-    let term_hits = conn
-        .prepare(
-            "SELECT b.text FROM item_search_terms s
-               JOIN domain_items i ON i.id = s.rowid
-               JOIN content_blobs b ON b.id = json_extract(i.semantic, '$.value.text.blob_id')
-              WHERE item_search_terms MATCH search_query('verify_tail')
-              ORDER BY i.id",
-        )
-        .expect("prep terms")
-        .query_map([], |r| r.get(0))
-        .expect("query terms")
-        .collect::<Result<_, _>>()
-        .expect("collect terms");
+    let term_hits = search_hits.clone();
     FullDbSnapshot {
         sources,
         records,

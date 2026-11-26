@@ -66,7 +66,7 @@ fn seed_rich_fixture(store: &Store) {
                  json('{"role":"agent.final_answer","value":{"text":{"blob_id":2},"has_images":false},"evidence_strength":"structural"}'));
             INSERT INTO item_records(item_id, record_id)
             VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
-            INSERT INTO item_search_terms(rowid, text)
+            INSERT INTO item_search(rowid, text)
             VALUES (1, 'session level runtime instructions context'),
                    (2, 'please investigate clash verge proxy latency in trace index'),
                    (5, 'found proxy configuration and fixed clash verge routing');

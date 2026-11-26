@@ -6,7 +6,7 @@ pub(crate) mod persist;
 pub(crate) mod persist_diff;
 pub(crate) mod public_schema;
 pub(crate) mod schema;
-mod schema_v4;
+mod schema_v5;
 pub(crate) mod search;
 mod semantic_encode;
 

@@ -231,23 +231,13 @@ public_view! {
 }
 
 public_virtual_table! {
-    /// Trigram candidate index over explicitly documented Item semantic text.
-    /// `rowid` is the matching `items.item_id`; query with
-    /// `trigram_query('...')` and exact-check candidate text via `blobs`.
+    /// Term-oriented FTS5 candidate index (Format 5+) over pre-tokenized Item
+    /// semantic text (2+ character CJK terms, words, underscore segments, split
+    /// code identifiers, and `prefix*` lookups) with `bm25()` ranking. `rowid`
+    /// is the matching `items.item_id`; query with `item_search(search_query('...'))`
+    /// and exact-check candidate text via `blobs`. On read-only Format 2/3/4
+    /// databases, `item_search` uses legacy trigram indexing (`trigram_query('...')`).
     pub(crate) const ITEM_SEARCH = "item_search" {
-        /// Contentless FTS MATCH operand. Reading it returns NULL; obtain exact
-        /// text from the Item's BlobRef and `blobs`.
-        text: Option<String>,
-    }
-}
-
-public_virtual_table! {
-    /// Term-oriented candidate index (Format 4+) over pre-tokenized Item
-    /// semantic text (2+ character CJK terms, words, and split code
-    /// identifiers) with `bm25()` ranking. `rowid` is the matching
-    /// `items.item_id`; query with `search_query('...')` and exact-check
-    /// candidate text via `blobs`.
-    pub(crate) const ITEM_SEARCH_TERMS = "item_search_terms" {
         /// Contentless FTS MATCH operand. Reading it returns NULL; obtain exact
         /// text from the Item's BlobRef and `blobs`.
         text: Option<String>,
@@ -284,7 +274,6 @@ pub(crate) const PUBLIC_RELATIONS: &[PublicRelation] = &[
     ITEMS,
     BLOBS,
     ITEM_SEARCH,
-    ITEM_SEARCH_TERMS,
     SESSION_METADATA,
 ];
 
@@ -352,9 +341,6 @@ pub(crate) fn validate_public_relations(
         .context("failed to inspect public relations")?;
 
     for relation in PUBLIC_RELATIONS {
-        if relation.name == ITEM_SEARCH_TERMS.name && storage_format < 4 {
-            continue;
-        }
         let expected_kind = match relation.kind {
             PublicRelationKind::View { .. } => "view",
             PublicRelationKind::VirtualTable => "table",
@@ -392,6 +378,14 @@ pub(crate) fn validate_public_relations(
             ))
             .with_context(|| format!("public relation {} cannot be queried", relation.name))?;
     }
+    if storage_format == 4 {
+        if existing.get("item_search_terms").map(String::as_str) != Some("table") {
+            bail!("Format 4 database is missing legacy virtual table item_search_terms");
+        }
+        connection
+            .prepare("SELECT * FROM \"item_search_terms\" LIMIT 0")
+            .context("Format 4 relation item_search_terms cannot be queried")?;
+    }
     Ok(())
 }
 
@@ -420,7 +414,6 @@ mod tests {
                 "items",
                 "blobs",
                 "item_search",
-                "item_search_terms",
                 "session_metadata"
             ]
         );
@@ -451,7 +444,7 @@ mod tests {
         }
     }
 
-    fn expected_columns() -> [(&'static str, &'static [&'static str]); 9] {
+    fn expected_columns() -> [(&'static str, &'static [&'static str]); 8] {
         [
             ("sources", &["source_id", "locator", "runtime"][..]),
             (
@@ -510,7 +503,6 @@ mod tests {
                 &["blob_id", "text", "full_bytes", "estimated_tokens"][..],
             ),
             ("item_search", &["text"][..]),
-            ("item_search_terms", &["text"][..]),
             (
                 "session_metadata",
                 &[
@@ -527,17 +519,15 @@ mod tests {
 
     #[test]
     fn declares_contentless_search_operand_nullable() {
-        for name in ["item_search", "item_search_terms"] {
-            let search_text = PUBLIC_RELATIONS
-                .iter()
-                .find(|relation| relation.name == name)
-                .and_then(|relation| relation.columns.first())
-                .expect("search text contract");
-            assert!(search_text.nullable, "{name}.text must be nullable");
-            assert!(
-                search_text.description.contains("Reading it returns NULL"),
-                "{name}.text must document NULL reads"
-            );
-        }
+        let search_text = PUBLIC_RELATIONS
+            .iter()
+            .find(|relation| relation.name == "item_search")
+            .and_then(|relation| relation.columns.first())
+            .expect("search text contract");
+        assert!(search_text.nullable, "item_search.text must be nullable");
+        assert!(
+            search_text.description.contains("Reading it returns NULL"),
+            "item_search.text must document NULL reads"
+        );
     }
 }

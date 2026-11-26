@@ -42,7 +42,7 @@ WITH hits AS (
         COUNT(*) AS candidate_items,
         MIN(i.occurred_at) AS first_occurred_at,
         MAX(i.occurred_at) AS last_occurred_at
-    FROM item_search_terms(search_query(:query)) AS fts
+    FROM item_search(search_query(:query)) AS fts
     JOIN items AS i ON i.item_id = fts.rowid
     WHERE i.item_id = fts.rowid
 -- #if roles

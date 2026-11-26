@@ -142,7 +142,7 @@ fn assert_projection(root: &Path) {
     assert_eq!(
         query(
             root,
-            "SELECT COUNT(*) AS n FROM item_search(trigram_query('results'))"
+            "SELECT COUNT(*) AS n FROM item_search(search_query('results'))"
         ),
         json!([{"n":2}])
     );

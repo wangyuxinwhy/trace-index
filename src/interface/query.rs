@@ -173,11 +173,14 @@ pub fn query_sql_with_params(
             let format = store
                 .storage_format()
                 .unwrap_or(crate::storage::schema::STORAGE_FORMAT);
-            let hint = if format >= 4 {
+            let hint = if format >= 5 {
+                "use item_search(search_query('...')) for word, identifier, prefix ('foo*'), or 2+ char CJK searches (supports bm25()); see 'trace-index docs get how-to/search-literals'".to_owned()
+            } else if format == 4 {
                 "use item_search_terms(search_query('...')) for word, identifier, or 2+ char CJK searches (supports bm25()), or item_search(trigram_query('...')) for 3+ char literal substrings; see 'trace-index docs get how-to/search-literals'".to_owned()
             } else {
                 format!(
-                    "this Format {format} index has only item_search (trigram, detail=none); pass 3+ char literal strings through item_search(trigram_query('...')) or build a Format 4 index for item_search_terms; see 'trace-index docs get how-to/search-literals'"
+                    "this Format {format} index has only item_search (trigram, detail=none); pass 3+ char literal strings through item_search(trigram_query('...')) or build a Format {} index for term search; see 'trace-index docs get how-to/search-literals'",
+                    crate::storage::schema::STORAGE_FORMAT
                 )
             };
             Err(error.context(hint))
@@ -186,9 +189,12 @@ pub fn query_sql_with_params(
             let format = store
                 .storage_format()
                 .unwrap_or(crate::storage::schema::STORAGE_FORMAT);
-            let hint = if format < 4 && error_mentions_item_search_terms(&error) {
+            let hint = if format >= 5 && error_mentions_item_search_terms(&error) {
+                "Storage Format 5 promoted item_search_terms into item_search; use item_search(search_query('...'))".to_owned()
+            } else if format < 4 && error_mentions_item_search_terms(&error) {
                 format!(
-                    "item_search_terms requires a Format 4 index (this database is Format {format}); use item_search(trigram_query('...')) or narrow structurally via items and blobs, or build a Format 4 index"
+                    "item_search_terms is absent in this Format {format} index; use item_search(trigram_query('...')) or narrow structurally via items and blobs, or build a Format {} index",
+                    crate::storage::schema::STORAGE_FORMAT
                 )
             } else {
                 "inspect the current public relations and columns with 'trace-index schema list' or 'trace-index schema get <RELATION> --compact'".to_owned()
@@ -242,20 +248,93 @@ fn error_mentions_item_search_terms(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("item_search_terms"))
 }
 
+#[derive(Default)]
+struct FtsAccessAudit {
+    read_item_search: AtomicBool,
+    read_item_search_terms: AtomicBool,
+    called_search_query: AtomicBool,
+    called_trigram_query: AtomicBool,
+}
+
+impl FtsAccessAudit {
+    fn observe(&self, context: &AuthContext<'_>) {
+        match context.action {
+            AuthAction::Read { table_name, .. } => {
+                if table_name == "item_search" {
+                    self.read_item_search.store(true, Ordering::Relaxed);
+                } else if table_name == "item_search_terms" {
+                    self.read_item_search_terms.store(true, Ordering::Relaxed);
+                }
+            }
+            AuthAction::Function { function_name } => {
+                if function_name.eq_ignore_ascii_case("search_query") {
+                    self.called_search_query.store(true, Ordering::Relaxed);
+                } else if function_name.eq_ignore_ascii_case("trigram_query") {
+                    self.called_trigram_query.store(true, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_for_format(&self, storage_format: u32) -> Result<()> {
+        let read_search = self.read_item_search.load(Ordering::Relaxed);
+        let read_terms = self.read_item_search_terms.load(Ordering::Relaxed);
+        let used_search_query = self.called_search_query.load(Ordering::Relaxed);
+        let used_trigram_query = self.called_trigram_query.load(Ordering::Relaxed);
+
+        if storage_format >= 5 && read_search && !used_search_query {
+            bail!(
+                "item_search in Storage Format {storage_format} is pre-tokenized and must be queried through item_search(search_query('...')); raw MATCH expressions can silently return 0 rows (see 'trace-index docs get how-to/search-literals')"
+            );
+        }
+        if storage_format == 4 && read_search && !read_terms && used_search_query {
+            bail!(
+                "in this Format 4 database, item_search uses trigram indexing and cannot be queried with search_query(...); use item_search_terms(search_query('...')) on Format 4, or rebuild into a Format {} index",
+                crate::storage::schema::STORAGE_FORMAT
+            );
+        }
+        if storage_format == 4 && read_terms && !read_search && used_trigram_query {
+            bail!(
+                "in this Format 4 database, item_search_terms uses term indexing and cannot be queried with trigram_query(...); use item_search_terms(search_query('...'))"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn run_query(
     store: &Store,
     sql: &str,
     params: &BTreeMap<String, SqlParamValue>,
     budget: QueryBudget,
 ) -> Result<SqlQueryReport> {
+    let storage_format = store
+        .storage_format()
+        .unwrap_or(crate::storage::schema::STORAGE_FORMAT);
     let executing = Arc::new(AtomicBool::new(false));
     let authorizer_executing = Arc::clone(&executing);
+    let audit = Arc::new(FtsAccessAudit::default());
+    let authorizer_audit = Arc::clone(&audit);
     store
         .connection()
         .authorizer(Some(move |context: AuthContext<'_>| {
-            authorize_read_only_query(context, authorizer_executing.load(Ordering::Relaxed))
+            let decision =
+                authorize_read_only_query(context, authorizer_executing.load(Ordering::Relaxed));
+            if matches!(decision, Authorization::Allow) {
+                authorizer_audit.observe(&context);
+            }
+            decision
         }))?;
-    let result = run_authorized_query(store, sql, params, budget, &executing);
+    let result = run_authorized_query(
+        store,
+        sql,
+        params,
+        budget,
+        &executing,
+        &audit,
+        storage_format,
+    );
     store
         .connection()
         .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
@@ -298,11 +377,14 @@ fn run_authorized_query(
     params: &BTreeMap<String, SqlParamValue>,
     budget: QueryBudget,
     executing: &AtomicBool,
+    audit: &FtsAccessAudit,
+    storage_format: u32,
 ) -> Result<SqlQueryReport> {
     let mut statement = store.connection().prepare(sql)?;
     if !statement.readonly() {
         bail!("only read-only SQL is allowed");
     }
+    audit.validate_for_format(storage_format)?;
 
     let columns = statement
         .column_names()
@@ -676,9 +758,7 @@ mod tests {
                  );
                  INSERT INTO item_records(item_id, record_id) VALUES (1, 1);
                  INSERT INTO item_search(rowid, text)
-                 VALUES (1, 'AgentFriendly 讨论智能体使用和知识索引');
-                 INSERT INTO item_search_terms(rowid, text)
-                 VALUES (1, 'agentfriendly agent friendly 讨论 论智 智能 能体 体使 使用 用和 和知 知识 识索 索引');",
+                 VALUES (1, 'agentfriendly agent friendly a1b2c3d4e5 讨论 论智 智能 能体 体使 使用 用和 和知 知识 识索 索引');",
             )
             .expect("insert search fixture");
     }
@@ -967,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_trigram_candidates_through_the_public_sql_plane() {
+    fn exposes_term_candidates_through_item_search_and_blocks_raw_match_or_trigram() {
         let directory = tempdir().expect("temp directory");
         let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
@@ -986,124 +1066,11 @@ mod tests {
         );
         assert!(schema.objects[0].columns[0].nullable);
 
-        let operand = query_sql(
-            &store,
-            "SELECT rowid, text FROM item_search(trigram_query('智能体使用'))",
-            TEST_BUDGET,
-        )
-        .expect("read contentless search operand");
-        assert_eq!(operand.returned, 1);
-        assert!(operand.rows[0]["text"].is_null());
-
-        let report = query_sql(
-            &store,
-            "WITH candidates AS MATERIALIZED (
-                 SELECT rowid AS item_id
-                   FROM item_search(trigram_query('智能体使用'))
-             )
-             SELECT i.item_id, json_extract(i.semantic, '$.role') AS role
-               FROM candidates c
-               JOIN items i USING(item_id)
-               JOIN blobs b
-                 ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')
-              WHERE instr(b.text, '智能体使用') > 0",
-            TEST_BUDGET,
-        )
-        .expect("query indexed candidates");
-        assert_eq!(report.returned, 1);
-        assert_eq!(report.rows[0]["role"], "human.request");
-    }
-
-    #[test]
-    fn keeps_candidate_generation_separate_from_exact_matching() {
-        let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("index.sqlite");
-        let store = Store::open(&database).expect("open store");
-        insert_search_fixture(&store);
-
-        let candidates = query_sql(
-            &store,
-            "SELECT rowid FROM item_search(trigram_query('agentfriendly'))",
-            TEST_BUDGET,
-        )
-        .expect("query case-folded candidates");
-        assert_eq!(candidates.returned, 1);
-
-        let exact = query_sql(
-            &store,
-            "SELECT i.item_id
-               FROM item_search(trigram_query('agentfriendly')) c
-               JOIN items i ON i.item_id = c.rowid
-               JOIN blobs b
-                 ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')
-              WHERE instr(b.text, 'agentfriendly') > 0",
-            TEST_BUDGET,
-        )
-        .expect("post-check exact text");
-        assert_eq!(exact.returned, 0);
-    }
-
-    #[test]
-    fn rejects_short_trigram_queries() {
-        let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("index.sqlite");
-        let store = Store::open(&database).expect("open store");
-
-        let short = query_sql(&store, "SELECT trigram_query('中文') AS query", TEST_BUDGET)
-            .expect_err("reject short trigram query");
-        let message = format!("{short:#}");
-        assert!(
-            message.contains("item_search_terms(search_query('...'))"),
-            "{message}"
-        );
-        assert!(
-            message.contains("narrow by source, session, role, or time"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn hints_trigram_query_on_fts5_phrase_query_error() {
-        let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("index.sqlite");
-        let store = Store::open(&database).expect("open store");
-        insert_search_fixture(&store);
-
-        let error = query_sql(
-            &store,
-            "SELECT rowid FROM item_search WHERE item_search MATCH '\"agent friendly\"'",
-            TEST_BUDGET,
-        )
-        .expect_err("reject FTS5 phrase query on detail=none index");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("item_search(trigram_query('...'))"),
-            "{message}"
-        );
-        assert!(
-            message.contains("item_search_terms(search_query('...'))"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn searches_terms_short_cjk_identifiers_and_bm25_through_item_search_terms() {
-        let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("index.sqlite");
-        let store = Store::open(&database).expect("open store");
-        insert_search_fixture(&store);
-
-        let schema =
-            public_schema(&store, &["item_search_terms"], true).expect("term search schema");
-        assert_eq!(schema.objects.len(), 1);
-        assert_eq!(schema.objects[0].name, "item_search_terms");
-        assert!(schema.objects[0].columns[0].nullable);
-
-        // 2-character CJK query (unsupported by trigram_query)
+        // 2-character CJK + bm25() on Format 5 item_search.
         let cjk2 = query_sql(
             &store,
-            "SELECT rowid, text, bm25(item_search_terms) AS score
-               FROM item_search_terms(search_query('索引'))
+            "SELECT rowid, text, bm25(item_search) AS score
+               FROM item_search(search_query('索引'))
               ORDER BY score",
             TEST_BUDGET,
         )
@@ -1116,25 +1083,34 @@ mod tests {
         // 3+ character CJK requires exact adjacency ("智能 能体"), rejecting non-adjacent chars.
         let cjk_phrase = query_sql(
             &store,
-            "SELECT rowid FROM item_search_terms(search_query('智能体'))",
+            "SELECT rowid FROM item_search(search_query('智能体使用'))",
             TEST_BUDGET,
         )
-        .expect("query 3-char CJK phrase");
+        .expect("query 5-char CJK phrase");
         assert_eq!(cjk_phrase.returned, 1);
 
         let cjk_nonadjacent = query_sql(
             &store,
-            "SELECT rowid FROM item_search_terms(search_query('智能索引'))",
+            "SELECT rowid FROM item_search(search_query('智能索引'))",
             TEST_BUDGET,
         )
         .expect("query non-adjacent 4-char CJK");
         assert_eq!(cjk_nonadjacent.returned, 0);
 
+        // Prefix query (`a1b2c3*`) matches full token `a1b2c3d4e5`.
+        let prefix = query_sql(
+            &store,
+            "SELECT rowid FROM item_search(search_query('a1b2c3*'))",
+            TEST_BUDGET,
+        )
+        .expect("prefix query");
+        assert_eq!(prefix.returned, 1);
+
         // Split camelCase identifier + mixed CJK & English multi-word query.
         let mixed = query_sql(
             &store,
             "SELECT i.item_id, b.text
-               FROM item_search_terms(search_query('friendly 知识')) t
+               FROM item_search(search_query('friendly 知识')) t
                JOIN items i ON i.item_id = t.rowid
                JOIN blobs b
                  ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')",
@@ -1143,18 +1119,140 @@ mod tests {
         .expect("query mixed split identifier and 2-char CJK");
         assert_eq!(mixed.returned, 1);
         assert_eq!(mixed.rows[0]["item_id"], 1);
+
+        // Raw MATCH without search_query() is rejected at prepare time on Format 5.
+        let raw_match = query_sql(
+            &store,
+            "SELECT rowid FROM item_search WHERE item_search MATCH 'friendly'",
+            TEST_BUDGET,
+        )
+        .expect_err("reject raw MATCH without search_query on Format 5");
+        assert!(
+            format!("{raw_match:#}").contains("item_search(search_query('...'))"),
+            "{raw_match:#}"
+        );
+
+        // trigram_query() is rejected cleanly on Format 5.
+        let legacy_fn = query_sql(&store, "SELECT trigram_query('智能体使用')", TEST_BUDGET)
+            .expect_err("reject trigram_query on Format 5");
+        assert!(
+            format!("{legacy_fn:#}").contains("Storage Format 5"),
+            "{legacy_fn:#}"
+        );
+
+        // Querying removed item_search_terms gives a Format 5 migration hint.
+        let legacy_table = query_sql(
+            &store,
+            "SELECT rowid FROM item_search_terms(search_query('索引'))",
+            TEST_BUDGET,
+        )
+        .expect_err("item_search_terms removed in Format 5");
+        assert!(
+            format!("{legacy_table:#}").contains("promoted item_search_terms into item_search"),
+            "{legacy_table:#}"
+        );
     }
 
     #[test]
-    fn hints_format_3_readers_without_suggesting_missing_item_search_terms() {
+    fn keeps_candidate_generation_separate_from_exact_matching() {
         let directory = tempdir().expect("temp directory");
-        let database = directory.path().join("format3.sqlite");
+        let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
         insert_search_fixture(&store);
-        store
+
+        let candidates = query_sql(
+            &store,
+            "SELECT rowid FROM item_search(search_query('agentfriendly'))",
+            TEST_BUDGET,
+        )
+        .expect("query case-folded candidates");
+        assert_eq!(candidates.returned, 1);
+
+        let exact = query_sql(
+            &store,
+            "SELECT i.item_id
+               FROM item_search(search_query('agentfriendly')) c
+               JOIN items i ON i.item_id = c.rowid
+               JOIN blobs b
+                 ON b.blob_id = json_extract(i.semantic, '$.value.text.blob_id')
+              WHERE instr(b.text, 'agentfriendly') > 0",
+            TEST_BUDGET,
+        )
+        .expect("post-check exact text");
+        assert_eq!(exact.returned, 0);
+    }
+
+    #[test]
+    fn enforces_cross_format_search_guards_on_format_3_and_format_4_readers() {
+        let directory = tempdir().expect("temp directory");
+
+        // Format 4 read-only fixture: item_search is trigram, item_search_terms is unicode61.
+        let format4_db = directory.path().join("format4.sqlite");
+        let store4 = Store::open(&format4_db).expect("open store");
+        insert_search_fixture(&store4);
+        store4
             .connection()
             .execute_batch(
-                "DROP TABLE item_search_terms;
+                "DROP TABLE item_search;
+                 CREATE VIRTUAL TABLE item_search USING fts5(
+                     text, content = '', tokenize = 'trigram', detail = 'none', contentless_delete = 1
+                 );
+                 CREATE VIRTUAL TABLE item_search_terms USING fts5(
+                     text, content = '', tokenize = 'unicode61 tokenchars ''_''', detail = 'full', contentless_delete = 1
+                 );
+                 INSERT INTO item_search(rowid, text) VALUES (1, 'AgentFriendly 讨论智能体使用和知识索引');
+                 INSERT INTO item_search_terms(rowid, text) VALUES (1, 'agentfriendly agent friendly 讨论 论智 智能 能体 体使 使用 用和 和知 知识 识索 索引');
+                 PRAGMA user_version = 4;",
+            )
+            .expect("downgrade to format 4");
+        drop(store4);
+
+        let reader4 = Store::open_read_only(&format4_db).expect("open format 4 read-only");
+        // Calling search_query on Format 4's trigram item_search must fail loudly (never silent 0 rows).
+        let mismatch = query_sql(
+            &reader4,
+            "SELECT rowid FROM item_search(search_query('智能体'))",
+            TEST_BUDGET,
+        )
+        .expect_err("reject search_query on Format 4 trigram item_search");
+        assert!(
+            format!("{mismatch:#}").contains("item_search_terms(search_query('...'))"),
+            "{mismatch:#}"
+        );
+        // Valid Format 4 queries on both tables continue working.
+        assert_eq!(
+            query_sql(
+                &reader4,
+                "SELECT rowid FROM item_search_terms(search_query('索引'))",
+                TEST_BUDGET,
+            )
+            .expect("valid format 4 term query")
+            .returned,
+            1
+        );
+        assert_eq!(
+            query_sql(
+                &reader4,
+                "SELECT rowid FROM item_search(trigram_query('智能体使用'))",
+                TEST_BUDGET,
+            )
+            .expect("valid format 4 trigram query")
+            .returned,
+            1
+        );
+
+        // Format 3 read-only fixture: only trigram item_search exists.
+        let format3_db = directory.path().join("format3.sqlite");
+        let store3 = Store::open(&format3_db).expect("open store");
+        insert_search_fixture(&store3);
+        store3
+            .connection()
+            .execute_batch(
+                "DROP TABLE item_search;
+                 CREATE VIRTUAL TABLE item_search USING fts5(
+                     text, content = '', tokenize = 'trigram', detail = 'none', contentless_delete = 1
+                 );
+                 INSERT INTO item_search(rowid, text) VALUES (1, 'AgentFriendly 讨论智能体使用和知识索引');
                  DROP VIEW blobs;
                  CREATE VIEW blobs AS
                  SELECT b.id AS \"blob_id\",
@@ -1165,21 +1263,20 @@ mod tests {
                  PRAGMA user_version = 3;",
             )
             .expect("downgrade to format 3");
-        drop(store);
+        drop(store3);
 
-        let reader = Store::open_read_only(&database).expect("open format 3 read-only");
+        let reader3 = Store::open_read_only(&format3_db).expect("open format 3 read-only");
         let missing = query_sql(
-            &reader,
+            &reader3,
             "SELECT rowid FROM item_search_terms(search_query('索引'))",
             TEST_BUDGET,
         )
         .expect_err("item_search_terms absent on format 3");
         let missing_msg = format!("{missing:#}");
-        assert!(missing_msg.contains("Format 4 index"), "{missing_msg}");
         assert!(missing_msg.contains("Format 3"), "{missing_msg}");
 
         let fts_err = query_sql(
-            &reader,
+            &reader3,
             "SELECT rowid FROM item_search WHERE item_search MATCH '\"agent friendly\"'",
             TEST_BUDGET,
         )
