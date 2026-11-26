@@ -170,7 +170,9 @@ To match alternative term groups (`OR` semantics), combine separate `item_search
 
 ## Exact-check Blob text for candidate snippets
 
-Most text-bearing Semantic values use `value.text = {blob_id}`. A compaction summary instead uses `value.summary = {blob_id}`. Select the reference according to the documented role, join `blobs`, and exact-check the literal before extracting a centered snippet:
+Most text-bearing Semantic values use `value.text = {blob_id}`. A compaction summary instead uses `value.summary = {blob_id}`. Select the reference according to the documented role, join `blobs`, and exact-check the literal before extracting a match-centered snippet.
+
+The built-in `search_snippet(text, query, max_chars[, literal])` SQL scalar function extracts a verbatim Unicode-scalar window of at most `max_chars` characters (inclusive of leading/trailing `…` markers) centered around the best match for `query` (reusing `search_query()`'s tokenization for CJK phrases, split identifiers, and `prefix*`, or an optional case-insensitive exact `literal` that takes precedence when supplied). It returns `NULL` for `NULL` text, falls back to a head prefix if no match appears in the stored bounded text, and never injects highlight markers into the verbatim text:
 
 ```sql
 WITH candidates AS MATERIALIZED (
@@ -194,7 +196,7 @@ SELECT ci.item_id,
        ci.role,
        ci.loop_id,
        ci.loop_position,
-       substr(b.text, max(instr(b.text, '智能体使用') - 160, 1), 512) AS snippet
+       search_snippet(b.text, '智能体使用', 512, '智能体使用') AS snippet
 FROM candidate_items ci
 JOIN blobs b USING (blob_id)
 WHERE instr(b.text, '智能体使用') > 0

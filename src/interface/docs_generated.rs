@@ -103,6 +103,13 @@ fn persist_sites() -> String {
     keys.join(", ")
 }
 
+fn skill_version() -> String {
+    format!(
+        "> Version contract: written for `trace-index {}`. If `trace-index --version` differs, follow the installed binary's `--help` and refresh this skill with `trace-index docs get skill`.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn regions() -> Vec<Region> {
     vec![
         Region {
@@ -119,6 +126,11 @@ fn regions() -> Vec<Region> {
             path: "docs/reference/output-contract.md",
             name: "persist-sites",
             body: persist_sites(),
+        },
+        Region {
+            path: ".agents/skills/trace-index/SKILL.md",
+            name: "skill-version",
+            body: skill_version(),
         },
     ]
 }
@@ -269,5 +281,49 @@ mod tests {
         );
         assert_eq!(by_name("relation-list").body.lines().count(), 8);
         assert_eq!(by_name("persist-sites").body.matches('`').count(), 6 * 2);
+        assert!(
+            by_name("skill-version")
+                .body
+                .contains(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn root_help_lists_every_builtin_template_and_its_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry =
+            crate::interface::template::TemplateRegistry::load(&dir.path().join("config.toml"))
+                .expect("load builtin templates");
+        let help = crate::interface::cli::ROOT_AFTER_HELP;
+        for summary in registry.list_report().templates {
+            let name = summary.name.as_str();
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("ROOT_AFTER_HELP missing built-in template `{name}`"));
+            let open = line
+                .rfind('(')
+                .unwrap_or_else(|| panic!("ROOT_AFTER_HELP line for `{name}` missing `(...)`"));
+            let close = line
+                .rfind(')')
+                .unwrap_or_else(|| panic!("ROOT_AFTER_HELP line for `{name}` missing `)`"));
+            let listed: std::collections::BTreeSet<&str> = line[open + 1..close]
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect();
+            let expected: std::collections::BTreeSet<String> = summary
+                .required_params
+                .iter()
+                .map(|param| format!("{param}*"))
+                .chain(summary.optional_params.iter().cloned())
+                .collect();
+            let expected_refs: std::collections::BTreeSet<&str> =
+                expected.iter().map(String::as_str).collect();
+            assert_eq!(
+                listed, expected_refs,
+                "ROOT_AFTER_HELP parameter summary for template `{name}` drifted from built-in SQL header"
+            );
+        }
     }
 }

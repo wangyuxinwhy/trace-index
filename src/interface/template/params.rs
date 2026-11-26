@@ -109,10 +109,10 @@ fn validate_item_ref_session_scope(
     resolutions: &BTreeMap<String, ParamResolution>,
     store: &Store,
 ) -> Result<()> {
-    let target_session = resolutions.values().find_map(|res| match res {
-        ParamResolution::SessionRef { session_id, .. } => Some(*session_id),
-        ParamResolution::Time { .. } => None,
-    });
+    let target_session = match resolutions.get("session") {
+        Some(ParamResolution::SessionRef { session_id, .. }) => Some(*session_id),
+        _ => None,
+    };
     let Some(expected_session_id) = target_session else {
         return Ok(());
     };

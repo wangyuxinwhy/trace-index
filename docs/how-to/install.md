@@ -59,6 +59,17 @@ trace-index --version
 
 `cargo install` compiles locally and can take longer than downloading a native release. Both installation paths provide the same CLI, bundled documentation, and public Schema.
 
+## Export or refresh the Agent Skill
+
+The installed binary bundles its version-matched `SKILL.md` (preserving YAML frontmatter). Print it to stdout or write it to whichever path your Agent harness reads:
+
+```bash
+trace-index docs get skill
+trace-index docs get skill > /path/to/your/skills/trace-index/SKILL.md
+```
+
+The installer never writes into external Agent harness directories automatically; re-run `trace-index docs get skill` after upgrading `trace-index` to keep your Skill copy matched to the installed binary.
+
 ## Verify the installer locally
 
 Repository maintainers can test the complete package, download, checksum, and installation path without publishing:

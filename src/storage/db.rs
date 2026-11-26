@@ -15,6 +15,7 @@ use super::schema::{
     CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, DROP_SECONDARY_INDEXES, STORAGE_FORMAT,
 };
 use super::search::make_term_search_query;
+use super::snippet::extract_search_snippet;
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -528,7 +529,40 @@ fn register_query_functions(connection: &Connection, storage_format: u32) -> Res
                 )),
             }
         })
-        .context("failed to register blob_text SQL function")
+        .context("failed to register blob_text SQL function")?;
+    register_search_snippet_functions(connection, flags)
+}
+
+fn register_search_snippet_functions(connection: &Connection, flags: FunctionFlags) -> Result<()> {
+    for arity in [3_i32, 4_i32] {
+        connection
+            .create_scalar_function("search_snippet", arity, flags, move |context| {
+                let text: Option<String> = context.get(0)?;
+                let Some(text) = text else {
+                    return Ok(rusqlite::types::Value::Null);
+                };
+                let query: Option<String> = context.get(1)?;
+                let max_chars_raw: i64 = context.get(2)?;
+                let max_chars = usize::try_from(max_chars_raw).ok().filter(|&n| n >= 1).ok_or_else(|| {
+                    rusqlite::Error::UserFunctionError(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("search_snippet max_chars must be an integer >= 1, got {max_chars_raw}"),
+                        )
+                        .into(),
+                    )
+                })?;
+                let literal: Option<String> = if arity == 4 { context.get(3)? } else { None };
+                Ok(rusqlite::types::Value::Text(extract_search_snippet(
+                    &text,
+                    query.as_deref(),
+                    max_chars,
+                    literal.as_deref(),
+                )))
+            })
+            .context("failed to register search_snippet SQL function")?;
+    }
+    Ok(())
 }
 
 fn make_trigram_query(

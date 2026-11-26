@@ -90,7 +90,7 @@ The two indexing limits change which Source content becomes a published fact, so
 
 ## User SQL templates
 
-Optional custom `.sql` query templates may be placed in `<config_dir>/templates/*.sql` (the `templates` subdirectory beside the resolved configuration file; the current working directory is never searched). Each file starts with a `/* trace-index-template ... */` TOML metadata comment block (`name`, `description`, optional `min_format`, `default_limit`, and `[params.<name>]`) followed by a single read-only SQL statement with native `:param` placeholders and optional `-- #if <param>` / `-- #if !<param>` / `-- #else` / `-- #endif` line conditionals. User template names must be unique across user files and cannot shadow built-in template names.
+Optional custom `.sql` query templates may be placed in `<config_dir>/templates/*.sql` (the `templates` subdirectory beside the resolved configuration file; the current working directory is never searched). Each file starts with a `/* trace-index-template ... */` TOML metadata comment block (`name`, `description`, optional `min_format`, `default_limit`, and `[params.<name>]`) followed by a single read-only SQL statement with native `:param` placeholders and optional `-- #if <param>` / `-- #if !<param>` / `-- #if <param>=<value>` (for `enum` or `string` parameters without whitespace) / `-- #else` / `-- #endif` line conditionals. User template names must be unique across user files and cannot shadow built-in template names.
 
 ## Configuration commands
 

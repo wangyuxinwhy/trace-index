@@ -13,6 +13,10 @@ description = "Search terms passed to search_query()"
 type = "string"
 description = "Filter to one runtime (e.g. codex, claude, pi, antigravity)"
 
+[params.exclude_session]
+type = "session_ref"
+description = "Exclude one already-indexed session (id:<n>, native:<id>, <runtime>:<id>, or unambiguous id / >=8-char native_id prefix)"
+
 [params.cwd]
 type = "string"
 description = "Filter sessions whose working_directory contains this substring"
@@ -45,6 +49,9 @@ WITH hits AS (
     FROM item_search(search_query(:query)) AS fts
     JOIN items AS i ON i.item_id = fts.rowid
     WHERE i.item_id = fts.rowid
+-- #if exclude_session
+      AND i.session_id <> :exclude_session
+-- #endif
 -- #if roles
       AND json_extract(i.semantic, '$.role') IN (SELECT value FROM json_each(:roles))
 -- #endif

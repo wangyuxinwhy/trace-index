@@ -38,7 +38,7 @@ Every template is inspectable SQL. Pass `--render` to resolve typed parameters (
 trace-index query template run shell-calls -p program=cargo -p since=7d --render
 ```
 
-You can also add reusable custom `.sql` templates under `<config_dir>/templates/*.sql` with a leading `/* trace-index-template ... */` TOML metadata block and optional `-- #if <param>` / `-- #if !<param>` / `-- #else` / `-- #endif` line conditionals. User templates cannot shadow built-in names and are validated read-only by `trace-index config check`.
+You can also add reusable custom `.sql` templates under `<config_dir>/templates/*.sql` with a leading `/* trace-index-template ... */` TOML metadata block and optional `-- #if <param>` / `-- #if !<param>` / `-- #if <param>=<value>` / `-- #else` / `-- #endif` line conditionals. User templates cannot shadow built-in names and are validated read-only by `trace-index config check`.
 
 ## Run custom parameterized SQL
 

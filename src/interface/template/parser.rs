@@ -2,10 +2,11 @@
 //!
 //! Template files are valid `SQL` with a leading `/* trace-index-template ... */`
 //! TOML metadata comment block and optional line-level `-- #if <param>`,
-//! `-- #if !<param>`, `-- #else`, and `-- #endif` directives. Values are never
-//! text-interpolated; every parameter binds through `SQLite` native `:param`.
+//! `-- #if !<param>`, `-- #if <param>=<value>`, `-- #else`, and `-- #endif`
+//! directives. Values are never text-interpolated; every parameter binds
+//! through `SQLite` native `:param`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -81,11 +82,16 @@ const fn default_template_limit() -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConditionalExpr {
+    Present { param: String, negated: bool },
+    Equals { param: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TemplateNode {
     Line(String),
     Conditional {
-        param: String,
-        negated: bool,
+        condition: ConditionalExpr,
         then_lines: Vec<String>,
         else_lines: Vec<String>,
     },
@@ -120,23 +126,34 @@ pub(crate) fn parse_template_source(source: &str, origin_label: &str) -> Result<
 }
 
 /// Renders template nodes into executable SQL given the active presence/bool
-/// flags for each declared parameter.
+/// flags and bound values for each declared parameter.
 pub(crate) fn render_nodes(
     nodes: &[TemplateNode],
     active_flags: &BTreeMap<String, bool>,
+    bound: &BTreeMap<String, crate::interface::query::SqlParamValue>,
 ) -> String {
     let mut lines: Vec<&str> = Vec::new();
     for node in nodes {
         match node {
             TemplateNode::Line(line) => lines.push(line.as_str()),
             TemplateNode::Conditional {
-                param,
-                negated,
+                condition,
                 then_lines,
                 else_lines,
             } => {
-                let active = active_flags.get(param).copied().unwrap_or(false);
-                let take_then = if *negated { !active } else { active };
+                let take_then = match condition {
+                    ConditionalExpr::Present { param, negated } => {
+                        let active = active_flags.get(param).copied().unwrap_or(false);
+                        if *negated { !active } else { active }
+                    }
+                    ConditionalExpr::Equals { param, value } => {
+                        matches!(
+                            bound.get(param),
+                            Some(crate::interface::query::SqlParamValue::Text(actual))
+                                if actual == value
+                        )
+                    }
+                };
                 let branch = if take_then { then_lines } else { else_lines };
                 for line in branch {
                     lines.push(line.as_str());
@@ -329,8 +346,7 @@ fn validate_default_value(
 }
 
 struct OpenConditional {
-    param: String,
-    negated: bool,
+    condition: ConditionalExpr,
     start_line: usize,
     in_else: bool,
     then_lines: Vec<String>,
@@ -343,7 +359,6 @@ fn parse_body_directives(
     header: &TemplateHeader,
     origin_label: &str,
 ) -> Result<Vec<TemplateNode>> {
-    let declared: BTreeSet<&str> = header.params.keys().map(String::as_str).collect();
     let mut nodes = Vec::new();
     let mut open: Option<OpenConditional> = None;
 
@@ -354,7 +369,7 @@ fn parse_body_directives(
             handle_directive(
                 directive.trim(),
                 line_no,
-                &declared,
+                header,
                 &mut open,
                 &mut nodes,
                 origin_label,
@@ -373,10 +388,14 @@ fn parse_body_directives(
     }
 
     if let Some(unclosed) = open {
+        let param = match &unclosed.condition {
+            ConditionalExpr::Present { param, .. } | ConditionalExpr::Equals { param, .. } => {
+                param.as_str()
+            }
+        };
         bail!(
-            "{origin_label}:{}: unclosed `-- #if` for parameter {:?}",
+            "{origin_label}:{}: unclosed `-- #if` for parameter {param:?}",
             unclosed.start_line,
-            unclosed.param
         );
     }
     Ok(nodes)
@@ -385,7 +404,7 @@ fn parse_body_directives(
 fn handle_directive(
     directive: &str,
     line_no: usize,
-    declared: &BTreeSet<&str>,
+    header: &TemplateHeader,
     open: &mut Option<OpenConditional>,
     nodes: &mut Vec<TemplateNode>,
     origin_label: &str,
@@ -397,23 +416,9 @@ fn handle_directive(
                 existing.start_line
             );
         }
-        let expr = rest.trim();
-        let (negated, param) = if let Some(inner) = expr.strip_prefix('!') {
-            (true, inner.trim())
-        } else {
-            (false, expr)
-        };
-        if !is_valid_param_name(param) {
-            bail!(
-                "{origin_label}:{line_no}: invalid `-- #if` target {expr:?}; use `-- #if <param>` or `-- #if !<param>`"
-            );
-        }
-        if !declared.contains(param) {
-            bail!("{origin_label}:{line_no}: `-- #if` references undeclared parameter {param:?}");
-        }
+        let condition = parse_conditional_expr(rest.trim(), line_no, header, origin_label)?;
         *open = Some(OpenConditional {
-            param: param.to_owned(),
-            negated,
+            condition,
             start_line: line_no,
             in_else: false,
             then_lines: Vec::new(),
@@ -436,16 +441,71 @@ fn handle_directive(
             bail!("{origin_label}:{line_no}: unexpected `-- #endif` without matching `-- #if`");
         };
         nodes.push(TemplateNode::Conditional {
-            param: finished.param,
-            negated: finished.negated,
+            condition: finished.condition,
             then_lines: finished.then_lines,
             else_lines: finished.else_lines,
         });
         return Ok(());
     }
     bail!(
-        "{origin_label}:{line_no}: unknown template directive `-- #{directive}`; supported directives are `-- #if <param>`, `-- #if !<param>`, `-- #else`, and `-- #endif`"
+        "{origin_label}:{line_no}: unknown template directive `-- #{directive}`; supported directives are `-- #if <param>`, `-- #if !<param>`, `-- #if <param>=<value>`, `-- #else`, and `-- #endif`"
     );
+}
+
+fn parse_conditional_expr(
+    expr: &str,
+    line_no: usize,
+    header: &TemplateHeader,
+    origin_label: &str,
+) -> Result<ConditionalExpr> {
+    if let Some((raw_param, raw_value)) = expr.split_once('=') {
+        let param = raw_param.trim();
+        let value = raw_value.trim();
+        if !is_valid_param_name(param) || value.is_empty() || value.contains(char::is_whitespace) {
+            bail!(
+                "{origin_label}:{line_no}: invalid `-- #if` equality expression {expr:?}; use `-- #if <param>=<value>`"
+            );
+        }
+        let Some(spec) = header.params.get(param) else {
+            bail!("{origin_label}:{line_no}: `-- #if` references undeclared parameter {param:?}");
+        };
+        if !matches!(spec.kind, ParamType::Enum | ParamType::String) {
+            bail!(
+                "{origin_label}:{line_no}: `-- #if {param}={value}` is only supported for enum or string parameters"
+            );
+        }
+        if spec.kind == ParamType::Enum
+            && !spec.values.is_empty()
+            && !spec.values.iter().any(|candidate| candidate == value)
+        {
+            bail!(
+                "{origin_label}:{line_no}: `-- #if {param}={value}` value is not in {:?}",
+                spec.values
+            );
+        }
+        return Ok(ConditionalExpr::Equals {
+            param: param.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+
+    let (negated, param) = if let Some(inner) = expr.strip_prefix('!') {
+        (true, inner.trim())
+    } else {
+        (false, expr)
+    };
+    if !is_valid_param_name(param) {
+        bail!(
+            "{origin_label}:{line_no}: invalid `-- #if` target {expr:?}; use `-- #if <param>`, `-- #if !<param>`, or `-- #if <param>=<value>`"
+        );
+    }
+    if !header.params.contains_key(param) {
+        bail!("{origin_label}:{line_no}: `-- #if` references undeclared parameter {param:?}");
+    }
+    Ok(ConditionalExpr::Present {
+        param: param.to_owned(),
+        negated,
+    })
 }
 
 pub(crate) fn is_valid_template_name(name: &str) -> bool {

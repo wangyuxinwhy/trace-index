@@ -9,5 +9,6 @@ pub(crate) mod schema;
 mod schema_v5;
 pub(crate) mod search;
 mod semantic_encode;
+pub(crate) mod snippet;
 
 pub(crate) mod metadata;
