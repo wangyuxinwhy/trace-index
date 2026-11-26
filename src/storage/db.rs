@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -208,6 +209,43 @@ impl Store {
 
     pub(crate) fn source_state(&self, path: &str) -> Result<Option<SourceState>> {
         source_state(&self.connection, path)
+    }
+
+    /// Loads every persisted Source checkpoint in a single sequential scan so
+    /// multi-file syncs and reconciles skip unchanged Sources in O(1) without
+    /// issuing one `SQLite` lookup per discovered file.
+    pub(crate) fn load_all_source_states(&self) -> Result<HashMap<String, SourceState>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT path, id, adapter, file_size, modified_ns, indexed_bytes, indexed_lines,
+                        indexed_fingerprint, status = 'complete'
+                   FROM trace_sources",
+            )
+            .context("failed to prepare bulk source state query")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SourceState {
+                        id: row.get(1)?,
+                        adapter: row.get(2)?,
+                        file_size: from_sql_u64(row.get(3)?)?,
+                        modified_ns: row.get(4)?,
+                        indexed_bytes: from_sql_u64(row.get(5)?)?,
+                        indexed_lines: from_sql_u64(row.get(6)?)?,
+                        indexed_fingerprint: row.get(7)?,
+                        complete: row.get(8)?,
+                    },
+                ))
+            })
+            .context("failed to query bulk source states")?;
+        let mut states = HashMap::new();
+        for row in rows {
+            let (path, state) = row.context("failed to read bulk source state")?;
+            states.insert(path, state);
+        }
+        Ok(states)
     }
 
     pub(crate) fn is_empty(&self) -> Result<bool> {
@@ -493,25 +531,25 @@ fn make_trigram_query(literal: &str) -> std::result::Result<String, &'static str
 
 pub(crate) fn source_state(connection: &Connection, path: &str) -> Result<Option<SourceState>> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT id, adapter, file_size, modified_ns, indexed_bytes, indexed_lines,
                     indexed_fingerprint, status = 'complete'
                FROM trace_sources
               WHERE path = ?1",
-            [path],
-            |row| {
-                Ok(SourceState {
-                    id: row.get(0)?,
-                    adapter: row.get(1)?,
-                    file_size: from_sql_u64(row.get(2)?)?,
-                    modified_ns: row.get(3)?,
-                    indexed_bytes: from_sql_u64(row.get(4)?)?,
-                    indexed_lines: from_sql_u64(row.get(5)?)?,
-                    indexed_fingerprint: row.get(6)?,
-                    complete: row.get(7)?,
-                })
-            },
         )
+        .context("failed to prepare source state query")?
+        .query_row([path], |row| {
+            Ok(SourceState {
+                id: row.get(0)?,
+                adapter: row.get(1)?,
+                file_size: from_sql_u64(row.get(2)?)?,
+                modified_ns: row.get(3)?,
+                indexed_bytes: from_sql_u64(row.get(4)?)?,
+                indexed_lines: from_sql_u64(row.get(5)?)?,
+                indexed_fingerprint: row.get(6)?,
+                complete: row.get(7)?,
+            })
+        })
         .optional()
         .context("failed to read source state")
 }

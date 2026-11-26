@@ -6,7 +6,7 @@
 //! threads prepare newly discovered Sources in parallel while the main thread
 //! persists each prepared Session sequentially in deterministic discovery order.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Mutex, mpsc};
 use std::thread;
@@ -32,7 +32,7 @@ use crate::ingest::source::{
 use crate::interface::output::SourceIndexResult;
 use crate::shell::syntax;
 use crate::storage::blob::BlobCache;
-use crate::storage::db::{Store, to_sql_i64};
+use crate::storage::db::{SourceState, Store, to_sql_i64};
 use crate::storage::persist::clear_projection;
 
 /// Maximum number of background threads preparing new Sources in parallel
@@ -52,38 +52,23 @@ pub(super) fn pipeline_worker_count(file_count: usize) -> usize {
         .min(MAX_PIPELINE_WORKERS)
 }
 
-pub(super) fn load_existing_source_paths(store: &Store) -> Result<HashSet<String>> {
-    let mut statement = store
-        .connection()
-        .prepare("SELECT path FROM trace_sources")
-        .context("failed to query existing source paths")?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("failed to inspect existing source paths")?;
-    let mut paths = HashSet::new();
-    for row in rows {
-        paths.insert(row.context("failed to read existing source path")?);
-    }
-    Ok(paths)
-}
-
 pub(super) fn is_pipeline_eligible(
     file: &DiscoveredFile,
-    existing_paths: &HashSet<String>,
+    existing_sources: &HashMap<String, SourceState>,
 ) -> bool {
     let path = file.path.to_string_lossy();
-    if existing_paths.contains(path.as_ref()) {
+    if existing_sources.contains_key(path.as_ref()) {
         return false;
     }
     let alternate = alternate_encoding(&file.path);
     let alternate_str = alternate.to_string_lossy();
-    !existing_paths.contains(alternate_str.as_ref())
+    !existing_sources.contains_key(alternate_str.as_ref())
 }
 
 pub(super) fn index_files_pipelined(
     store: &mut Store,
     files: &[DiscoveredFile],
-    existing_paths: &HashSet<String>,
+    existing_sources: &HashMap<String, SourceState>,
     worker_count: usize,
     options: &IndexOptions,
     scratch: &mut SyncScratch,
@@ -131,7 +116,7 @@ pub(super) fn index_files_pipelined(
             }
             while in_flight < in_flight_limit
                 && next_dispatch < files.len()
-                && is_pipeline_eligible(&files[next_dispatch], existing_paths)
+                && is_pipeline_eligible(&files[next_dispatch], existing_sources)
             {
                 if job_tx.send(next_dispatch).is_err() {
                     break;
@@ -165,7 +150,15 @@ pub(super) fn index_files_pipelined(
                     )
                 })
             } else {
-                index_source(store, file, options, scratch, sink.telemetry, sink.progress)
+                index_source(
+                    store,
+                    file,
+                    options,
+                    Some(existing_sources),
+                    scratch,
+                    sink.telemetry,
+                    sink.progress,
+                )
             };
             record_source_outcome(file, outcome, &mut scratch.blobs, sink);
         }
