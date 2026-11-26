@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::types::ValueRef;
+use rusqlite::types::{Value as SqlValue, ValueRef};
+use serde::Serialize;
 
 use super::output::{SchemaColumn, SchemaObject, SchemaReport, SqlQueryReport};
 use crate::storage::db::Store;
@@ -25,13 +26,126 @@ pub struct QueryBudget {
     pub timeout: Duration,
 }
 
+/// Typed named SQL parameter value bound via `SQLite` native parameter binding.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SqlParamValue {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+impl SqlParamValue {
+    fn to_sqlite_value(&self) -> SqlValue {
+        match self {
+            Self::Null => SqlValue::Null,
+            Self::Int(value) => SqlValue::Integer(*value),
+            Self::Real(value) => SqlValue::Real(*value),
+            Self::Text(value) => SqlValue::Text(value.clone()),
+        }
+    }
+}
+
+/// Parses `--params-json` and repeatable `-p key=value` CLI arguments into
+/// typed SQL bind parameters.
+///
+/// `--params-json` preserves exact JSON types (`null`, integer, float, boolean
+/// as `0`/`1`, string, or compact JSON text for arrays/objects). Repeatable
+/// `--param key=value` pairs bind as text and override matching JSON keys.
+///
+/// # Errors
+///
+/// Returns an error if `--params-json` is not a valid JSON object, contains an
+/// invalid parameter name, or a `--param` item is missing `=`.
+pub fn parse_cli_query_params(
+    params_json: Option<&str>,
+    raw_params: &[String],
+) -> Result<BTreeMap<String, SqlParamValue>> {
+    let mut params = BTreeMap::new();
+    if let Some(json_text) = params_json {
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_text).context("--params-json must be valid JSON")?;
+        let Some(object) = parsed.as_object() else {
+            bail!("--params-json must be a JSON object mapping parameter names to values");
+        };
+        for (raw_key, value) in object {
+            let key = normalize_param_name(raw_key)?;
+            params.insert(key, json_to_sql_param(value)?);
+        }
+    }
+    for entry in raw_params {
+        let Some((raw_key, raw_value)) = entry.split_once('=') else {
+            bail!("invalid --param {entry:?}; expected key=value");
+        };
+        let key = normalize_param_name(raw_key)?;
+        params.insert(key, SqlParamValue::Text(raw_value.to_owned()));
+    }
+    Ok(params)
+}
+
+fn normalize_param_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_start_matches([':', '@', '$']);
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || trimmed.as_bytes()[0].is_ascii_digit()
+    {
+        bail!("invalid SQL parameter name {raw:?}; use ASCII letters, digits, and '_'");
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn json_to_sql_param(value: &serde_json::Value) -> Result<SqlParamValue> {
+    match value {
+        serde_json::Value::Null => Ok(SqlParamValue::Null),
+        serde_json::Value::Bool(flag) => Ok(SqlParamValue::Int(i64::from(*flag))),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Ok(SqlParamValue::Int(int))
+            } else if let Some(real) = number.as_f64() {
+                Ok(SqlParamValue::Real(real))
+            } else {
+                bail!("JSON number {number} exceeds 64-bit SQLite parameter range")
+            }
+        }
+        serde_json::Value::String(text) => Ok(SqlParamValue::Text(text.clone())),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Ok(SqlParamValue::Text(
+            serde_json::to_string(value).context("failed to encode JSON parameter value")?,
+        )),
+    }
+}
+
 /// Executes one read-only SQL statement with bounded rows, cell size, and time.
 ///
 /// # Errors
 ///
 /// Returns an error for non-read-only or multi-statement SQL, duplicate output
 /// column names, timeout, or `SQLite` decoding failures.
+#[cfg(test)]
 pub fn query_sql(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryReport> {
+    query_sql_with_params(store, sql, &BTreeMap::new(), budget)
+}
+
+/// Executes one parameterized read-only SQL statement with bounded rows, cell
+/// size, and time.
+///
+/// Parameters are bound by introspecting `SQLite`'s own prepared statement
+/// parameter list (`parameter_count` / `parameter_name`). Any parameter in
+/// `params` not referenced by the prepared SQL is safely ignored.
+///
+/// # Errors
+///
+/// Returns an error for non-read-only or multi-statement SQL, missing or
+/// positional parameters, duplicate output column names, timeout, or `SQLite`
+/// decoding failures.
+pub fn query_sql_with_params(
+    store: &Store,
+    sql: &str,
+    params: &BTreeMap<String, SqlParamValue>,
+    budget: QueryBudget,
+) -> Result<SqlQueryReport> {
     if sql.trim().is_empty() {
         bail!("SQL must not be empty");
     }
@@ -41,7 +155,7 @@ pub fn query_sql(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQue
     store
         .connection()
         .progress_handler(10_000, Some(move || started.elapsed() >= timeout))?;
-    let result = run_query(store, sql, budget);
+    let result = run_query(store, sql, params, budget);
     store
         .connection()
         .progress_handler(0, None::<fn() -> bool>)?;
@@ -128,7 +242,12 @@ fn error_mentions_item_search_terms(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("item_search_terms"))
 }
 
-fn run_query(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryReport> {
+fn run_query(
+    store: &Store,
+    sql: &str,
+    params: &BTreeMap<String, SqlParamValue>,
+    budget: QueryBudget,
+) -> Result<SqlQueryReport> {
     let executing = Arc::new(AtomicBool::new(false));
     let authorizer_executing = Arc::clone(&executing);
     store
@@ -136,16 +255,47 @@ fn run_query(store: &Store, sql: &str, budget: QueryBudget) -> Result<SqlQueryRe
         .authorizer(Some(move |context: AuthContext<'_>| {
             authorize_read_only_query(context, authorizer_executing.load(Ordering::Relaxed))
         }))?;
-    let result = run_authorized_query(store, sql, budget, &executing);
+    let result = run_authorized_query(store, sql, params, budget, &executing);
     store
         .connection()
         .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
     result
 }
 
+fn bind_named_parameters(
+    statement: &mut rusqlite::Statement<'_>,
+    params: &BTreeMap<String, SqlParamValue>,
+) -> Result<()> {
+    for index in 1..=statement.parameter_count() {
+        let Some(raw_name) = statement.parameter_name(index) else {
+            bail!(
+                "positional SQL placeholder ?{index} is not supported; use named parameters (:name) with --param or --params-json"
+            );
+        };
+        let Some(name) = raw_name.strip_prefix([':', '@', '$']) else {
+            bail!(
+                "positional SQL placeholder {raw_name:?} is not supported; use named parameters (:name)"
+            );
+        };
+        if name.is_empty() || name.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!(
+                "positional SQL placeholder {raw_name:?} is not supported; use named parameters (:name)"
+            );
+        }
+        let Some(value) = params.get(name) else {
+            bail!(
+                "missing SQL parameter {raw_name}; pass --param {name}=<VALUE> or include {name:?} in --params-json"
+            );
+        };
+        statement.raw_bind_parameter(index, value.to_sqlite_value())?;
+    }
+    Ok(())
+}
+
 fn run_authorized_query(
     store: &Store,
     sql: &str,
+    params: &BTreeMap<String, SqlParamValue>,
     budget: QueryBudget,
     executing: &AtomicBool,
 ) -> Result<SqlQueryReport> {
@@ -164,9 +314,11 @@ fn run_authorized_query(
         bail!("query output has duplicate column names; use SQL aliases");
     }
 
+    bind_named_parameters(&mut statement, params)?;
+
     executing.store(true, Ordering::Relaxed);
     let result = (|| {
-        let mut query = statement.query([])?;
+        let mut query = statement.raw_query();
         let mut output = Vec::with_capacity(budget.limit);
         let mut cells_truncated = 0;
         let mut output_bytes = 0_usize;

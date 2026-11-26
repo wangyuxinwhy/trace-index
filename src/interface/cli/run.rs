@@ -8,8 +8,8 @@ use clap::error::{ContextKind, ErrorKind};
 
 use super::{
     AssetCommand, Cli, Command, ConfigCommand, DocsCommand, DocsOutput, IndexCommand,
-    MAX_SQL_INPUT_BYTES, QueryCommand, QueryFormat, QueryRunArgs, RecordCommand, SchemaCommand,
-    StderrProgress, WatchCommand,
+    MAX_SQL_INPUT_BYTES, QueryCommand, QueryFormat, QueryRunArgs, QueryTemplateCommand,
+    RecordCommand, SchemaCommand, StderrProgress, WatchCommand,
 };
 use crate::indexing::indexer::IndexOptions;
 use crate::indexing::status::status;
@@ -23,8 +23,10 @@ use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
 use crate::interface::output::ResponseEnvelope;
 use crate::interface::query::{
-    QueryBudget, format_tsv_truncation_notice, public_schema, query_sql, write_query_tsv,
+    QueryBudget, format_tsv_truncation_notice, parse_cli_query_params, public_schema,
+    query_sql_with_params, write_query_tsv,
 };
+use crate::interface::template::{TemplateRegistry, execute_template, render_template};
 use crate::storage::db::{IndexingPolicy, Store};
 
 pub(crate) fn run() -> Result<()> {
@@ -51,6 +53,16 @@ pub(crate) fn run() -> Result<()> {
             )?;
             if let Command::Session { command } = command {
                 return run_session(command, &loaded);
+            }
+            if let Command::Query {
+                command:
+                    QueryCommand::Template {
+                        command:
+                            command @ (QueryTemplateCommand::List | QueryTemplateCommand::Show { .. }),
+                    },
+            } = command
+            {
+                return run_offline_query_template(command, &loaded);
             }
             if let Command::Index {
                 command: IndexCommand::Watch { command },
@@ -92,7 +104,7 @@ fn run_operational(command: Command, loaded: &LoadedConfig) -> Result<()> {
                 store.connection(),
                 Some(&loaded.effective.metadata_database.path),
             )?;
-            run_query(&store, command)
+            run_query(&store, loaded, command)
         }
         Command::Record { command } => run_record(&store, command),
         Command::Asset { command } => run_asset(&store, command),
@@ -157,9 +169,13 @@ fn cli_error_hint(error: &clap::Error) -> Option<&'static str> {
                 .get(ContextKind::Usage)
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            if usage.contains("trace-index query run") {
+            if usage.contains("trace-index query template run") {
                 Some(
-                    "pass SQL as a positional argument, '--stdin', or '--file <PATH>' (default stdout is compact JSON; pass '--format tsv' for tab-separated rows; run 'trace-index query run --help' for exact flags).",
+                    "pass template parameters with repeatable '-p key=value' (see 'trace-index query template show <NAME>' for exact parameters and 'trace-index query template run --help' for flags).",
+                )
+            } else if usage.contains("trace-index query run") {
+                Some(
+                    "pass SQL as a positional argument, '--stdin', or '--file <PATH>' (bind named parameters with '--params-json' or '-p key=value'; default stdout is compact JSON, or pass '--format tsv'; run 'trace-index query run --help' for exact flags).",
                 )
             } else {
                 Some(
@@ -423,26 +439,78 @@ fn run_schema(store: &Store, command: SchemaCommand) -> Result<()> {
     print_envelope(&public_schema(store, &requested, include_descriptions)?)
 }
 
-fn run_query(store: &Store, command: QueryCommand) -> Result<()> {
-    let QueryCommand::Run(args) = command;
-    let sql = read_query_sql(&args)?;
-    let report = query_sql(
-        store,
-        &sql,
-        QueryBudget {
-            limit: args.limit,
-            max_cell_bytes: args.max_cell_bytes,
-            max_output_bytes: args.max_output_bytes,
-            timeout: Duration::from_secs(u64::try_from(args.timeout_seconds)?),
-        },
-    )?;
-    match args.format {
-        QueryFormat::Json => print_envelope(&report),
+fn run_offline_query_template(command: QueryTemplateCommand, loaded: &LoadedConfig) -> Result<()> {
+    let registry = TemplateRegistry::load(&loaded.effective.config_file.path)?;
+    match command {
+        QueryTemplateCommand::List => print_envelope(&registry.list_report()),
+        QueryTemplateCommand::Show { name } => print_envelope(&registry.show_report(&name)?),
+        QueryTemplateCommand::Run(_) => {
+            unreachable!("template run opens the index read-only")
+        }
+    }
+}
+
+fn run_query(store: &Store, loaded: &LoadedConfig, command: QueryCommand) -> Result<()> {
+    match command {
+        QueryCommand::Run(args) => {
+            let sql = read_query_sql(&args)?;
+            let params = parse_cli_query_params(args.params_json.as_deref(), &args.param)?;
+            let report = query_sql_with_params(
+                store,
+                &sql,
+                &params,
+                QueryBudget {
+                    limit: args.limit,
+                    max_cell_bytes: args.max_cell_bytes,
+                    max_output_bytes: args.max_output_bytes,
+                    timeout: Duration::from_secs(u64::try_from(args.timeout_seconds)?),
+                },
+            )?;
+            emit_query_output(&report, args.format)
+        }
+        QueryCommand::Template {
+            command: QueryTemplateCommand::Run(args),
+        } => {
+            let registry = TemplateRegistry::load(&loaded.effective.config_file.path)?;
+            let entry = registry.get(&args.name)?;
+            if args.render {
+                let rendered = render_template(entry, store, &args.param)?;
+                return print_envelope(&rendered);
+            }
+            let report = execute_template(
+                entry,
+                store,
+                &args.param,
+                args.limit,
+                QueryBudget {
+                    limit: entry.parsed.header.default_limit,
+                    max_cell_bytes: args.max_cell_bytes,
+                    max_output_bytes: args.max_output_bytes,
+                    timeout: Duration::from_secs(u64::try_from(args.timeout_seconds)?),
+                },
+            )?;
+            match args.format {
+                QueryFormat::Json => print_envelope(&report),
+                QueryFormat::Tsv => emit_query_output(&report.query, QueryFormat::Tsv),
+            }
+        }
+        QueryCommand::Template {
+            command: QueryTemplateCommand::List | QueryTemplateCommand::Show { .. },
+        } => unreachable!("offline template commands are dispatched before opening the database"),
+    }
+}
+
+fn emit_query_output(
+    report: &crate::interface::output::SqlQueryReport,
+    format: QueryFormat,
+) -> Result<()> {
+    match format {
+        QueryFormat::Json => print_envelope(report),
         QueryFormat::Tsv => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            write_query_tsv(&report, &mut lock)?;
-            if let Some(notice) = format_tsv_truncation_notice(&report) {
+            write_query_tsv(report, &mut lock)?;
+            if let Some(notice) = format_tsv_truncation_notice(report) {
                 eprintln!("{notice}");
             }
             Ok(())

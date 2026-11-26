@@ -1211,3 +1211,164 @@ fn schema_get_accepts_multiple_relations_and_query_run_supports_tsv_output() {
     assert!(truncated_stderr.contains("reason=row_limit"));
     assert!(truncated_stderr.contains("cells_truncated=1"));
 }
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "end-to-end external-process contract check for templates, --render forking, and config check"
+)]
+fn query_templates_and_parameterized_query_run_work_end_to_end() {
+    let directory = tempdir().expect("temporary directory");
+    let config_path = directory.path().join("config.toml");
+    let unused_db = directory.path().join("never-created.sqlite");
+
+    // `query template list` and `show` work offline without creating any database or config file.
+    let list = compact_json(&run(&[
+        "--db",
+        path_text(&unused_db),
+        "query",
+        "template",
+        "list",
+    ]));
+    assert!(!unused_db.exists());
+    let template_names: Vec<&str> = list["data"]["templates"]
+        .as_array()
+        .expect("templates array")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("template name"))
+        .collect();
+    for expected in [
+        "item-context",
+        "recent-sessions",
+        "search-items",
+        "search-sessions",
+        "session-transcript",
+        "shell-calls",
+    ] {
+        assert!(
+            template_names.contains(&expected),
+            "missing built-in template {expected} in {template_names:?}"
+        );
+    }
+
+    let show = compact_json(&run(&[
+        "--db",
+        path_text(&unused_db),
+        "query",
+        "template",
+        "show",
+        "session-transcript",
+    ]));
+    assert_eq!(show["data"]["name"], "session-transcript");
+    assert_eq!(show["data"]["origin"]["kind"], "builtin");
+    assert!(!unused_db.exists());
+
+    // Create a minimal explicit config for template dir + config check tests.
+    fs::write(&config_path, "schema_version = 1\n").expect("write config.toml");
+
+    // Index a fixture and exercise `--render` -> lossless `query run --params-json` forking.
+    let (database, _, _) = index_fixture(directory.path(), "template e2e probe");
+    let rendered = compact_json(&run(&[
+        "--config",
+        path_text(&config_path),
+        "--db",
+        path_text(&database),
+        "query",
+        "template",
+        "run",
+        "session-transcript",
+        "-p",
+        "session=1",
+        "--render",
+    ]));
+    assert_eq!(rendered["data"]["template"], "session-transcript");
+    assert_eq!(rendered["data"]["resolved"]["session"]["session_id"], 1);
+    let rendered_sql = rendered["data"]["sql"].as_str().expect("rendered sql");
+    let rendered_params = serde_json::to_string(&rendered["data"]["params"]).expect("params json");
+
+    let forked = compact_json(&run_with_stdin(
+        &[
+            "--db",
+            path_text(&database),
+            "query",
+            "run",
+            "--stdin",
+            "--params-json",
+            &rendered_params,
+        ],
+        rendered_sql,
+    ));
+    assert!(forked["data"]["returned"].as_u64().expect("returned") >= 1);
+
+    // Execute template directly with `--format tsv` and verify clean stdout.
+    let tsv = run(&[
+        "--config",
+        path_text(&config_path),
+        "--db",
+        path_text(&database),
+        "query",
+        "template",
+        "run",
+        "recent-sessions",
+        "--format",
+        "tsv",
+    ]);
+    assert!(
+        tsv.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tsv.stderr)
+    );
+    let tsv_text = String::from_utf8(tsv.stdout).expect("utf-8 tsv");
+    assert!(tsv_text.starts_with("session_id\truntime\tnative_id\t"));
+    assert_eq!(tsv_text.lines().count(), 2);
+
+    // User template under <config_dir>/templates/ loads cleanly; invalid template fails `config check`.
+    let templates_dir = directory.path().join("templates");
+    fs::create_dir_all(&templates_dir).expect("mkdir templates");
+    fs::write(
+        templates_dir.join("count-items.sql"),
+        "/* trace-index-template\nname = \"count-items\"\ndescription = \"Count items\"\n*/\nSELECT COUNT(*) AS total FROM items\n",
+    )
+    .expect("write user template");
+    let custom_run = compact_json(&run(&[
+        "--config",
+        path_text(&config_path),
+        "--db",
+        path_text(&database),
+        "query",
+        "template",
+        "run",
+        "count-items",
+    ]));
+    assert_eq!(custom_run["data"]["origin"]["kind"], "user");
+    assert!(
+        custom_run["data"]["rows"][0]["total"]
+            .as_u64()
+            .expect("total")
+            >= 1
+    );
+
+    fs::write(
+        templates_dir.join("bad-shadow.sql"),
+        "/* trace-index-template\nname = \"shell-calls\"\ndescription = \"Attempt shadow\"\n*/\nSELECT 1 AS x\n",
+    )
+    .expect("write shadowing template");
+    let check_out = run(&[
+        "--config",
+        path_text(&config_path),
+        "--db",
+        path_text(&database),
+        "config",
+        "check",
+    ]);
+    assert!(!check_out.status.success());
+    let check_json: Value = serde_json::from_slice(&check_out.stdout).expect("config check json");
+    assert_eq!(check_json["data"]["valid"], false);
+    assert!(
+        check_json["data"]["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|issue| issue["code"] == "invalid_query_template")
+    );
+}

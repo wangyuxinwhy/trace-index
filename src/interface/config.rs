@@ -537,6 +537,16 @@ pub(crate) fn check_selected(
         }
     }
     check_database_path(&loaded.effective.database.path, &mut issues);
+    for issue in
+        crate::interface::template::validate_user_templates(&loaded.effective.config_file.path)
+    {
+        issues.push(ConfigCheckIssue {
+            level: ConfigCheckLevel::Error,
+            code: "invalid_query_template",
+            message: issue.message,
+            path: Some(issue.path),
+        });
+    }
     let valid = !issues
         .iter()
         .any(|issue| matches!(issue.level, ConfigCheckLevel::Error));
