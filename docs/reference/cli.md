@@ -39,6 +39,10 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 | `schema get` | Get one or more public SQL relations' schemas |
 | `query` | Execute one bounded read-only SQL statement against public relations |
 | `query run` | Run one bounded read-only SQL statement |
+| `query template` | Discover, inspect, render, or run named read-only SQL templates |
+| `query template list` | List built-in and configured user SQL templates without opening the database |
+| `query template show` | Show one SQL template's parameters and source SQL without opening the database |
+| `query template run` | Render or execute one named SQL template with typed parameter binding |
 | `record` | Inspect, verify, or export physical JSONL records |
 | `record inspect` | Verify and inspect one display-safe source-backed Record representation |
 | `record verify` | Verify one Record against its original source bytes |
@@ -50,6 +54,6 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 
 Use `trace-index --help`, `trace-index <noun> --help`, and `trace-index <noun> <verb> --help` for version-matched concepts and command details.
 
-`docs`, `config`, `schema`, `index watch status`, and `session metadata` can operate without opening the index. `index sync` and `index watch run` write the trace index; `index watch install/uninstall` manage an opt-in user-level OS service; `session metadata set/delete` write the independent caller-owned metadata store. Queries open the selected index and metadata store read-only. See [Session Metadata](../how-to/session-metadata.md) for whole-document replacement and version checks.
+`docs`, `config`, `schema`, `query template list`, `query template show`, `index watch status`, and `session metadata` can operate without opening the index. `index sync` and `index watch run` write the trace index; `index watch install/uninstall` manage an opt-in user-level OS service; `session metadata set/delete` write the independent caller-owned metadata store. Queries (including `query template run`) open the selected index and metadata store read-only. See [Session Metadata](../how-to/session-metadata.md) for whole-document replacement and version checks.
 
 The CLI intentionally has no shortcut command for a query that SQL already expresses. A new command must establish a safety or side-effect boundary, expose a capability SQL cannot reliably express, or be justified by repeated experiments.

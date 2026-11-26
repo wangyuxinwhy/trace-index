@@ -7,3 +7,4 @@ pub(crate) mod docs;
 pub(crate) mod docs_generated;
 pub(crate) mod output;
 pub(crate) mod query;
+pub(crate) mod template;

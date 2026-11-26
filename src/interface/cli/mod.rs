@@ -15,13 +15,23 @@ const DEFAULT_MAX_RECORD_READ_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_ASSET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SQL_INPUT_BYTES: usize = 1024 * 1024;
-const ROOT_AFTER_HELP: &str = r"Start here (for Agents):
+pub(crate) const ROOT_AFTER_HELP: &str = r"Start here (for Agents):
+  trace-index query template run recent-sessions --format tsv
+  trace-index query template run search-sessions -p query='<TERMS>' --format tsv
+  trace-index query template run session-transcript -p session=<ID> --format tsv
   trace-index docs get start-here
   trace-index schema list
-  trace-index schema get items --compact
+
+  Built-in templates (* = required; run `query template show <NAME>` for full params/SQL):
+    recent-sessions     List recent sessions (runtime, cwd, since, until)
+    search-sessions     FTS candidate hits aggregated by session (query*, runtime, cwd, roles, since, until, min_hits)
+    search-items        FTS candidate items with previews (query*, session, runtime, roles, since, until, contains, max_chars)
+    session-transcript  Read one session timeline (session*, tail_loops, from_loop, to_loop, after_item_id, roles, include_reasoning, include_tools, max_chars)
+    item-context        Neighborhood around one item_id across its session (item_id*, window, include_reasoning, max_chars)
+    shell-calls         Audit shell calls + paired tool.output (program, session, runtime, since, until, failed_only, max_chars)
 
   Help, bundled docs, and Schema discovery match this binary. Discover exact
-  names and shapes before writing SQL; do not guess relations, columns, or flags.
+  names and shapes before writing custom SQL; do not guess relations, columns, or flags.
 
 Conceptual model:
   Source ──contains──> Record
@@ -257,14 +267,33 @@ const SCHEMA_GET_AFTER_HELP: &str = r"Behavior:
 Example:
   trace-index schema get sessions loops items blobs --compact";
 
+const QUERY_TEMPLATE_RUN_AFTER_HELP: &str = r"Behavior:
+  Renders and executes one named read-only SQL template against the existing
+  index using native SQLite :param binding (zero text interpolation).
+  Pass --render to open the index read-only, resolve typed params (such as
+  session_ref and time), and print the expanded SQL and bound JSON parameters
+  as JSON without executing; pass that SQL and params into
+  `query run --params-json ...` to customize freely.
+  Templates declare a default_limit that sets the row limit unless --limit is passed.
+  --format tsv writes only the tab-separated header and rows on stdout (omitting
+  JSON envelope fields such as template/origin/resolved), with incompleteness and
+  cell-truncation notices on stderr (empty when complete and untruncated; exit 0).
+
+Examples:
+  trace-index query template run search-items -p query='proxy latency' -p since=7d --format tsv
+  trace-index query template run session-transcript -p session=1 -p tail_loops=5 --render";
+
 const QUERY_RUN_AFTER_HELP: &str = r#"Behavior:
   Runs one read-only statement against the existing index. It never refreshes
   traces. Inspect relation names and JSON shapes with schema list/get first.
-  Default output is a compact JSON envelope on stdout. Pass --format tsv for a
-  tab-separated header and rows on stdout (\, tab, LF, CR are backslash-escaped;
-  NULL and empty string both render empty; incompleteness and cell-truncation
-  notices are written to stderr, which stays empty when complete and untruncated,
-  with exit status 0; see docs get reference/output-contract).
+  Bind named SQL parameters (:name) with --params-json '<JSON>' (preserves JSON
+  types: integer, real, null, string) and/or repeatable -p/--param key=value
+  (binds as TEXT and overrides matching keys). Default output is a compact JSON
+  envelope on stdout. Pass --format tsv for a tab-separated header and rows on
+  stdout (\, tab, LF, CR are backslash-escaped; NULL and empty string both render
+  empty; incompleteness and cell-truncation notices are written to stderr, which
+  stays empty when complete and untruncated, with exit status 0; see
+  docs get reference/output-contract).
 
 Examples:
   trace-index query run \
@@ -273,10 +302,10 @@ Examples:
   Use --stdin for multiline SQL so the shell does not turn newlines into a
   literal \n sequence:
 
-  trace-index query run --format tsv --stdin <<'SQL'
+  trace-index query run --format tsv --params-json '{"loop_id":1}' --stdin <<'SQL'
   SELECT loop_position, json_extract(semantic, '$.role') AS role
   FROM items
-  WHERE loop_id = 1
+  WHERE loop_id = :loop_id
   ORDER BY loop_position;
   SQL
 
@@ -669,6 +698,62 @@ enum SchemaCommand {
 enum QueryCommand {
     /// Run one bounded read-only SQL statement.
     Run(QueryRunArgs),
+
+    /// Discover, inspect, render, or run named read-only SQL templates.
+    Template {
+        #[command(subcommand)]
+        command: QueryTemplateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueryTemplateCommand {
+    /// List built-in and configured user SQL templates without opening the database.
+    List,
+
+    /// Show one SQL template's parameters and source SQL without opening the database.
+    Show {
+        /// Template name.
+        name: String,
+    },
+
+    /// Render or execute one named SQL template with typed parameter binding.
+    Run(QueryTemplateRunArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = QUERY_TEMPLATE_RUN_AFTER_HELP)]
+struct QueryTemplateRunArgs {
+    /// Template name (see `query template list`).
+    name: String,
+
+    /// Bind one template parameter as key=value (repeatable).
+    #[arg(short = 'p', long = "param", value_name = "KEY=VALUE")]
+    param: Vec<String>,
+
+    /// Print the rendered SQL and bound JSON parameters without executing the query.
+    #[arg(long)]
+    render: bool,
+
+    /// Output format for executed query results.
+    #[arg(long, value_enum, default_value_t = QueryFormat::Json)]
+    format: QueryFormat,
+
+    /// Override the template's default row limit.
+    #[arg(long, value_parser = parse_limit)]
+    limit: Option<usize>,
+
+    /// Maximum UTF-8 bytes returned for one text or blob cell.
+    #[arg(long, default_value_t = DEFAULT_MAX_TEXT_BYTES, value_parser = parse_cell_bytes)]
+    max_cell_bytes: usize,
+
+    /// Maximum serialized bytes returned across query rows.
+    #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES, value_parser = parse_output_bytes)]
+    max_output_bytes: usize,
+
+    /// Abort the query after this many seconds.
+    #[arg(long, default_value_t = 30, value_parser = parse_timeout_seconds)]
+    timeout_seconds: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -696,6 +781,14 @@ struct QueryRunArgs {
     /// Read the SQL statement from standard input.
     #[arg(long)]
     stdin: bool,
+
+    /// Bind one named SQL parameter as key=value (text; repeatable).
+    #[arg(short = 'p', long = "param", value_name = "KEY=VALUE")]
+    param: Vec<String>,
+
+    /// Bind typed named SQL parameters from a JSON object (e.g. from `query template run --render`).
+    #[arg(long, value_name = "JSON")]
+    params_json: Option<String>,
 
     /// Output format for query results.
     #[arg(long, value_enum, default_value_t = QueryFormat::Json)]
