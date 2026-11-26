@@ -45,161 +45,157 @@ pub struct TopicSections {
 struct Topic {
     summary: TopicSummary,
     content: &'static str,
+    preserve_frontmatter: bool,
+}
+
+const fn topic(
+    name: &'static str,
+    category: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    content: &'static str,
+) -> Topic {
+    Topic {
+        summary: TopicSummary {
+            name,
+            category,
+            title,
+            summary,
+        },
+        content,
+        preserve_frontmatter: false,
+    }
 }
 
 const TOPICS: &[Topic] = &[
+    topic(
+        "start-here",
+        "tutorial",
+        "Start Here",
+        "Build an index and answer from its bounded public query plane.",
+        include_str!("../../docs/start-here.md"),
+    ),
+    topic(
+        "how-to/install",
+        "how-to",
+        "Install Trace Index",
+        "Install a verified prebuilt binary or build Trace Index from crates.io.",
+        include_str!("../../docs/how-to/install.md"),
+    ),
+    topic(
+        "how-to/configure-and-sync",
+        "how-to",
+        "Configure and Synchronize Traces",
+        "Configure Runtime trace roots, synchronize them, and inspect coverage.",
+        include_str!("../../docs/how-to/configure-and-sync.md"),
+    ),
+    topic(
+        "how-to/session-metadata",
+        "how-to",
+        "Session Metadata",
+        "Store caller-defined JSON independently and query Session associations.",
+        include_str!("../../docs/how-to/session-metadata.md"),
+    ),
+    topic(
+        "how-to/query-evidence",
+        "how-to",
+        "Query Indexed Facts",
+        "Explore public relations with selective, bounded, read-only SQL.",
+        include_str!("../../docs/how-to/query-evidence.md"),
+    ),
+    topic(
+        "how-to/search-literals",
+        "how-to",
+        "Search Literal Text",
+        "Recover broad memories through bounded literal candidates and confirmation.",
+        include_str!("../../docs/how-to/search-literals.md"),
+    ),
+    topic(
+        "how-to/inspect-and-export",
+        "how-to",
+        "Inspect and Export Physical Evidence",
+        "Audit or explicitly materialize exact Records and Assets on demand.",
+        include_str!("../../docs/how-to/inspect-and-export.md"),
+    ),
+    topic(
+        "reference/cli",
+        "reference",
+        "CLI Reference",
+        "Stable command tree and capability boundaries.",
+        include_str!("../../docs/reference/cli.md"),
+    ),
+    topic(
+        "reference/configuration",
+        "reference",
+        "Configuration Reference",
+        "Configuration fields, path resolution, defaults, and precedence.",
+        include_str!("../../docs/reference/configuration.md"),
+    ),
+    topic(
+        "reference/public-schema",
+        "reference",
+        "Public SQL Schema",
+        "Public relations and their evidence semantics.",
+        include_str!("../../docs/reference/public-schema.md"),
+    ),
+    topic(
+        "reference/glossary",
+        "reference",
+        "Glossary",
+        "Canonical meanings of Runtime, Adapter, Source, Record, Session, Loop, and Item.",
+        include_str!("../../docs/reference/glossary.md"),
+    ),
+    topic(
+        "reference/output-contract",
+        "reference",
+        "Output Contract",
+        "Compact JSON, Markdown docs, stderr, and process exit codes.",
+        include_str!("../../docs/reference/output-contract.md"),
+    ),
+    topic(
+        "reference/supported-traces",
+        "reference",
+        "Supported Trace Formats",
+        "Recognized Codex, Pi, Claude Code, and Antigravity CLI JSONL Sources and edge-case behavior.",
+        include_str!("../../docs/reference/supported-traces.md"),
+    ),
+    topic(
+        "explanation/evidence-model",
+        "explanation",
+        "Evidence Model",
+        "The five domain objects, typed Semantic values, and Record evidence.",
+        include_str!("../../docs/explanation/evidence-model.md"),
+    ),
+    topic(
+        "explanation/runtime-adapters",
+        "explanation",
+        "Runtime Adapters",
+        "Why Runtime traces share physical structure without one universal Message model.",
+        include_str!("../../docs/explanation/runtime-adapters.md"),
+    ),
+    topic(
+        "explanation/bounded-observation",
+        "explanation",
+        "Bounded Observation",
+        "Resource budgets, truncation facts, and explicit materialization.",
+        include_str!("../../docs/explanation/bounded-observation.md"),
+    ),
+    topic(
+        "explanation/architecture",
+        "explanation",
+        "Architecture",
+        "Module boundaries, SQLite lifecycle, and feature admission principles.",
+        include_str!("../../docs/explanation/architecture.md"),
+    ),
     Topic {
         summary: TopicSummary {
-            name: "start-here",
-            category: "tutorial",
-            title: "Start Here",
-            summary: "Build an index and answer from its bounded public query plane.",
-        },
-        content: include_str!("../../docs/start-here.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/install",
-            category: "how-to",
-            title: "Install Trace Index",
-            summary: "Install a verified prebuilt binary or build Trace Index from crates.io.",
-        },
-        content: include_str!("../../docs/how-to/install.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/configure-and-sync",
-            category: "how-to",
-            title: "Configure and Synchronize Traces",
-            summary: "Configure Runtime trace roots, synchronize them, and inspect coverage.",
-        },
-        content: include_str!("../../docs/how-to/configure-and-sync.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/session-metadata",
-            category: "how-to",
-            title: "Session Metadata",
-            summary: "Store caller-defined JSON independently and query Session associations.",
-        },
-        content: include_str!("../../docs/how-to/session-metadata.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/query-evidence",
-            category: "how-to",
-            title: "Query Indexed Facts",
-            summary: "Explore public relations with selective, bounded, read-only SQL.",
-        },
-        content: include_str!("../../docs/how-to/query-evidence.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/search-literals",
-            category: "how-to",
-            title: "Search Literal Text",
-            summary: "Recover broad memories through bounded literal candidates and confirmation.",
-        },
-        content: include_str!("../../docs/how-to/search-literals.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "how-to/inspect-and-export",
-            category: "how-to",
-            title: "Inspect and Export Physical Evidence",
-            summary: "Audit or explicitly materialize exact Records and Assets on demand.",
-        },
-        content: include_str!("../../docs/how-to/inspect-and-export.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/cli",
+            name: "skill",
             category: "reference",
-            title: "CLI Reference",
-            summary: "Stable command tree and capability boundaries.",
+            title: "Trace Index Agent Skill",
+            summary: "Version-matched SKILL.md for Agent harnesses (preserves YAML frontmatter).",
         },
-        content: include_str!("../../docs/reference/cli.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/configuration",
-            category: "reference",
-            title: "Configuration Reference",
-            summary: "Configuration fields, path resolution, defaults, and precedence.",
-        },
-        content: include_str!("../../docs/reference/configuration.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/public-schema",
-            category: "reference",
-            title: "Public SQL Schema",
-            summary: "Public relations and their evidence semantics.",
-        },
-        content: include_str!("../../docs/reference/public-schema.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/glossary",
-            category: "reference",
-            title: "Glossary",
-            summary: "Canonical meanings of Runtime, Adapter, Source, Record, Session, Loop, and Item.",
-        },
-        content: include_str!("../../docs/reference/glossary.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/output-contract",
-            category: "reference",
-            title: "Output Contract",
-            summary: "Compact JSON, Markdown docs, stderr, and process exit codes.",
-        },
-        content: include_str!("../../docs/reference/output-contract.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "reference/supported-traces",
-            category: "reference",
-            title: "Supported Trace Formats",
-            summary: "Recognized Codex, Pi, Claude Code, and Antigravity CLI JSONL Sources and edge-case behavior.",
-        },
-        content: include_str!("../../docs/reference/supported-traces.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "explanation/evidence-model",
-            category: "explanation",
-            title: "Evidence Model",
-            summary: "The five domain objects, typed Semantic values, and Record evidence.",
-        },
-        content: include_str!("../../docs/explanation/evidence-model.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "explanation/runtime-adapters",
-            category: "explanation",
-            title: "Runtime Adapters",
-            summary: "Why Runtime traces share physical structure without one universal Message model.",
-        },
-        content: include_str!("../../docs/explanation/runtime-adapters.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "explanation/bounded-observation",
-            category: "explanation",
-            title: "Bounded Observation",
-            summary: "Resource budgets, truncation facts, and explicit materialization.",
-        },
-        content: include_str!("../../docs/explanation/bounded-observation.md"),
-    },
-    Topic {
-        summary: TopicSummary {
-            name: "explanation/architecture",
-            category: "explanation",
-            title: "Architecture",
-            summary: "Module boundaries, SQLite lifecycle, and feature admission principles.",
-        },
-        content: include_str!("../../docs/explanation/architecture.md"),
+        content: include_str!("../../.agents/skills/trace-index/SKILL.md"),
+        preserve_frontmatter: true,
     },
 ];
 
@@ -243,11 +239,16 @@ pub fn search(query: &str) -> Result<TopicList> {
 /// Returns an error when the topic does not exist.
 pub fn get(name: &str) -> Result<TopicDocument> {
     let topic = find_topic(name)?;
+    let content = if topic.preserve_frontmatter {
+        normalize_newlines(topic.content)
+    } else {
+        markdown_body(topic.content)
+    };
     Ok(TopicDocument {
         name: topic.summary.name,
         title: topic.summary.title,
         media_type: "text/markdown",
-        content: markdown_body(topic.content),
+        content,
     })
 }
 
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn lists_gets_and_searches_bundled_topics() {
-        assert_eq!(list().returned, 17);
+        assert_eq!(list().returned, 18);
         assert!(
             get("how-to/install")
                 .expect("install docs")
@@ -573,6 +574,19 @@ mod tests {
                 .expect("start docs")
                 .content
                 .starts_with("---")
+        );
+        let skill = get("skill").expect("skill doc");
+        assert!(skill.content.starts_with("---\nname: trace-index\n"));
+        assert_eq!(
+            skill.content.as_ref(),
+            normalize_newlines(include_str!("../../.agents/skills/trace-index/SKILL.md")).as_ref()
+        );
+        let skill_sections = list_sections("skill").expect("skill sections");
+        assert!(
+            skill_sections
+                .sections
+                .iter()
+                .any(|s| s.heading == "Caller-owned Session metadata")
         );
     }
 

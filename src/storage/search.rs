@@ -10,6 +10,18 @@
 
 use std::collections::HashSet;
 
+/// Parsed search clause shared by `search_query()` FTS expression building and
+/// `search_snippet()` match windowing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum QueryClause {
+    /// Lowercased word or identifier token of length >= 2.
+    Word(String),
+    /// Lowercased ASCII identifier prefix of length >= 4 (from trailing `*`).
+    Prefix(String),
+    /// Contiguous CJK character sequence of length >= 2.
+    CjkPhrase(String),
+}
+
 /// Produces space-separated normalized tokens for `item_search` (Format 5+).
 ///
 /// - Contiguous CJK runs of length >= 2 emit overlapping 2-grams in source
@@ -72,6 +84,19 @@ pub(crate) fn tokenize_for_term_index(text: &str) -> String {
     out
 }
 
+/// Parses a user search string into deduplicated clauses matching
+/// `search_query()` semantics.
+pub(crate) fn parse_query_clauses(query: &str) -> Vec<QueryClause> {
+    let mut clauses = Vec::new();
+    let mut seen = HashSet::new();
+
+    for chunk in query.split_whitespace() {
+        collect_chunk_clauses(chunk, &mut clauses, &mut seen);
+    }
+
+    clauses
+}
+
 /// Converts a user search string into an FTS5 `MATCH` expression for
 /// `item_search` (Format 5+, or legacy Format 4 `item_search_terms`).
 ///
@@ -80,24 +105,47 @@ pub(crate) fn tokenize_for_term_index(text: &str) -> String {
 /// Within a chunk, a contiguous CJK run of length >= 3 becomes an adjacent
 /// bigram phrase (so `"智能体"` becomes `"智能 能体"` with exact adjacency).
 pub(crate) fn make_term_search_query(query: &str) -> std::result::Result<String, &'static str> {
-    let mut clauses = Vec::new();
-    let mut seen = HashSet::new();
-
-    for chunk in query.split_whitespace() {
-        collect_chunk_clauses(chunk, &mut clauses, &mut seen);
-    }
-
-    if clauses.is_empty() {
+    let parsed = parse_query_clauses(query);
+    if parsed.is_empty() {
         return Err(
             "search_query requires at least one 2+ character word, identifier, prefix (4+ chars with trailing '*'), or CJK term; \
              narrow structurally and scan blobs with instr() for single characters or punctuation literals",
         );
     }
 
+    let clauses: Vec<String> = parsed
+        .into_iter()
+        .map(|clause| match clause {
+            QueryClause::Word(word) => quote_fts_phrase(&word),
+            QueryClause::Prefix(prefix) => format!("{}*", quote_fts_phrase(&prefix)),
+            QueryClause::CjkPhrase(raw) => format_cjk_fts_phrase(&raw),
+        })
+        .collect();
+
     Ok(clauses.join(" AND "))
 }
 
-fn collect_chunk_clauses(chunk: &str, clauses: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn format_cjk_fts_phrase(raw: &str) -> String {
+    let cjk_chars: Vec<char> = raw.chars().collect();
+    if cjk_chars.len() == 2 {
+        return quote_fts_phrase(raw);
+    }
+    let mut joined = String::new();
+    for pair in cjk_chars.windows(2) {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push(pair[0]);
+        joined.push(pair[1]);
+    }
+    quote_fts_phrase(&joined)
+}
+
+fn collect_chunk_clauses(
+    chunk: &str,
+    clauses: &mut Vec<QueryClause>,
+    seen: &mut HashSet<QueryClause>,
+) {
     let mut chars = chunk.char_indices().peekable();
 
     while let Some(&(start, ch)) = chars.peek() {
@@ -112,25 +160,12 @@ fn collect_chunk_clauses(chunk: &str, clauses: &mut Vec<String>, seen: &mut Hash
                     break;
                 }
             }
-            let cjk_chars: Vec<char> = chunk[start..end].chars().collect();
-            if cjk_chars.len() < 2 {
+            if chunk[start..end].chars().count() < 2 {
                 continue;
             }
-            let phrase = if cjk_chars.len() == 2 {
-                quote_fts_phrase(&chunk[start..end])
-            } else {
-                let mut joined = String::new();
-                for pair in cjk_chars.windows(2) {
-                    if !joined.is_empty() {
-                        joined.push(' ');
-                    }
-                    joined.push(pair[0]);
-                    joined.push(pair[1]);
-                }
-                quote_fts_phrase(&joined)
-            };
-            if seen.insert(phrase.clone()) {
-                clauses.push(phrase);
+            let clause = QueryClause::CjkPhrase(chunk[start..end].to_owned());
+            if seen.insert(clause.clone()) {
+                clauses.push(clause);
             }
         } else if is_ascii_ident(ch) {
             let mut end = start + ch.len_utf8();
@@ -148,16 +183,17 @@ fn collect_chunk_clauses(chunk: &str, clauses: &mut Vec<String>, seen: &mut Hash
             if wants_prefix {
                 chars.next();
             }
-            if wants_prefix && lower.len() >= 4 {
-                let clause = format!("{}*", quote_fts_phrase(&lower));
-                if seen.insert(clause.clone()) {
-                    clauses.push(clause);
-                }
+            let clause = if wants_prefix && lower.len() >= 4 {
+                Some(QueryClause::Prefix(lower))
             } else if lower.len() >= 2 {
-                let phrase = quote_fts_phrase(&lower);
-                if seen.insert(phrase.clone()) {
-                    clauses.push(phrase);
-                }
+                Some(QueryClause::Word(lower))
+            } else {
+                None
+            };
+            if let Some(clause) = clause
+                && seen.insert(clause.clone())
+            {
+                clauses.push(clause);
             }
         } else if ch.is_alphabetic() {
             let mut end = start + ch.len_utf8();
@@ -172,14 +208,113 @@ fn collect_chunk_clauses(chunk: &str, clauses: &mut Vec<String>, seen: &mut Hash
             }
             let lower = chunk[start..end].to_lowercase();
             if lower.chars().count() >= 2 {
-                let phrase = quote_fts_phrase(&lower);
-                if seen.insert(phrase.clone()) {
-                    clauses.push(phrase);
+                let clause = QueryClause::Word(lower);
+                if seen.insert(clause.clone()) {
+                    clauses.push(clause);
                 }
             }
         } else {
             chars.next();
         }
+    }
+}
+
+/// Visits every lowercased word/identifier token emitted by the term indexer
+/// together with its half-open Unicode scalar span `(char_start, char_end)` in
+/// the original `text`.
+pub(super) fn for_each_word_token_span<F>(text: &str, mut visit: F)
+where
+    F: FnMut(&str, usize, usize),
+{
+    let mut iter = text.char_indices().enumerate().peekable();
+
+    while let Some(&(char_start, (byte_start, ch))) = iter.peek() {
+        if is_cjk(ch) {
+            iter.next();
+            while let Some(&(_, (_, next))) = iter.peek() {
+                if is_cjk(next) {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+        } else if is_ascii_ident(ch) {
+            let mut byte_end = byte_start + ch.len_utf8();
+            iter.next();
+            while let Some(&(_, (idx, next))) = iter.peek() {
+                if is_ascii_ident(next) {
+                    byte_end = idx + next.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            visit_ascii_ident_spans(&text[byte_start..byte_end], char_start, &mut visit);
+        } else if ch.is_alphabetic() {
+            let mut byte_end = byte_start + ch.len_utf8();
+            let mut char_end = char_start + 1;
+            iter.next();
+            while let Some(&(c_idx, (idx, next))) = iter.peek() {
+                if next.is_alphabetic() && !is_cjk(next) && !is_ascii_ident(next) {
+                    byte_end = idx + next.len_utf8();
+                    char_end = c_idx + 1;
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            let lower = text[byte_start..byte_end].to_lowercase();
+            if lower.chars().count() >= 2 {
+                visit(&lower, char_start, char_end);
+            }
+        } else {
+            iter.next();
+        }
+    }
+}
+
+fn visit_ascii_ident_spans<F>(run: &str, run_char_start: usize, visit: &mut F)
+where
+    F: FnMut(&str, usize, usize),
+{
+    let lower = run.to_ascii_lowercase();
+    if lower.len() >= 2 {
+        visit(&lower, run_char_start, run_char_start + run.len());
+    }
+    let bytes = run.as_bytes();
+    let mut seg_start = 0;
+    while seg_start < bytes.len() {
+        while seg_start < bytes.len() && bytes[seg_start] == b'_' {
+            seg_start += 1;
+        }
+        if seg_start >= bytes.len() {
+            break;
+        }
+        let mut seg_end = seg_start;
+        while seg_end < bytes.len() && bytes[seg_end] != b'_' {
+            seg_end += 1;
+        }
+        let segment = &run[seg_start..seg_end];
+        if segment.len() >= 2 && (seg_start > 0 || seg_end < bytes.len()) {
+            let seg_lower = segment.to_ascii_lowercase();
+            visit(
+                &seg_lower,
+                run_char_start + seg_start,
+                run_char_start + seg_end,
+            );
+        }
+        for (sub_start, sub_end) in split_camel_and_digits_ranges(segment) {
+            let sub_len = sub_end - sub_start;
+            if sub_len >= 2 && !(sub_start == 0 && sub_end == segment.len()) {
+                let sub_lower = segment[sub_start..sub_end].to_ascii_lowercase();
+                visit(
+                    &sub_lower,
+                    run_char_start + seg_start + sub_start,
+                    run_char_start + seg_start + sub_end,
+                );
+            }
+        }
+        seg_start = seg_end;
     }
 }
 
@@ -231,8 +366,15 @@ fn emit_ascii_ident_run(run: &str, out: &mut String) {
 /// acronym boundaries (`HTTPServer` -> `http`, `server`), and digit transitions
 /// (`v4alpha` -> `v`, `4`, `alpha`).
 fn split_camel_and_digits(segment: &str, out: &mut Vec<String>) {
+    for (start, end) in split_camel_and_digits_ranges(segment) {
+        out.push(segment[start..end].to_ascii_lowercase());
+    }
+}
+
+fn split_camel_and_digits_ranges(segment: &str) -> Vec<(usize, usize)> {
     let bytes = segment.as_bytes();
     let len = bytes.len();
+    let mut ranges = Vec::new();
     let mut start = 0;
     while start < len {
         let end = if bytes[start].is_ascii_digit() {
@@ -264,9 +406,10 @@ fn split_camel_and_digits(segment: &str, out: &mut Vec<String>) {
             }
             idx
         };
-        out.push(segment[start..end].to_ascii_lowercase());
+        ranges.push((start, end));
         start = end;
     }
+    ranges
 }
 
 fn push_token(out: &mut String, token: &str) {

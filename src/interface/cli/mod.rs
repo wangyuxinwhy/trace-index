@@ -24,11 +24,14 @@ pub(crate) const ROOT_AFTER_HELP: &str = r"Start here (for Agents):
 
   Built-in templates (* = required; run `query template show <NAME>` for full params/SQL):
     recent-sessions     List recent sessions (runtime, cwd, since, until)
-    search-sessions     FTS candidate hits aggregated by session (query*, runtime, cwd, roles, since, until, min_hits)
-    search-items        FTS candidate items with previews (query*, session, runtime, roles, since, until, contains, max_chars)
+    search-sessions     FTS candidate hits aggregated by session (query*, runtime, exclude_session, cwd, roles, since, until, min_hits)
+    search-items        FTS candidate items with match-centered previews (query*, session, exclude_session, runtime, roles, since, until, contains, sort, max_chars)
     session-transcript  Read one session timeline (session*, tail_loops, from_loop, to_loop, after_item_id, roles, include_reasoning, include_tools, max_chars)
     item-context        Neighborhood around one item_id across its session (item_id*, window, include_reasoning, max_chars)
     shell-calls         Audit shell calls + paired tool.output (program, session, runtime, since, until, failed_only, max_chars)
+
+  Optional user templates for recurring read-only SQL live under <templates_dir>/<name>.sql
+  (see `query template list` and `docs get how-to/query-evidence`); validate them with `config check`.
 
   Help, bundled docs, and Schema discovery match this binary. Discover exact
   names and shapes before writing custom SQL; do not guess relations, columns, or flags.
@@ -266,6 +269,11 @@ const SCHEMA_GET_AFTER_HELP: &str = r"Behavior:
 
 Example:
   trace-index schema get sessions loops items blobs --compact";
+
+const QUERY_TEMPLATE_AFTER_HELP: &str = r"Behavior:
+  Discovers built-in SQL templates and optional user templates under
+  <templates_dir>/*.sql (path reported by `query template list`; format in
+  `docs get how-to/query-evidence`). Validate user templates with `config check`.";
 
 const QUERY_TEMPLATE_RUN_AFTER_HELP: &str = r"Behavior:
   Renders and executes one named read-only SQL template against the existing
@@ -702,6 +710,7 @@ enum QueryCommand {
     Run(QueryRunArgs),
 
     /// Discover, inspect, render, or run named read-only SQL templates.
+    #[command(after_help = QUERY_TEMPLATE_AFTER_HELP)]
     Template {
         #[command(subcommand)]
         command: QueryTemplateCommand,

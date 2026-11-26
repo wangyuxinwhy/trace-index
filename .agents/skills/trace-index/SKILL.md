@@ -5,6 +5,12 @@ description: Query indexed agent traces with trace-index when investigating sess
 
 # Trace Index
 
+<!-- generated: skill-version — run `UPDATE_DOCS=1 cargo test generated_documentation` to refresh -->
+
+> Version contract: written for `trace-index 0.6.0`. If `trace-index --version` differs, follow the installed binary's `--help` and refresh this skill with `trace-index docs get skill`.
+
+<!-- /generated -->
+
 Use `trace-index` as the read-only, source-traceable SQL query plane for agent traces. Trace Index returns facts and provenance; interpret them and form the conclusion yourself. Read `trace-index docs get reference/supported-traces` for Runtime coverage and its limits.
 
 At the start of each trace-analysis task, run `trace-index --help` once. Its help, built-in templates, bundled documentation, and Schema match the installed binary. Prefer built-in SQL templates for common navigation, search, transcript reading, and shell-call auditing, and follow the discovery path before writing custom SQL instead of guessing relation names, columns, JSON shapes, or flags:
@@ -20,7 +26,7 @@ trace-index schema list
 trace-index schema get <RELATION>... --compact
 ```
 
-Pass `--render` to `query template run` to resolve typed parameters (`session_ref`, `time`, `list`, etc.) and inspect the exact SQL and JSON parameters without executing, then customize with `query run --params-json '<JSON>'` or `-p key=value` when a question needs custom SQL.
+Pass `--render` to `query template run` to resolve typed parameters (`session_ref`, `time`, `list`, etc.) and inspect the exact SQL and JSON parameters without executing, then customize with `query run --params-json '<JSON>'` or `-p key=value` when a question needs custom SQL. When the user asks to save a recurring parameterized query, place it under `<templates_dir>/<name>.sql` (path reported by `query template list`; format in `docs get how-to/query-evidence`) and validate with `trace-index config check`.
 
 Load `trace-index docs get start-here` when the index has not been built or the first-use workflow is needed. Run `config init` only when the selected configuration file does not exist; it creates only that file and refuses to overwrite one. Use `config show` and `config check` to inspect the selected values and readiness, then run `index sync` to write the database. Do not initialize or synchronize when the existing indexed facts are sufficient.
 

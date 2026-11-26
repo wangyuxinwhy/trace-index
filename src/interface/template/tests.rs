@@ -108,10 +108,54 @@ WHERE item_id > 0
     let mut flags = BTreeMap::new();
     flags.insert("session".to_owned(), true);
     flags.insert("include_extra".to_owned(), false);
-    let rendered = render_nodes(&parsed.nodes, &flags);
+    let bound = BTreeMap::new();
+    let rendered = render_nodes(&parsed.nodes, &flags, &bound);
     assert!(rendered.contains("AND session_id = :session"));
     assert!(rendered.contains("AND loop_id IS NULL"));
     assert!(!rendered.contains("AND loop_id IS NOT NULL"));
+
+    // Value equality directive (`-- #if param=value`) validates enum values and branches cleanly.
+    let eq_source = r#"/* trace-index-template
+name = "eq-sample"
+description = "Equality conditional sample"
+
+[params.sort]
+type = "enum"
+values = ["relevance", "recent"]
+default = "relevance"
+*/
+SELECT 1
+-- #if sort=recent
+ORDER BY occurred_at DESC
+-- #else
+ORDER BY rank
+-- #endif
+"#;
+    let eq_parsed = parse_template_source(eq_source, "eq.sql").expect("parse equality directive");
+    let mut eq_bound = BTreeMap::new();
+    eq_bound.insert(
+        "sort".to_owned(),
+        crate::interface::query::SqlParamValue::Text("recent".to_owned()),
+    );
+    let rendered_recent = render_nodes(&eq_parsed.nodes, &BTreeMap::new(), &eq_bound);
+    assert!(rendered_recent.contains("ORDER BY occurred_at DESC"));
+    assert!(!rendered_recent.contains("ORDER BY rank"));
+
+    eq_bound.insert(
+        "sort".to_owned(),
+        crate::interface::query::SqlParamValue::Text("relevance".to_owned()),
+    );
+    let rendered_rel = render_nodes(&eq_parsed.nodes, &BTreeMap::new(), &eq_bound);
+    assert!(rendered_rel.contains("ORDER BY rank"));
+    assert!(!rendered_rel.contains("ORDER BY occurred_at DESC"));
+
+    let bad_enum_eq = eq_source.replace("sort=recent", "sort=bogus");
+    assert!(
+        parse_template_source(&bad_enum_eq, "bad_eq.sql")
+            .expect_err("invalid enum value in directive")
+            .to_string()
+            .contains("is not in")
+    );
 
     // Undeclared parameter in `-- #if` fails at load time with line number.
     let bad_undeclared = "/* trace-index-template\nname = \"bad\"\ndescription = \"bad\"\n*/\nSELECT 1\n-- #if ghost\nAND 1 = 1\n-- #endif\n";
@@ -517,6 +561,217 @@ fn user_templates_load_from_config_dir_and_cannot_shadow_builtins() {
     let issues = validate_user_templates(&config_path);
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("cannot shadow built-in"));
+}
+
+fn seed_session_two_late_match_item(store: &Store) {
+    let long_text = format!(
+        "{}gateway relay diagnostics matched at tail{}",
+        "padding context ".repeat(40),
+        " trailing detail".repeat(10)
+    );
+    store
+        .connection()
+        .execute_batch(&format!(
+            r#"
+            INSERT INTO trace_records(id, source_id, seq, byte_offset, byte_length, raw_hash, native_type, parse_status)
+            VALUES (7, 2, 1, 100, 100, 'h7', 'user', 'ok');
+            INSERT INTO domain_loops(id, session_id, source_id, ordinal, session_position, start_record_id)
+            VALUES (3, 2, 2, 0, 0, 7);
+            INSERT INTO content_blobs(id, hash, text, full_bytes, estimated_tokens)
+            VALUES (5, X'05', '{long_text}', {}, 100);
+            INSERT INTO domain_items(id, session_id, source_id, loop_id, loop_position, occurred_at, semantic)
+            VALUES (6, 2, 2, 3, 0, 1763900000000,
+                    json('{{"role":"human.request","value":{{"text":{{"blob_id":5}},"has_images":false}},"evidence_strength":"structural"}}'));
+            INSERT INTO item_records(item_id, record_id) VALUES (6, 7);
+            INSERT INTO item_search(rowid, text)
+            VALUES (6, 'padding context gateway relay diagnostics matched at tail trailing detail');
+            "#,
+            long_text.len()
+        ))
+        .expect("insert session 2 item");
+}
+
+#[test]
+fn search_items_uses_streaming_fts_rank_plan_and_centered_snippets() {
+    let dir = tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join("index.sqlite")).expect("open store");
+    seed_rich_fixture(&store);
+    seed_session_two_late_match_item(&store);
+
+    let registry = TemplateRegistry::load(&dir.path().join("config.toml")).expect("registry");
+    let si = registry.get("search-items").expect("search-items");
+
+    for combo in [
+        vec!["query=gateway relay".to_owned()],
+        vec![
+            "query=gateway relay".to_owned(),
+            "exclude_session=1".to_owned(),
+        ],
+        vec![
+            "query=gateway relay".to_owned(),
+            "runtime=claude".to_owned(),
+        ],
+        vec![
+            "query=gateway relay".to_owned(),
+            "since=1763500000000".to_owned(),
+        ],
+        vec![
+            "query=gateway relay".to_owned(),
+            "roles=human.request".to_owned(),
+            "contains=diagnostics".to_owned(),
+        ],
+    ] {
+        let rendered = render_template(si, &store, &combo).expect("render relevance");
+        let plan = explain_plan(&store, &rendered.sql, &rendered.params);
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "relevance plan for {combo:?} unexpectedly created TEMP B-TREE:\n{plan}"
+        );
+    }
+
+    let late = execute_template(
+        si,
+        &store,
+        &[
+            "query=gateway relay".to_owned(),
+            "exclude_session=1".to_owned(),
+            "max_chars=70".to_owned(),
+        ],
+        None,
+        TEST_BUDGET,
+    )
+    .expect("execute search-items with exclude_session");
+    assert_eq!(late.query.returned, 1);
+    assert_eq!(late.query.rows[0]["candidate_item_id"], 6);
+    let preview = late.query.rows[0]["preview"].as_str().expect("preview str");
+    assert!(preview.contains("gateway relay"), "preview: {preview}");
+    assert!(preview.starts_with('…'), "preview: {preview}");
+    assert!(preview.chars().count() <= 70, "preview len > 70: {preview}");
+}
+
+#[test]
+fn search_templates_support_exclude_session_recent_sort_and_snippet_sql_errors() {
+    let dir = tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join("index.sqlite")).expect("open store");
+    seed_rich_fixture(&store);
+    seed_session_two_late_match_item(&store);
+
+    let registry = TemplateRegistry::load(&dir.path().join("config.toml")).expect("registry");
+    let si = registry.get("search-items").expect("search-items");
+    let ss = registry.get("search-sessions").expect("search-sessions");
+
+    let ss_excl = execute_template(
+        ss,
+        &store,
+        &[
+            "query=gateway relay".to_owned(),
+            "exclude_session=1".to_owned(),
+        ],
+        None,
+        TEST_BUDGET,
+    )
+    .expect("execute search-sessions with exclude_session");
+    assert_eq!(ss_excl.query.returned, 1);
+    assert_eq!(ss_excl.query.rows[0]["session_id"], 2);
+
+    let rendered_recent = render_template(
+        si,
+        &store,
+        &["query=gateway relay".to_owned(), "sort=recent".to_owned()],
+    )
+    .expect("render recent");
+    let recent_plan = explain_plan(&store, &rendered_recent.sql, &rendered_recent.params);
+    assert!(
+        recent_plan.contains("MATERIALIZE matched"),
+        "recent plan should materialize matched before blobs:\n{recent_plan}"
+    );
+    let recent = execute_template(
+        si,
+        &store,
+        &["query=gateway relay".to_owned(), "sort=recent".to_owned()],
+        None,
+        TEST_BUDGET,
+    )
+    .expect("execute search-items sort=recent");
+    assert_eq!(recent.query.returned, 3);
+    assert_eq!(recent.query.rows[0]["candidate_item_id"], 6);
+
+    let null_res = query_sql_with_params(
+        &store,
+        "SELECT search_snippet(NULL, 'foo', 50) AS s",
+        &BTreeMap::new(),
+        TEST_BUDGET,
+    )
+    .expect("null snippet");
+    assert!(null_res.rows[0]["s"].is_null());
+    let err = query_sql_with_params(
+        &store,
+        "SELECT search_snippet('hello', 'hello', 0) AS s",
+        &BTreeMap::new(),
+        TEST_BUDGET,
+    )
+    .expect_err("max_chars=0 must error");
+    assert!(
+        err.to_string()
+            .contains("max_chars must be an integer >= 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_item_ref_session_scope_ignores_exclude_session_ref() {
+    let dir = tempdir().expect("tempdir");
+    let store = Store::open(&dir.path().join("index.sqlite")).expect("open store");
+    seed_rich_fixture(&store);
+
+    let config_path = dir.path().join("config.toml");
+    let templates_dir = dir.path().join("templates");
+    fs::create_dir_all(&templates_dir).expect("mkdir templates");
+    fs::write(
+        templates_dir.join("excl-item.sql"),
+        r#"/* trace-index-template
+name = "excl-item"
+description = "Template combining exclude_session and item_ref"
+
+[params.exclude_session]
+type = "session_ref"
+required = true
+
+[params.session]
+type = "session_ref"
+required = true
+
+[params.cursor]
+type = "item_ref"
+required = true
+*/
+SELECT item_id
+FROM items
+WHERE session_id = :session
+  AND session_id <> :exclude_session
+  AND item_id >= :cursor
+ORDER BY item_id
+"#,
+    )
+    .expect("write template");
+
+    let registry = TemplateRegistry::load(&config_path).expect("load registry");
+    let tpl = registry.get("excl-item").expect("excl-item");
+    // Item 2 belongs to session 1; exclude_session=2 sorts before "session" in
+    // BTreeMap and must NOT trigger a false session mismatch on item_ref.
+    let report = execute_template(
+        tpl,
+        &store,
+        &[
+            "exclude_session=2".to_owned(),
+            "session=1".to_owned(),
+            "cursor=2".to_owned(),
+        ],
+        None,
+        TEST_BUDGET,
+    )
+    .expect("exclude_session must not hijack item_ref session scope");
+    assert!(report.query.returned >= 1);
 }
 
 fn explain_plan(
