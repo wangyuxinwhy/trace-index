@@ -36,7 +36,7 @@ The first `trace-index --help` screen establishes the complete prerequisite mode
 | `index watch uninstall` | Stop and remove the user OS service installed for this database |
 | `schema` | Describe the stable public SQL query contract |
 | `schema list` | List public SQL relations and their descriptions |
-| `schema get` | Get one public SQL relation's schema |
+| `schema get` | Get one or more public SQL relations' schemas |
 | `query` | Execute one bounded read-only SQL statement against public relations |
 | `query run` | Run one bounded read-only SQL statement |
 | `record` | Inspect, verify, or export physical JSONL records |

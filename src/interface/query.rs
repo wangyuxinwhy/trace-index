@@ -1,11 +1,12 @@
 //! Read-only SQL and public-schema query interface.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::ValueRef;
 
@@ -289,15 +290,127 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (&str, bool) {
     (&value[..boundary], true)
 }
 
-/// Describes the stable public SQL relations.
+/// Renders a query report as tab-separated values with a header row.
+///
+/// Cell strings escape `\`, `\t`, `\n`, and `\r` so every returned row stays
+/// strictly one physical line with `columns.len() - 1` tab delimiters.
 ///
 /// # Errors
 ///
-/// Returns an error if the requested relation is unknown or the public
+/// Returns an error if writing to `output` or serializing a structured cell
+/// fails.
+pub(crate) fn write_query_tsv(report: &SqlQueryReport, output: &mut impl Write) -> Result<()> {
+    for (index, column) in report.columns.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b"\t").context("failed to write TSV tab")?;
+        }
+        write_escaped_tsv_str(output, column)?;
+    }
+    output
+        .write_all(b"\n")
+        .context("failed to write TSV header newline")?;
+
+    for row in &report.rows {
+        for (index, column) in report.columns.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b"\t").context("failed to write TSV tab")?;
+            }
+            if let Some(value) = row.get(column) {
+                write_tsv_value(output, value)?;
+            }
+        }
+        output
+            .write_all(b"\n")
+            .context("failed to write TSV row newline")?;
+    }
+    Ok(())
+}
+
+/// Builds a stderr notice when TSV output is incomplete or truncated.
+pub(crate) fn format_tsv_truncation_notice(report: &SqlQueryReport) -> Option<String> {
+    if report.complete && report.cells_truncated == 0 {
+        return None;
+    }
+    let mut details = Vec::new();
+    if let Some(reason) = &report.incomplete_reason {
+        details.push(format!("reason={reason}"));
+    }
+    details.push(format!("returned={}", report.returned));
+    if report.cells_truncated > 0 {
+        details.push(format!("cells_truncated={}", report.cells_truncated));
+    }
+    let prefix = if report.complete {
+        "notice: TSV output contains truncated cells"
+    } else {
+        "notice: TSV output is incomplete"
+    };
+    let mut message = format!("{prefix} ({})", details.join(", "));
+    if let Some(hint) = &report.hint {
+        message.push_str(". ");
+        message.push_str(hint);
+    }
+    Some(message)
+}
+
+fn write_tsv_value(output: &mut impl Write, value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::Bool(flag) => {
+            write!(output, "{flag}").context("failed to write TSV boolean")
+        }
+        serde_json::Value::Number(number) => {
+            write!(output, "{number}").context("failed to write TSV number")
+        }
+        serde_json::Value::String(text) => write_escaped_tsv_str(output, text),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            let encoded =
+                serde_json::to_string(value).context("failed to serialize structured TSV cell")?;
+            write_escaped_tsv_str(output, &encoded)
+        }
+    }
+}
+
+fn write_escaped_tsv_str(output: &mut impl Write, text: &str) -> Result<()> {
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        let escaped: &[u8] = match byte {
+            b'\\' => br"\\",
+            b'\t' => br"\t",
+            b'\n' => br"\n",
+            b'\r' => br"\r",
+            _ => continue,
+        };
+        if index > start {
+            output
+                .write_all(&text.as_bytes()[start..index])
+                .context("failed to write TSV text")?;
+        }
+        output
+            .write_all(escaped)
+            .context("failed to write escaped TSV byte")?;
+        start = index + 1;
+    }
+    if start < text.len() {
+        output
+            .write_all(&text.as_bytes()[start..])
+            .context("failed to write TSV text tail")?;
+    }
+    Ok(())
+}
+
+/// Describes the stable public SQL relations.
+///
+/// An empty `requested` slice lists all public relations without columns; a
+/// non-empty slice validates every name and returns each requested relation's
+/// columns in caller order (deduplicating repeated names).
+///
+/// # Errors
+///
+/// Returns an error if any requested relation is unknown or the public
 /// relations in the database do not match the compiled contract.
 pub fn public_schema(
     store: &Store,
-    requested: Option<&str>,
+    requested: &[&str],
     include_descriptions: bool,
 ) -> Result<SchemaReport> {
     validate_public_relations(store.connection(), store.storage_format()?)?;
@@ -309,47 +422,53 @@ pub fn public_schema(
 /// # Errors
 /// Returns an error for an unknown relation name.
 pub(crate) fn describe_schema(
-    requested: Option<&str>,
+    requested: &[&str],
     include_descriptions: bool,
 ) -> Result<SchemaReport> {
-    if let Some(name) = requested
-        && find_public_relation(name).is_none()
-    {
-        bail!(
-            "unknown public relation {name:?}\n\
-             Hint: run `trace-index schema list` to discover valid public relation names"
-        );
+    if requested.is_empty() {
+        let objects = PUBLIC_RELATIONS
+            .iter()
+            .map(|relation| SchemaObject {
+                name: relation.name.to_owned(),
+                description: include_descriptions.then(|| relation.description.trim().to_owned()),
+                columns: Vec::new(),
+            })
+            .collect();
+        return Ok(SchemaReport { objects });
     }
 
-    let mut objects = Vec::with_capacity(requested.map_or(PUBLIC_RELATIONS.len(), |_| 1));
-    for relation in PUBLIC_RELATIONS
-        .iter()
-        .filter(|relation| requested.is_none_or(|requested| requested == relation.name))
-    {
-        let columns = if requested.is_some() {
-            relation
-                .columns
-                .iter()
-                .map(|column| SchemaColumn {
-                    name: column.name.to_owned(),
-                    data_type: column.data_type.to_owned(),
-                    nullable: column.nullable,
-                    // The Semantic object advertises the role vocabulary from
-                    // the domain declaration so callers do not have to infer
-                    // it from whichever roles happen to exist in one index.
-                    description: include_descriptions.then(|| match column.name {
-                        "semantic" => format!(
-                            "{} {}",
-                            column.description.trim(),
-                            crate::domain::describe_semantic_roles()
-                        ),
-                        _ => column.description.trim().to_owned(),
-                    }),
-                })
-                .collect()
-        } else {
-            Vec::new()
+    let mut seen = BTreeSet::new();
+    let mut objects = Vec::with_capacity(requested.len());
+    for &name in requested {
+        let Some(relation) = find_public_relation(name) else {
+            bail!(
+                "unknown public relation {name:?}\n\
+                 Hint: run `trace-index schema list` to discover valid public relation names"
+            );
         };
+        if !seen.insert(relation.name) {
+            continue;
+        }
+        let columns = relation
+            .columns
+            .iter()
+            .map(|column| SchemaColumn {
+                name: column.name.to_owned(),
+                data_type: column.data_type.to_owned(),
+                nullable: column.nullable,
+                // The Semantic object advertises the role vocabulary from
+                // the domain declaration so callers do not have to infer
+                // it from whichever roles happen to exist in one index.
+                description: include_descriptions.then(|| match column.name {
+                    "semantic" => format!(
+                        "{} {}",
+                        column.description.trim(),
+                        crate::domain::describe_semantic_roles()
+                    ),
+                    _ => column.description.trim().to_owned(),
+                }),
+            })
+            .collect();
         objects.push(SchemaObject {
             name: relation.name.to_owned(),
             description: include_descriptions.then(|| relation.description.trim().to_owned()),
@@ -418,7 +537,7 @@ mod tests {
         let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
 
-        let schema = public_schema(&store, None, true).expect("public schema");
+        let schema = public_schema(&store, &[], true).expect("public schema");
         assert!(schema.objects.iter().any(|object| object.name == "items"));
         assert!(schema.objects.iter().any(|object| object.name == "loops"));
         assert!(schema.objects.iter().any(|object| object.name == "blobs"));
@@ -630,7 +749,7 @@ mod tests {
         let database = directory.path().join("index.sqlite");
         let store = Store::open(&database).expect("open store");
 
-        let schema = public_schema(&store, Some("items"), true).expect("filtered schema");
+        let schema = public_schema(&store, &["items"], true).expect("filtered schema");
         assert_eq!(schema.objects.len(), 1);
         assert_eq!(schema.objects[0].name, "items");
         assert_eq!(
@@ -664,8 +783,35 @@ mod tests {
         assert_eq!(item_id.data_type, "INTEGER");
         assert!(!item_id.nullable);
         let unknown =
-            public_schema(&store, Some("missing"), true).expect_err("reject unknown relation");
+            public_schema(&store, &["missing"], true).expect_err("reject unknown relation");
         assert!(unknown.to_string().contains("trace-index schema list"));
+
+        let multi = public_schema(&store, &["items", "sessions", "items"], false)
+            .expect("multi-relation schema");
+        assert_eq!(
+            multi
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["items", "sessions"]
+        );
+        assert!(
+            multi
+                .objects
+                .iter()
+                .all(|object| object.description.is_none())
+        );
+        assert!(
+            multi
+                .objects
+                .iter()
+                .all(|object| !object.columns.is_empty())
+        );
+        assert!(
+            public_schema(&store, &["sessions", "missing"], false).is_err(),
+            "unknown relation in a multi-relation request must fail"
+        );
     }
 
     #[test]
@@ -675,7 +821,7 @@ mod tests {
         let store = Store::open(&database).expect("open store");
         insert_search_fixture(&store);
 
-        let schema = public_schema(&store, Some("item_search"), true).expect("search schema");
+        let schema = public_schema(&store, &["item_search"], true).expect("search schema");
         assert_eq!(schema.objects.len(), 1);
         assert_eq!(schema.objects[0].name, "item_search");
         assert_eq!(
@@ -796,7 +942,7 @@ mod tests {
         insert_search_fixture(&store);
 
         let schema =
-            public_schema(&store, Some("item_search_terms"), true).expect("term search schema");
+            public_schema(&store, &["item_search_terms"], true).expect("term search schema");
         assert_eq!(schema.objects.len(), 1);
         assert_eq!(schema.objects[0].name, "item_search_terms");
         assert!(schema.objects[0].columns[0].nullable);
