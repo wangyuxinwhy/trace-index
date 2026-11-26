@@ -2,6 +2,26 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.6.0] - 2026-11-26
+
+### Added
+
+- Add multi-relation `trace-index schema get <OBJECT>...` (preserving requested order and deduplicating repeated names) and `--format json|tsv` tabular output on `query run` and `query template run` (`PR #36`). TSV output writes a header row and backslash-escaped rows (`\\`, `\t`, `\n`, `\r`) to stdout while keeping stderr empty unless a row limit, output budget, or cell-truncation bound is hit (emitting an actionable `notice:` with exit status 0).
+- Add native SQLite parameter binding (`--params-json '<JSON>'` and repeatable `-p/--param key=value`) to `query run`, plus a transparent named SQL template engine (`trace-index query template list|show|run`, `PR #37`):
+  - Ships 6 built-in read-only `.sql` templates (`recent-sessions`, `search-sessions`, `search-items`, `session-transcript`, `item-context`, `shell-calls`) with typed parameters (`string`, `int`, `bool`, `enum`, `list`, `time`, `session_ref`, `item_ref`), line-granular `-- #if` conditionals, zero text interpolation (100% SQLite `:param` binding), and `--render` escape hatch to inspect and customize SQL.
+  - Supports user-defined `.sql` templates under `<config_dir>/templates/*.sql` (never searching CWD, never shadowing built-in names) validated read-only by `config check`.
+- Emit a `database_format_upgrade_required` warning from `trace-index config check` when an existing database uses an older Storage Format (`PR #38`).
+
+### Changed
+
+- **Storage Format 5** (`PR #38`): promote term-based full-text search into the single canonical `item_search` FTS5 access relation (`unicode61 tokenchars '_'`, `detail='full'`, `contentless_delete=1`), removing the redundant trigram table and `item_search_terms` split and simplifying the public SQL surface from 9 to **8 relations**.
+  - Tokenizer now preserves `_`-delimited identifier segments (`pkg_CoreEngine_Worker`, `slot_7t_context`) and supports trailing `prefix*` queries on ≥4-character ASCII tokens without prefix-index disk bloat.
+  - Cuts FTS5 disk footprint by **-58.5% (2.41× smaller)**, `persist_ms.item_search` by **1.93×**, and cold-rebuild wall time by **1.43×** on real multi-runtime corpora.
+  - Adds prepare-time SQLite authorizer guards so Format ≥ 5 queries reading `item_search` without `search_query(...)` or calling removed `trigram_query(...)` fail with actionable hints instead of silently returning zero rows.
+  - Preserves read-only compatibility with Format 2, Format 3, and Format 4 databases (built-in search templates automatically route Format 4 databases to legacy `item_search_terms`). Reindexing into a new Format 5 database is required for future `index sync` / `index watch` writes.
+- Accelerate no-op and incremental `index sync` / `index watch` reconciliation (`PR #35`) via single-query bulk `source_state` preloading, `prepare_cached` statement reuse, and `transcript_full.jsonl`-first Antigravity discovery (**9.08×** faster `prepare` / **2.51×** faster total wall time under macOS Background QoS on a 4.52 GB / 4,630-file corpus).
+- Align root/leaf Help, all bundled documentation, `.agents/skills/trace-index/SKILL.md`, and `README.md` with Storage Format 5, built-in/user SQL templates, parameterized `query run`, and `--format tsv` (`PR #39`).
+
 ## [0.5.6] - 2026-11-24
 
 ### Changed
