@@ -2,6 +2,23 @@
 
 All notable public changes to Trace Index are documented here.
 
+## [0.6.1] - 2026-11-26
+
+### Added
+
+- Add read-only `search_snippet(text, query, max_chars[, literal])` `SQLite` scalar function across all storage formats (`PR #41`): reuses `search_query()` clause parsing and identifier/CJK span rules to extract verbatim match-centered excerpts strictly bounded to `<= max_chars` Unicode scalars inclusive of `…` (`U+2026`), prioritizing exact `literal` (`:contains`) and inverse in-blob frequency multi-term windows without injecting highlight markers.
+- Add `exclude_session` (`session_ref`) to built-in `search-items` and `search-sessions` templates, `sort=relevance|recent` to `search-items`, and `-- #if <param>=<value>` equality conditionals (for `enum`/`string` parameters) to the SQL template engine (`PR #41`).
+- Add `trace-index docs get skill` preserving YAML frontmatter byte-for-byte for exporting/refreshing the version-matched Agent Skill, plus an auto-generated version contract line in `.agents/skills/trace-index/SKILL.md` and a test locking `ROOT_AFTER_HELP`'s template parameter summary to built-in `.sql` headers (`PR #41`).
+
+### Changed
+
+- Optimize built-in `search-items` (`PR #41`): default `sort=relevance` now streams directly via FTS5 `ORDER BY fts.rank` with zero `TEMP B-TREE`, and `sort=recent` materializes lightweight scalar matches before joining `blobs`, avoiding pre-sort `zstd` blob decompression across all FTS candidates (**3.64×–5.39×** faster on a 4.1 GiB Format 5 index while computing match-centered `search_snippet()` previews). Storage Format 5 is unchanged; existing Format 5 indexes need no reindexing.
+- Add opt-in user template discovery pointers (`<templates_dir>/*.sql` + `config check`) in root Help, `query template --help`, and `SKILL.md`.
+
+### Fixed
+
+- Scope `validate_item_ref_session_scope` strictly to the `session` parameter so templates combining `exclude_session` and an `item_ref` parameter cannot trigger false session-mismatch errors (`PR #41`).
+
 ## [0.6.0] - 2026-11-26
 
 ### Added
