@@ -138,9 +138,5 @@ For row and field names, inspect the current query contract rather than guessing
 
 ```bash
 trace-index schema list
-trace-index schema get sources --compact
-trace-index schema get records --compact
-trace-index schema get sessions --compact
-trace-index schema get loops --compact
-trace-index schema get items --compact
+trace-index schema get sources records sessions loops items --compact
 ```

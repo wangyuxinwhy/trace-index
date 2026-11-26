@@ -15,15 +15,12 @@ Start by discovering the current binary's contract:
 
 ```bash
 trace-index schema list
-trace-index schema get sessions --compact
-trace-index schema get loops --compact
-trace-index schema get items --compact
-trace-index schema get blobs --compact
+trace-index schema get sessions loops items blobs --compact
 ```
 
-The compact form shows names, SQLite types, and nullability. Load the full schema for one relation when a field's meaning is not yet clear.
+The compact form shows names, SQLite types, and nullability. Pass one or more relation names to `schema get`, and omit `--compact` when a field's meaning is not yet clear.
 
-Run one bounded, read-only SQL statement:
+Run one bounded, read-only SQL statement (pass `--format tsv` for tab-separated rows on stdout; incompleteness and cell-truncation notices are written to stderr only when a bound is hit):
 
 ```bash
 trace-index query run \
@@ -341,6 +338,6 @@ The `records` relation contains byte ranges and fingerprints, not raw Runtime JS
 
 ## Work within query bounds
 
-Start with counts, groups, identities, and bounded snippets. When `complete` is false, the returned rows are only part of the result set. Follow the report's `hint`: narrow the scope, aggregate before fetching rows, return fewer or smaller columns, or continue from a stable, unique `ORDER BY` key. A nonzero `cells_truncated` means selected values are prefixes even when all rows were returned. Raise a budget only for selected material that the claim actually needs.
+Start with counts, groups, identities, and bounded snippets. When `complete` is false, the returned rows are only part of the result set. Follow the report's `hint`: narrow the scope, aggregate before fetching rows, return fewer or smaller columns, or continue from a stable, unique `ORDER BY` key. A nonzero `cells_truncated` means selected values are prefixes even when all rows were returned. When using `--format tsv`, inspect stderr for the same incompleteness and cell-truncation notices (stderr is empty when complete and untruncated; see `docs get reference/output-contract`). Raise a budget only for selected material that the claim actually needs.
 
 Public relations are the normal facts for analysis. Internal storage tables are implementation details even if SQLite can technically read them.

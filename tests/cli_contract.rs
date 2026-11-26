@@ -1118,3 +1118,96 @@ fn index_watch_status_and_service_dry_run_are_non_mutating() {
     assert_eq!(index_status["data"]["watch"]["active"], false);
     assert_eq!(index_status["data"]["watch"]["service_installed"], false);
 }
+
+#[test]
+fn schema_get_accepts_multiple_relations_and_query_run_supports_tsv_output() {
+    let directory = tempdir().expect("temporary directory");
+    let (database, _, _) = index_fixture(directory.path(), "tsv output fixture");
+
+    // Multi-relation `schema get` preserves requested order and deduplicates names.
+    let multi_schema = compact_json(&run(&[
+        "schema",
+        "get",
+        "items",
+        "sessions",
+        "loops",
+        "items",
+        "--compact",
+    ]));
+    let objects = multi_schema["data"]["objects"]
+        .as_array()
+        .expect("schema objects array");
+    let names: Vec<&str> = objects
+        .iter()
+        .map(|object| object["name"].as_str().expect("object name"))
+        .collect();
+    assert_eq!(names, ["items", "sessions", "loops"]);
+    assert!(
+        objects
+            .iter()
+            .all(|object| object.get("description").is_none())
+    );
+    assert!(
+        objects
+            .iter()
+            .all(|object| !object["columns"].as_array().expect("columns").is_empty())
+    );
+
+    // Unknown relation in a multi-relation list fails cleanly.
+    let unknown = run(&["schema", "get", "sessions", "does_not_exist"]);
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("trace-index schema list"));
+
+    // `--format tsv` preserves SQL column order, renders NULL as empty, and escapes tabs/newlines/backslashes.
+    let tsv_output = run(&[
+        "--db",
+        path_text(&database),
+        "query",
+        "run",
+        "--format",
+        "tsv",
+        "SELECT 1 AS z_num, NULL AS a_null, 'line1' || char(10) || 'col2' || char(9) || 'slash\\' || char(13) AS m_text",
+    ]);
+    assert!(
+        tsv_output.status.success(),
+        "tsv query failed: {}",
+        String::from_utf8_lossy(&tsv_output.stderr)
+    );
+    assert!(
+        tsv_output.stderr.is_empty(),
+        "complete untruncated TSV query should emit no stderr notice: {}",
+        String::from_utf8_lossy(&tsv_output.stderr)
+    );
+    let stdout = String::from_utf8(tsv_output.stdout).expect("utf-8 tsv");
+    assert_eq!(
+        stdout,
+        "z_num\ta_null\tm_text\n1\t\tline1\\ncol2\\tslash\\\\\\r\n"
+    );
+
+    // Incomplete or cell-truncated TSV writes a notice to stderr while keeping stdout pure TSV.
+    let truncated = run(&[
+        "--db",
+        path_text(&database),
+        "query",
+        "run",
+        "--format",
+        "tsv",
+        "--limit",
+        "1",
+        "--max-cell-bytes",
+        "8",
+        "SELECT item_id, json_extract(semantic, '$.role') AS role FROM items ORDER BY item_id",
+    ]);
+    assert!(truncated.status.success());
+    let truncated_stdout = String::from_utf8(truncated.stdout).expect("utf-8 truncated tsv");
+    let lines: Vec<&str> = truncated_stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "header plus one row: {truncated_stdout:?}");
+    assert_eq!(lines[0], "item_id\trole");
+    let truncated_stderr = String::from_utf8(truncated.stderr).expect("utf-8 stderr");
+    assert!(
+        truncated_stderr.contains("notice: TSV output is incomplete"),
+        "expected stderr truncation notice, got: {truncated_stderr:?}"
+    );
+    assert!(truncated_stderr.contains("reason=row_limit"));
+    assert!(truncated_stderr.contains("cells_truncated=1"));
+}

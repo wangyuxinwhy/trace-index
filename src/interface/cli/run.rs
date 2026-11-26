@@ -8,8 +8,8 @@ use clap::error::{ContextKind, ErrorKind};
 
 use super::{
     AssetCommand, Cli, Command, ConfigCommand, DocsCommand, DocsOutput, IndexCommand,
-    MAX_SQL_INPUT_BYTES, QueryCommand, QueryRunArgs, RecordCommand, SchemaCommand, StderrProgress,
-    WatchCommand,
+    MAX_SQL_INPUT_BYTES, QueryCommand, QueryFormat, QueryRunArgs, RecordCommand, SchemaCommand,
+    StderrProgress, WatchCommand,
 };
 use crate::indexing::indexer::IndexOptions;
 use crate::indexing::status::status;
@@ -22,7 +22,9 @@ use crate::ingest::record::{export_record, extract_asset, inspect_record, verify
 use crate::interface::config::{self, EffectiveIndexingConfig, LoadedConfig};
 use crate::interface::docs;
 use crate::interface::output::ResponseEnvelope;
-use crate::interface::query::{QueryBudget, public_schema, query_sql};
+use crate::interface::query::{
+    QueryBudget, format_tsv_truncation_notice, public_schema, query_sql, write_query_tsv,
+};
 use crate::storage::db::{IndexingPolicy, Store};
 
 pub(crate) fn run() -> Result<()> {
@@ -157,7 +159,7 @@ fn cli_error_hint(error: &clap::Error) -> Option<&'static str> {
                 .unwrap_or_default();
             if usage.contains("trace-index query run") {
                 Some(
-                    "pass SQL as a positional argument, '--stdin', or '--file <PATH>' (stdout is always compact JSON; run 'trace-index query run --help' for exact flags).",
+                    "pass SQL as a positional argument, '--stdin', or '--file <PATH>' (default stdout is compact JSON; pass '--format tsv' for tab-separated rows; run 'trace-index query run --help' for exact flags).",
                 )
             } else {
                 Some(
@@ -413,21 +415,18 @@ fn resolve_indexing_policy(
 }
 
 fn run_schema(store: &Store, command: SchemaCommand) -> Result<()> {
-    let (object, include_descriptions) = match command {
-        SchemaCommand::List => (None, true),
-        SchemaCommand::Get { object, compact } => (Some(object), !compact),
+    let (objects, include_descriptions) = match command {
+        SchemaCommand::List => (Vec::new(), true),
+        SchemaCommand::Get { objects, compact } => (objects, !compact),
     };
-    print_envelope(&public_schema(
-        store,
-        object.as_deref(),
-        include_descriptions,
-    )?)
+    let requested: Vec<&str> = objects.iter().map(String::as_str).collect();
+    print_envelope(&public_schema(store, &requested, include_descriptions)?)
 }
 
 fn run_query(store: &Store, command: QueryCommand) -> Result<()> {
     let QueryCommand::Run(args) = command;
     let sql = read_query_sql(&args)?;
-    print_envelope(&query_sql(
+    let report = query_sql(
         store,
         &sql,
         QueryBudget {
@@ -436,7 +435,19 @@ fn run_query(store: &Store, command: QueryCommand) -> Result<()> {
             max_output_bytes: args.max_output_bytes,
             timeout: Duration::from_secs(u64::try_from(args.timeout_seconds)?),
         },
-    )?)
+    )?;
+    match args.format {
+        QueryFormat::Json => print_envelope(&report),
+        QueryFormat::Tsv => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            write_query_tsv(&report, &mut lock)?;
+            if let Some(notice) = format_tsv_truncation_notice(&report) {
+                eprintln!("{notice}");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn read_query_sql(args: &QueryRunArgs) -> Result<String> {
@@ -589,10 +600,13 @@ fn run_session(command: super::SessionCommand, loaded: &LoadedConfig) -> Result<
 fn run_declared_schema(command: SchemaCommand) -> Result<()> {
     match command {
         SchemaCommand::List => {
-            print_envelope(&crate::interface::query::describe_schema(None, true)?)
+            print_envelope(&crate::interface::query::describe_schema(&[], true)?)
         }
-        SchemaCommand::Get { object, compact } => print_envelope(
-            &crate::interface::query::describe_schema(Some(&object), !compact)?,
-        ),
+        SchemaCommand::Get { objects, compact } => {
+            let requested: Vec<&str> = objects.iter().map(String::as_str).collect();
+            print_envelope(&crate::interface::query::describe_schema(
+                &requested, !compact,
+            )?)
+        }
     }
 }

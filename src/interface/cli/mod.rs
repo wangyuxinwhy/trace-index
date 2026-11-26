@@ -166,7 +166,7 @@ Operational boundary:
   use index status to inspect coverage, freshness, and whether index watch is
   active for this database. Run index sync explicitly only when newly written
   traces are required and watch is inactive (or immediate freshness is needed).
-  Commands return compact JSON on stdout; synchronization progress and watch
+  Commands default to compact JSON on stdout; synchronization progress and watch
   diagnostics use stderr. Metadata set/delete write only the independent
   metadata store; they do not modify trace or index data.
 
@@ -250,9 +250,21 @@ Examples:
   trace-index docs get reference/public-schema --list-sections
   trace-index docs get reference/public-schema --section "Semantic SQL encoding""#;
 
+const SCHEMA_GET_AFTER_HELP: &str = r"Behavior:
+  Returns one or more public relations in the requested order (deduplicating
+  repeated names) without opening or creating the database.
+
+Example:
+  trace-index schema get sessions loops items blobs --compact";
+
 const QUERY_RUN_AFTER_HELP: &str = r#"Behavior:
   Runs one read-only statement against the existing index. It never refreshes
   traces. Inspect relation names and JSON shapes with schema list/get first.
+  Default output is a compact JSON envelope on stdout. Pass --format tsv for a
+  tab-separated header and rows on stdout (\, tab, LF, CR are backslash-escaped;
+  NULL and empty string both render empty; incompleteness and cell-truncation
+  notices are written to stderr, which stays empty when complete and untruncated,
+  with exit status 0; see docs get reference/output-contract).
 
 Examples:
   trace-index query run \
@@ -261,8 +273,8 @@ Examples:
   Use --stdin for multiline SQL so the shell does not turn newlines into a
   literal \n sequence:
 
-  trace-index query run --stdin <<'SQL'
-  SELECT loop_position, semantic
+  trace-index query run --format tsv --stdin <<'SQL'
+  SELECT loop_position, json_extract(semantic, '$.role') AS role
   FROM items
   WHERE loop_id = 1
   ORDER BY loop_position;
@@ -640,10 +652,12 @@ enum SchemaCommand {
     /// List public SQL relations and their descriptions.
     List,
 
-    /// Get one public SQL relation's schema.
+    /// Get one or more public SQL relations' schemas.
+    #[command(after_help = SCHEMA_GET_AFTER_HELP)]
     Get {
-        /// Public relation name.
-        object: String,
+        /// One or more public relation names.
+        #[arg(required = true, num_args = 1.., value_name = "OBJECT")]
+        objects: Vec<String>,
 
         /// Omit descriptions and return only names, types, and nullability.
         #[arg(long)]
@@ -655,6 +669,12 @@ enum SchemaCommand {
 enum QueryCommand {
     /// Run one bounded read-only SQL statement.
     Run(QueryRunArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum QueryFormat {
+    Json,
+    Tsv,
 }
 
 #[derive(Debug, Args)]
@@ -676,6 +696,10 @@ struct QueryRunArgs {
     /// Read the SQL statement from standard input.
     #[arg(long)]
     stdin: bool,
+
+    /// Output format for query results.
+    #[arg(long, value_enum, default_value_t = QueryFormat::Json)]
+    format: QueryFormat,
 
     /// Maximum rows returned.
     #[arg(long, default_value_t = 1_000, value_parser = parse_limit)]

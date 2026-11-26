@@ -9,6 +9,8 @@ Machine-readable commands write one compact JSON envelope followed by one newlin
 
 `docs get` writes Markdown by default (`--list-sections` lists headings and `--section <HEADING>` extracts matching sections without printing the full page). `--output json` returns the document or section list in the same JSON envelope.
 
+`query run` writes the JSON envelope by default (`--format json`) and also supports `--format tsv` for tab-separated tabular output on stdout (detailed under [Bounded query results](#bounded-query-results)).
+
 Process and stream behavior:
 
 - Success exits 0 and writes the result to stdout.
@@ -24,6 +26,15 @@ Process and stream behavior:
 `query run` bounds execution time, row count, cell size, and serialized row bytes. Its report includes `complete`, optional `incomplete_reason`, optional `hint`, and `cells_truncated`. `complete` states whether every result row was returned; `incomplete_reason` is `row_limit` or `output_budget`. When `complete` is false, `hint` explains why only part of the result was returned and suggests a next query shape. An incomplete report is a successful bounded observation, not an exhaustive result.
 
 `cells_truncated` is a separate boundary. A nonzero value means that many returned text or blob cells contain only a UTF-8-safe prefix because they reached `--max-cell-bytes`; the row set can still have `complete=true`. In that case `hint` explains how to retrieve selected values without mistaking prefixes for complete evidence.
+
+When `--format tsv` is passed to `query run`:
+
+- Stdout begins with a header row of `SELECT` column names in projection order (even when zero rows match), followed by one physical line per returned row.
+- Column names and cell strings escape `\`, tab (`\t`), LF (`\n`), and CR (`\r`) as `\\`, `\t`, `\n`, and `\r` (not RFC 4180 quoting), so every line keeps `columns - 1` tab delimiters. Note that JSON strings selected as text cells will have their backslashes escaped a second time.
+- SQL `NULL` and empty string `""` both render as an empty field; use `--format json` or explicit SQL (`IS NULL`, `COALESCE`) when distinguishing absent values from empty strings matters.
+- SQLite `BLOB` cells serialize as compact JSON (`{"byte_length":...,"encoding":"hex","value":"..."}`) and are then TSV-escaped.
+- `--max-output-bytes` is enforced against the internal JSON row representation before TSV formatting, so `output_budget` can trigger before stdout reaches `--max-output-bytes`.
+- Stderr remains empty when `complete=true` and `cells_truncated=0`. When the result is incomplete (`row_limit` or `output_budget`) or any cell was truncated, a `notice: ...` line carrying the reason, counts, and recovery hint is written to stderr while exit status remains 0. Keep stderr separate when piping stdout into a TSV parser, and do not silently discard it.
 
 Public values preserve their declared representation. `records.content_range`, nested Session attributes, `source_ids`, `loops.end`, `items.record_ids`, and `items.semantic` are JSON values returned through ordinary SQL cells. Top-level Semantic text is represented inside `items.semantic` by `{blob_id}`; `blobs.text`, `blobs.full_bytes`, and `blobs.estimated_tokens` are ordinary columns read only when the query joins that access relation.
 

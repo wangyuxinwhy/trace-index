@@ -33,11 +33,10 @@ Run the version-matched help once, then discover relation and column names:
 ```bash
 trace-index --help
 trace-index schema list
-trace-index schema get items --compact
-trace-index schema get blobs --compact
+trace-index schema get items blobs --compact
 ```
 
-Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions. The bundled help, documentation, and schema describe the running binary; do not substitute names remembered from another version.
+Use `schema get items` or `schema get blobs` without `--compact` when you need column descriptions. `schema get` accepts one or more relation names in one call. The bundled help, documentation, and schema describe the running binary; do not substitute names remembered from another version.
 
 ## 4. Understand the five objects
 
