@@ -88,8 +88,12 @@ The two indexing limits change which Source content becomes a published fact, so
 
 `index status` and every synchronization report return the stored policy.
 
+## User SQL templates
+
+Optional custom `.sql` query templates may be placed in `<config_dir>/templates/*.sql` (the `templates` subdirectory beside the resolved configuration file; the current working directory is never searched). Each file starts with a `/* trace-index-template ... */` TOML metadata comment block (`name`, `description`, optional `min_format`, `default_limit`, and `[params.<name>]`) followed by a single read-only SQL statement with native `:param` placeholders and optional `-- #if <param>` / `-- #if !<param>` / `-- #else` / `-- #endif` line conditionals. User template names must be unique across user files and cannot shadow built-in template names.
+
 ## Configuration commands
 
 - `config init` creates and validates one file without overwriting, creating a database, or synchronizing traces. It records the built-in initial indexing values; an existing non-empty database still owns its established policy. `--root PATH` is repeatable, `--discover` adds only standard Runtime roots that currently exist, and `--db` writes an initial database path.
 - `config show` resolves values and reports their origins without inspecting the filesystem.
-- `config check` performs a read-only preflight of configured root existence, type, canonical duplication, and database path ancestry. Parse and schema errors exit before a report. In a returned report, Error issues make `valid` false and cause exit 1; Warning-only reports exit 0. `configured_sync_ready` additionally requires at least one configured root.
+- `config check` performs a read-only preflight of configured root existence, type, canonical duplication, database path ancestry, existing database Storage Format compatibility (`database_format_upgrade_required` warning when an existing index uses an older format), metadata store readability, and user SQL templates in `<config_dir>/templates/*.sql`. Parse and schema errors exit before a report. In a returned report, Error issues make `valid` false and cause exit 1; Warning-only reports exit 0. `configured_sync_ready` additionally requires at least one configured root.

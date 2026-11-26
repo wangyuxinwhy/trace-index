@@ -280,7 +280,7 @@ const QUERY_TEMPLATE_RUN_AFTER_HELP: &str = r"Behavior:
   cell-truncation notices on stderr (empty when complete and untruncated; exit 0).
 
 Examples:
-  trace-index query template run search-items -p query='proxy latency' -p since=7d --format tsv
+  trace-index query template run search-items -p query='needle phrase' -p since=7d --format tsv
   trace-index query template run session-transcript -p session=1 -p tail_loops=5 --render";
 
 const QUERY_RUN_AFTER_HELP: &str = r#"Behavior:
@@ -363,8 +363,10 @@ Example:
 
 const CONFIG_CHECK_AFTER_HELP: &str = r"Behavior:
   Resolves the same configuration file, database path, and roots as operational
-  commands, then checks root existence, type, canonical duplication, and database
-  path ancestry. It is read-only and does not require the database to exist.
+  commands, then checks root existence, type, canonical duplication, database
+  path ancestry, existing database Storage Format compatibility, metadata store
+  readability, and user SQL templates. It is read-only and does not require the
+  database to exist.
   Any issue with level=error produces valid=false and exit 1 after the JSON
   report. A warning-only report exits 0 even when configured_sync_ready=false,
   because index sync can still receive explicit PATHS.

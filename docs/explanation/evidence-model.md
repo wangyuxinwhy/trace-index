@@ -47,4 +47,4 @@ Evidence proves what the Source recorded and how Trace Index classified it. It d
 
 ## Storage does not add meaning
 
-SQLite normalizes arrays and sparse attributes into private tables, deduplicates bounded Semantic text, and maintains indexes for performance. Those storage tables support the five domain objects; they do not create additional entities in the evidence model. Public `blobs`, `item_search`, and `item_search_terms` are access relations: `blobs` reads referenced text, while `item_search` and `item_search_terms` find candidate Items. All three acquire meaning from Item and its Record evidence.
+SQLite normalizes arrays and sparse attributes into private tables, deduplicates bounded Semantic text, and maintains indexes for performance. Those storage tables support the five domain objects; they do not create additional entities in the evidence model. Public `blobs` and `item_search` are access relations: `blobs` reads referenced text, while `item_search` finds candidate Items. Both acquire meaning from Item and its Record evidence.

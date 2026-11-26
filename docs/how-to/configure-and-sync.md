@@ -62,7 +62,7 @@ To index only particular files or directories, pass them explicitly. Positional 
 trace-index index sync /path/to/one.jsonl /path/to/session-directory
 ```
 
-`config init --discover` includes `~/.gemini/antigravity-cli/brain` when present; on an existing configuration, add that root or pass it as a positional path to opt in to Antigravity CLI history. Format 2 and Format 3 databases remain readable in place but cannot be synchronized by this release. Select a new Format 4 database with `--db` and supply the available roots you want to index. Keep existing Format 2 or Format 3 databases if they contain history whose original Sources are unavailable.
+`config init --discover` includes `~/.gemini/antigravity-cli/brain` when present; on an existing configuration, add that root or pass it as a positional path to opt in to Antigravity CLI history. Format 2, Format 3, and Format 4 databases remain readable in place but cannot be synchronized by this release (`config check` emits a `database_format_upgrade_required` warning when an existing database uses an older format). Select a new Format 5 database with `--db` (or update `database` in `config.toml`), supply the available roots you want to index, and if `index watch` is installed, reinstall it against the new database. Keep existing older databases if they contain history whose original Sources are unavailable.
 
 Synchronization is the only operation that updates the index. `schema`, `query`, `record`, and `asset` commands never refresh it implicitly.
 

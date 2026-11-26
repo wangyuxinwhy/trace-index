@@ -5,20 +5,42 @@ description: Explore public relations with selective, bounded, read-only SQL.
 
 # Query Indexed Facts
 
-Trace Index publishes five domain objects and three text-access relations:
+Trace Index publishes five domain objects, two text-access relations, and caller-owned Session metadata:
 
 ```text
-sources  records  sessions  loops  items  blobs  item_search  item_search_terms
+sources  records  sessions  loops  items  blobs  item_search  session_metadata
 ```
 
-Start by discovering the current binary's contract:
+Start by discovering the current binary's templates and SQL contract:
 
 ```bash
+trace-index query template list
 trace-index schema list
 trace-index schema get sessions loops items blobs --compact
 ```
 
 The compact form shows names, SQLite types, and nullability. Pass one or more relation names to `schema get`, and omit `--compact` when a field's meaning is not yet clear.
+
+## Run or customize named SQL templates
+
+Common investigation workflows are packaged as transparent read-only SQL templates with typed parameters (`string`, `int`, `bool`, `enum`, `list`, `time`, `session_ref`, `item_ref`) bound through native SQLite `:param` placeholders (zero text interpolation):
+
+```bash
+trace-index query template list
+trace-index query template show session-transcript
+trace-index query template run recent-sessions -p since=7d --format tsv
+trace-index query template run session-transcript -p session=1 -p tail_loops=5 --format tsv
+```
+
+Every template is inspectable SQL. Pass `--render` to resolve typed parameters (such as `session_ref` or relative `time` like `7d`) against the index read-only and print the expanded SQL plus bound JSON parameters without executing it. You can then adapt the SQL and execute it with `query run --params-json`:
+
+```bash
+trace-index query template run shell-calls -p program=cargo -p since=7d --render
+```
+
+You can also add reusable custom `.sql` templates under `<config_dir>/templates/*.sql` with a leading `/* trace-index-template ... */` TOML metadata block and optional `-- #if <param>` / `-- #if !<param>` / `-- #else` / `-- #endif` line conditionals. User templates cannot shadow built-in names and are validated read-only by `trace-index config check`.
+
+## Run custom parameterized SQL
 
 Run one bounded, read-only SQL statement (pass `--format tsv` for tab-separated rows on stdout; incompleteness and cell-truncation notices are written to stderr only when a bound is hit):
 
@@ -31,15 +53,16 @@ trace-index query run \
     LIMIT 20"
 ```
 
-For multiline SQL, use stdin or a UTF-8 file rather than fragile shell quoting:
+For multiline SQL or dynamic parameters, use stdin or a UTF-8 file together with `--params-json '<JSON>'` (preserves JSON integer, real, null, and string types) and/or repeatable `-p/--param key=value` (binds as `TEXT` and overrides matching keys) rather than string concatenation:
 
 ```bash
-trace-index query run --stdin <<'SQL'
+trace-index query run --params-json '{"runtime":"codex"}' --stdin <<'SQL'
 SELECT s.runtime,
        json_extract(i.semantic, '$.role') AS role,
        COUNT(*) AS items
 FROM items i
 JOIN sessions s USING (session_id)
+WHERE s.runtime = :runtime
 GROUP BY s.runtime, json_extract(i.semantic, '$.role')
 ORDER BY items DESC;
 SQL
@@ -338,6 +361,6 @@ The `records` relation contains byte ranges and fingerprints, not raw Runtime JS
 
 ## Work within query bounds
 
-Start with counts, groups, identities, and bounded snippets. When `complete` is false, the returned rows are only part of the result set. Follow the report's `hint`: narrow the scope, aggregate before fetching rows, return fewer or smaller columns, or continue from a stable, unique `ORDER BY` key. A nonzero `cells_truncated` means selected values are prefixes even when all rows were returned. When using `--format tsv`, inspect stderr for the same incompleteness and cell-truncation notices (stderr is empty when complete and untruncated; see `docs get reference/output-contract`). Raise a budget only for selected material that the claim actually needs.
+Start with counts, groups, identities, and bounded snippets. Templates declare a `default_limit` that feeds the same row budget unless `--limit` is passed explicitly. When `complete` is false, the returned rows are only part of the result set. Follow the report's `hint`: narrow the scope, aggregate before fetching rows, return fewer or smaller columns, or continue from a stable, unique `ORDER BY` key. A nonzero `cells_truncated` means selected values are prefixes even when all rows were returned. When using `--format tsv`, inspect stderr for the same incompleteness and cell-truncation notices (stderr is empty when complete and untruncated; see `docs get reference/output-contract`). Raise a budget only for selected material that the claim actually needs.
 
 Public relations are the normal facts for analysis. Internal storage tables are implementation details even if SQLite can technically read them.

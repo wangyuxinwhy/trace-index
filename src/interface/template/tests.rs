@@ -48,8 +48,8 @@ fn seed_rich_fixture(store: &Store) {
             VALUES (1, 1, 1, 0, 0, 2),
                    (2, 1, 1, 1, 1, 5);
             INSERT INTO content_blobs(id, hash, text, full_bytes, estimated_tokens)
-            VALUES (1, X'01', 'Please investigate Clash Verge proxy latency in trace-index', 59, 15),
-                   (2, X'02', 'Found proxy configuration and fixed Clash Verge routing', 55, 14),
+            VALUES (1, X'01', 'Please investigate gateway relay timeout in trace-index', 55, 14),
+                   (2, X'02', 'Found relay configuration and fixed gateway relay routing', 57, 14),
                    (3, X'03', 'Session-level runtime instructions context', 42, 10),
                    (4, X'04', 'cargo test failed with exit code 101', 36, 9);
             INSERT INTO domain_items(id, session_id, source_id, loop_id, loop_position, occurred_at, semantic)
@@ -68,8 +68,8 @@ fn seed_rich_fixture(store: &Store) {
             VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
             INSERT INTO item_search(rowid, text)
             VALUES (1, 'session level runtime instructions context'),
-                   (2, 'please investigate clash verge proxy latency in trace index'),
-                   (5, 'found proxy configuration and fixed clash verge routing');
+                   (2, 'please investigate gateway relay timeout in trace index'),
+                   (5, 'found relay configuration and fixed gateway relay routing');
             "#,
         )
         .expect("seed fixture");
@@ -266,7 +266,7 @@ fn all_builtin_templates_prepare_and_execute_across_optional_branches_and_use_in
     let r1 = execute_template(
         ss,
         &store,
-        &["query=Clash Verge".to_owned()],
+        &["query=gateway relay".to_owned()],
         None,
         TEST_BUDGET,
     )
@@ -277,7 +277,7 @@ fn all_builtin_templates_prepare_and_execute_across_optional_branches_and_use_in
         ss,
         &store,
         &[
-            "query=Clash Verge".to_owned(),
+            "query=gateway relay".to_owned(),
             "runtime=codex".to_owned(),
             "cwd=trace-index".to_owned(),
             "roles=human.request,agent.final_answer".to_owned(),
@@ -297,9 +297,9 @@ fn all_builtin_templates_prepare_and_execute_across_optional_branches_and_use_in
         si,
         &store,
         &[
-            "query=Clash Verge".to_owned(),
+            "query=gateway relay".to_owned(),
             "session=1".to_owned(),
-            "contains=proxy latency".to_owned(),
+            "contains=relay timeout".to_owned(),
         ],
         None,
         TEST_BUDGET,

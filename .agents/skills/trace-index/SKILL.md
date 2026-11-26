@@ -7,9 +7,12 @@ description: Query indexed agent traces with trace-index when investigating sess
 
 Use `trace-index` as the read-only, source-traceable SQL query plane for agent traces. Trace Index returns facts and provenance; interpret them and form the conclusion yourself. Read `trace-index docs get reference/supported-traces` for Runtime coverage and its limits.
 
-At the start of each trace-analysis task, run `trace-index --help` once. Its help, bundled documentation, and Schema match the installed binary. Follow the discovery path instead of guessing relation names, columns, JSON shapes, or flags:
+At the start of each trace-analysis task, run `trace-index --help` once. Its help, built-in templates, bundled documentation, and Schema match the installed binary. Prefer built-in SQL templates for common navigation, search, transcript reading, and shell-call auditing, and follow the discovery path before writing custom SQL instead of guessing relation names, columns, JSON shapes, or flags:
 
 ```bash
+trace-index query template list
+trace-index query template show <NAME>
+trace-index query template run <NAME> -p key=value --format tsv
 trace-index docs list
 trace-index docs get <TOPIC> --list-sections
 trace-index docs get <TOPIC> --section "<HEADING>"
@@ -17,11 +20,13 @@ trace-index schema list
 trace-index schema get <RELATION>... --compact
 ```
 
+Pass `--render` to `query template run` to resolve typed parameters (`session_ref`, `time`, `list`, etc.) and inspect the exact SQL and JSON parameters without executing, then customize with `query run --params-json '<JSON>'` or `-p key=value` when a question needs custom SQL.
+
 Load `trace-index docs get start-here` when the index has not been built or the first-use workflow is needed. Run `config init` only when the selected configuration file does not exist; it creates only that file and refuses to overwrite one. Use `config show` and `config check` to inspect the selected values and readiness, then run `index sync` to write the database. Do not initialize or synchronize when the existing indexed facts are sufficient.
 
 Load the full schema without `--compact` only when field descriptions or the JSON contract are needed.
 
-The public domain objects are `sources`, `records`, `sessions`, `loops`, and `items`. `blobs`, `item_search`, and `item_search_terms` are access relations, not domain objects. `blobs` resolves bounded semantic text by `blob_id`; `item_search` and `item_search_terms` retrieve candidate Item ids. Do not build routine analysis on visible storage tables.
+The public domain objects are `sources`, `records`, `sessions`, `loops`, and `items`. `blobs` and `item_search` are access relations, not domain objects. `blobs` resolves bounded semantic text by `blob_id`; `item_search` retrieves candidate Item ids. Do not build routine analysis on visible storage tables.
 
 Use `items` as the central fact relation. Within one Loop, order by `loop_position`. Each Item has:
 
@@ -54,13 +59,13 @@ In the public SQL encoding, top-level domain TextContent is not inline. `semanti
 
 Loop model identity and normalized token usage are nested under `loops.model` and `loops.usage`. Cache-read and cache-write tokens are already subsets of `usage.input`, and reasoning tokens are already a subset of `usage.output`. Derive total model tokens as `input + output`; never add the subsets again or treat missing Usage as zero.
 
-Run bounded projections, filters, counts, groups, and joins with `query run`. Stop when the requested claim is supported. When `complete` is false, the rows are only a partial result set; follow the returned `hint` before drawing an exhaustive conclusion. Reads never refresh the index. Default to querying directly; check `index status` to inspect coverage, freshness, and whether `index watch` is active for this database, and run `index sync` only when newly written traces are required and watch is inactive (or when immediate freshness is needed).
+Run bounded projections, filters, counts, groups, and joins with `query template run` or `query run` (pass `--format tsv` for compact tabular output; inspect stderr for `notice:` lines whenever a row limit, output budget, or cell truncation bound is hit). Stop when the requested claim is supported. When `complete` is false, the rows are only a partial result set; follow the returned `hint` before drawing an exhaustive conclusion. Reads never refresh the index. Default to querying directly; check `index status` to inspect coverage, freshness, and whether `index watch` is active for this database, and run `index sync` only when newly written traces are required and watch is inactive (or when immediate freshness is needed).
 
-For broad text recall, use search only to generate candidates instead of fetching whole conversations. Derive several literal anchors from the user's wording, measure candidate density, and initially return only identities, scope, role, and short snippets. Compare candidates against the Runtime, time, project, actor, and provenance constraints that the request actually supplies before expanding any conversation. If the evidence does not identify one Session, preserve that ambiguity or ask for the missing discriminator. The bundled `how-to/search-literals` document gives the complete workflow and SQL patterns.
+For broad text recall, use search only to generate candidates instead of fetching whole conversations. Start with `search-sessions` / `search-items` templates or derive several literal anchors from the user's wording, measure candidate density, and initially return only identities, scope, role, and short snippets. Compare candidates against the Runtime, time, project, actor, and provenance constraints that the request actually supplies before expanding any conversation. If the evidence does not identify one Session, preserve that ambiguity or ask for the missing discriminator. The bundled `how-to/search-literals` document gives the complete workflow and SQL patterns.
 
 In `sessions`, `session_id` is the Trace Index-local join key and `native_id` is the Runtime-native identity. Report `runtime` plus `native_id` when the user asks for a native Session id.
 
-Use `item_search_terms` (`search_query('...')`) for term, identifier (`camelCase`/`snake_case`), multi-word, or 2+ character CJK candidate retrieval (supports `bm25(item_search_terms)` ranking). Use `item_search` (`trigram_query('...')`) for 3+ character literal substrings or punctuation-bearing literals. Both have contentless `text` columns that read as NULL and output candidate `rowid`. Join `rowid` to `items.item_id`, select the `blob_id` defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()` or an equally explicit comparison. Both indexes are broader than exact literal matching. For single-character or non-word literals shorter than three characters, narrow Items structurally first and join only their referenced Blobs.
+On Storage Format 5+, `item_search(search_query('...'))` is the single canonical FTS5 candidate index for words, underscore segments, split code identifiers (`camelCase`/`snake_case`), multi-word queries, 2+ character CJK terms, and trailing `prefix*` lookups (≥4 ASCII chars), with `bm25(item_search)` ranking. Its contentless `text` column reads as `NULL` and outputs candidate `rowid`; Format 5+ requires `search_query('...')`. Join `rowid` to `items.item_id`, select the `blob_id` defined by that Item's `semantic.role`, join `blobs`, and exact-check `blobs.text` with `instr()` or an equally explicit comparison because candidate retrieval is case-folded and broader than exact literal matching. For single-character or punctuation-only literals, narrow Items structurally first and join only their referenced Blobs. On read-only legacy Format 2/3/4 databases, `item_search` uses `trigram_query('...')` (Format 4 also has `item_search_terms(search_query('...'))`, which built-in templates route to automatically).
 
 Do not join `blobs` for role counts, timelines, tool metadata, Loop usage, or any other query that does not read text. Keeping Blob access demand-driven avoids loading large values into routine analysis.
 
