@@ -33,13 +33,6 @@ pub(crate) fn clear_projection(transaction: &Transaction<'_>, source_id: i64) ->
             [source_id],
         )
         .context("failed to clear searchable Items")?;
-    transaction
-        .execute(
-            "DELETE FROM item_search_terms WHERE rowid IN (
-             SELECT id FROM domain_items WHERE source_id = ?1)",
-            [source_id],
-        )
-        .context("failed to clear term-searchable Items")?;
 
     // Loop Items disappear through the Loop foreign key, while Session-level
     // Items have no Loop to cascade from. Delete by Source explicitly so both
@@ -811,18 +804,13 @@ impl<'a, 'connection> ItemWriter<'a, 'connection> {
 
     fn write_search_indexes(&mut self, item_id: i64, text: &str) -> Result<()> {
         let started = Instant::now();
-        self.transaction
-            .prepare_cached("INSERT INTO item_search(rowid, text) VALUES (?1, ?2)")
-            .context("failed to prepare Item search insert")?
-            .execute(params![item_id, text])
-            .context("failed to store Item search text")?;
         let terms = tokenize_for_term_index(text);
         if !terms.is_empty() {
             self.transaction
-                .prepare_cached("INSERT INTO item_search_terms(rowid, text) VALUES (?1, ?2)")
-                .context("failed to prepare Item term search insert")?
+                .prepare_cached("INSERT INTO item_search(rowid, text) VALUES (?1, ?2)")
+                .context("failed to prepare Item search insert")?
                 .execute(params![item_id, terms])
-                .context("failed to store Item term search text")?;
+                .context("failed to store Item search text")?;
         }
         self.telemetry
             .record_persist(PersistTable::ItemSearch, started.elapsed());

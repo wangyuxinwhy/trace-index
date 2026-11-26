@@ -1,10 +1,11 @@
-//! Storage format 4, shaped around the five public domain objects.
+//! Storage format 5, shaped around the five public domain objects.
 //!
-//! Format 4 compresses large deduplicated Semantic Blobs with per-blob `zstd`,
-//! stores `item_records` `WITHOUT ROWID`, and adds the term-oriented
-//! `item_search_terms` FTS5 access relation alongside `item_search`.
+//! Format 5 keeps per-blob `zstd` compression and `WITHOUT ROWID` `item_records`
+//! from Format 4, promotes the term-oriented FTS5 access relation (`unicode61`
+//! with `detail = 'full'` and Rust pre-tokenization) into the single
+//! `item_search` relation, and removes the redundant trigram table.
 
-pub(crate) const STORAGE_FORMAT: u32 = 4;
+pub(crate) const STORAGE_FORMAT: u32 = 5;
 
 pub(crate) const CREATE_SCHEMA: &str = r"
 PRAGMA foreign_keys = ON;
@@ -201,18 +202,10 @@ BEGIN
      );
 END;
 
--- Trigram access structure rebuilt from Item semantic text. rowid is items.id.
+-- Term-oriented FTS5 candidate index rebuilt from pre-tokenized Item semantic
+-- text (CJK bigrams, code identifier splits, underscore segments, and words).
+-- rowid is items.id.
 CREATE VIRTUAL TABLE item_search USING fts5(
-    text,
-    content = '',
-    tokenize = 'trigram',
-    detail = 'none',
-    contentless_delete = 1
-);
-
--- Term-oriented access structure rebuilt from pre-tokenized Item semantic text
--- (CJK bigrams, code identifier splits, and words). rowid is items.id.
-CREATE VIRTUAL TABLE item_search_terms USING fts5(
     text,
     content = '',
     tokenize = 'unicode61 tokenchars ''_''',
@@ -277,8 +270,8 @@ mod tests {
     use super::{CREATE_SCHEMA, CREATE_SECONDARY_INDEXES, STORAGE_FORMAT};
 
     #[test]
-    fn creates_the_format_4_schema() {
-        assert_eq!(STORAGE_FORMAT, 4);
+    fn creates_the_format_5_schema() {
+        assert_eq!(STORAGE_FORMAT, 5);
         let connection = Connection::open_in_memory().expect("open database");
         connection
             .execute_batch(CREATE_SCHEMA)
@@ -308,11 +301,11 @@ mod tests {
             "item_records",
             "item_session_links",
             "item_search",
-            "item_search_terms",
         ] {
             assert!(tables.contains(expected), "missing {expected}");
         }
         for removed in [
+            "item_search_terms",
             "turns",
             "message_details",
             "tool_call_details",

@@ -561,7 +561,10 @@ pub(crate) fn check_selected(
 
 fn check_database_path(path: &Path, issues: &mut Vec<ConfigCheckIssue>) {
     match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => return,
+        Ok(metadata) if metadata.is_file() => {
+            check_existing_database_format(path, issues);
+            return;
+        }
         Ok(_) => {
             issues.push(ConfigCheckIssue {
                 level: ConfigCheckLevel::Error,
@@ -599,6 +602,31 @@ fn check_database_path(path: &Path, issues: &mut Vec<ConfigCheckIssue>) {
             code: "database_parent_not_directory",
             message: "an existing database path ancestor is not a directory".to_owned(),
             path: Some(existing_ancestor.to_path_buf()),
+        });
+    }
+}
+
+fn check_existing_database_format(path: &Path, issues: &mut Vec<ConfigCheckIssue>) {
+    let Ok(connection) = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(version): Result<u32, _> =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))
+    else {
+        return;
+    };
+    let current = crate::storage::schema::STORAGE_FORMAT;
+    if version != 0 && version != current {
+        issues.push(ConfigCheckIssue {
+            level: ConfigCheckLevel::Warning,
+            code: "database_format_upgrade_required",
+            message: format!(
+                "existing database uses Storage Format {version} (current build writes Format {current}); read commands remain compatible, while `index sync` and `index watch` require rebuilding into a new Format {current} database"
+            ),
+            path: Some(path.to_path_buf()),
         });
     }
 }

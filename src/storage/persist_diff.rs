@@ -807,9 +807,6 @@ fn delete_items(transaction: &Transaction<'_>, items: &[ExistingItem]) -> Result
     let mut del_search = transaction
         .prepare_cached("DELETE FROM item_search WHERE rowid = ?1")
         .context("failed to prepare Item search delete")?;
-    let mut del_terms = transaction
-        .prepare_cached("DELETE FROM item_search_terms WHERE rowid = ?1")
-        .context("failed to prepare Item term search delete")?;
     let mut del_item = transaction
         .prepare_cached("DELETE FROM domain_items WHERE id = ?1")
         .context("failed to prepare Item delete")?;
@@ -817,9 +814,6 @@ fn delete_items(transaction: &Transaction<'_>, items: &[ExistingItem]) -> Result
         del_search
             .execute([item.id])
             .context("failed to delete searchable Item")?;
-        del_terms
-            .execute([item.id])
-            .context("failed to delete term-searchable Item")?;
         del_item
             .execute([item.id])
             .context("failed to delete Item")?;
@@ -838,13 +832,6 @@ fn delete_loops(transaction: &Transaction<'_>, loops: &[ExistingLoop]) -> Result
              )",
         )
         .context("failed to prepare Loop search delete")?;
-    let mut del_terms = transaction
-        .prepare_cached(
-            "DELETE FROM item_search_terms WHERE rowid IN (
-                 SELECT id FROM domain_items WHERE loop_id = ?1
-             )",
-        )
-        .context("failed to prepare Loop term search delete")?;
     let mut del_loop = transaction
         .prepare_cached("DELETE FROM domain_loops WHERE id = ?1")
         .context("failed to prepare Loop delete")?;
@@ -852,9 +839,6 @@ fn delete_loops(transaction: &Transaction<'_>, loops: &[ExistingLoop]) -> Result
         del_search
             .execute([existing_loop.id])
             .context("failed to clear Loop searchable Items")?;
-        del_terms
-            .execute([existing_loop.id])
-            .context("failed to clear Loop term-searchable Items")?;
         del_loop
             .execute([existing_loop.id])
             .context("failed to delete Loop")?;
@@ -1137,12 +1121,12 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect items");
 
-        let trigram_hits = conn
+        let term_hits = conn
             .prepare(
                 "SELECT i.loop_position, json_extract(i.semantic, '$.role')
                    FROM item_search s
                    JOIN domain_items i ON i.id = s.rowid
-                  WHERE item_search MATCH 'hel AND ell AND llo'
+                  WHERE item_search MATCH 'hello'
                   ORDER BY i.id",
             )
             .expect("prep fts")
@@ -1156,26 +1140,7 @@ mod tests {
             .expect("query fts")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect fts");
-
-        let term_hits = conn
-            .prepare(
-                "SELECT i.loop_position, json_extract(i.semantic, '$.role')
-                   FROM item_search_terms s
-                   JOIN domain_items i ON i.id = s.rowid
-                  WHERE item_search_terms MATCH 'hello'
-                  ORDER BY i.id",
-            )
-            .expect("prep fts terms")
-            .query_map([], |r| {
-                Ok(format!(
-                    "{:?}:{}",
-                    r.get::<_, Option<i64>>(0)?,
-                    r.get::<_, String>(1)?
-                ))
-            })
-            .expect("query fts terms")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("collect fts terms");
+        let trigram_hits = term_hits.clone();
 
         (loops, items, trigram_hits, term_hits)
     }
@@ -1424,23 +1389,14 @@ mod tests {
             &mut revised,
         );
 
-        let stale_trigram: i64 = inc_store
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM item_search WHERE item_search MATCH 'sta AND tal AND ale'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("trigram check");
         let stale_terms: i64 = inc_store
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM item_search_terms WHERE item_search_terms MATCH 'stale'",
+                "SELECT COUNT(*) FROM item_search WHERE item_search MATCH 'stale'",
                 [],
                 |r| r.get(0),
             )
             .expect("terms check");
-        assert_eq!(stale_trigram, 0);
         assert_eq!(stale_terms, 0);
 
         write_initial(&mut fresh_store, "/tmp/edit.jsonl", 4, &revised);
